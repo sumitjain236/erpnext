@@ -12,13 +12,24 @@
   "company",
   "column_break_header",
   "status",
+  "migration_date",
+  "no_opening_data",
   "steps_section",
   "onboarding_html",
   "steps",
   "accounts_tab",
   "chart_of_accounts_source",
+  "accounts_html",
   "opening_balances_section",
-  "opening_balances"
+  "opening_balances",
+  "selling_tab",
+  "selling_html",
+  "opening_sales_invoices_section",
+  "opening_sales_invoices",
+  "buying_tab",
+  "buying_html",
+  "opening_purchase_invoices_section",
+  "opening_purchase_invoices"
  ],
  "fields": [
   {
@@ -50,14 +61,14 @@
   {
    "fieldname": "steps_tab",
    "fieldtype": "Tab Break",
-   "label": "Steps"
+   "label": "Overview"
   },
   {
    "fieldname": "steps",
    "fieldtype": "Table",
    "hidden": 1,
    "label": "Steps",
-   "options": "Company Onboarding Step"
+   "options": "Company Setup Step"
   },
   {
    "fieldname": "accounts_tab",
@@ -68,13 +79,14 @@
    "description": "The opening balances from your old system. Nothing is posted until you press Post.",
    "fieldname": "opening_balances_section",
    "fieldtype": "Section Break",
+   "hidden": 1,
    "label": "Opening Balances"
   },
   {
    "fieldname": "opening_balances",
    "fieldtype": "Table",
    "label": "Opening Balances",
-   "options": "Company Onboarding Opening Balance"
+   "options": "Company Setup Opening Balance"
   },
   {
    "fieldname": "onboarding_html",
@@ -85,6 +97,7 @@
    "description": "Whether the company keeps the chart made during setup or imports its own.",
    "fieldname": "chart_of_accounts_source",
    "fieldtype": "Select",
+   "hidden": 1,
    "label": "Chart of Accounts",
    "options": "\nExisting\nImported",
    "read_only": 1
@@ -92,14 +105,78 @@
   {
    "fieldname": "steps_section",
    "fieldtype": "Section Break"
+  },
+  {
+   "description": "The day the company moves to ERPNext. Opening balances are dated the day before.",
+   "fieldname": "migration_date",
+   "fieldtype": "Date",
+   "hidden": 1,
+   "label": "Migration Date"
+  },
+  {
+   "default": "0",
+   "description": "A new business with no old books, so there are no opening balances or invoices.",
+   "fieldname": "no_opening_data",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Nothing to Bring"
+  },
+  {
+   "fieldname": "accounts_html",
+   "fieldtype": "HTML",
+   "label": "Accounts"
+  },
+  {
+   "fieldname": "selling_tab",
+   "fieldtype": "Tab Break",
+   "label": "Selling"
+  },
+  {
+   "fieldname": "selling_html",
+   "fieldtype": "HTML",
+   "label": "Selling"
+  },
+  {
+   "fieldname": "buying_tab",
+   "fieldtype": "Tab Break",
+   "label": "Buying"
+  },
+  {
+   "fieldname": "buying_html",
+   "fieldtype": "HTML",
+   "label": "Buying"
+  },
+  {
+   "fieldname": "opening_sales_invoices_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Opening Sales Invoices"
+  },
+  {
+   "fieldname": "opening_sales_invoices",
+   "fieldtype": "Table",
+   "label": "Opening Sales Invoices",
+   "options": "Company Setup Opening Invoice"
+  },
+  {
+   "fieldname": "opening_purchase_invoices_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Opening Purchase Invoices"
+  },
+  {
+   "fieldname": "opening_purchase_invoices",
+   "fieldtype": "Table",
+   "label": "Opening Purchase Invoices",
+   "options": "Company Setup Opening Invoice"
   }
  ],
  "grid_page_length": 50,
  "links": [],
- "modified": "2026-10-09 18:30:37.450356",
+ "modified": "2026-10-13 16:22:41.861842",
  "modified_by": "Administrator",
  "module": "Setup",
- "name": "Company Onboarding",
+ "name": "Company Setup",
  "owner": "Administrator",
  "permissions": [
   {

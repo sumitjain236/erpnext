@@ -5,7 +5,7 @@
 from frappe.model.document import Document
 
 
-class CompanyOnboardingOpeningBalance(Document):
+class CompanySetupStep(Document):
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -14,18 +14,14 @@ class CompanyOnboardingOpeningBalance(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
-		account: DF.Link | None
-		credit: DF.Currency
-		debit: DF.Currency
-		journal_entry: DF.Link | None
-		original_account: DF.Data | None
+		last_checked: DF.Datetime | None
+		message: DF.SmallText | None
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data
-		party: DF.DynamicLink | None
-		party_type: DF.Link | None
-		root_type: DF.Data | None
-		status: DF.Literal["Draft", "Posted"]
+		status: DF.Literal["Not Started", "Done", "Skipped"]
+		step: DF.Data
+		step_key: DF.Data | None
 	# end: auto-generated types
 
-	_DOCTYPE_NAME = "Company Onboarding Opening Balance"
+	_DOCTYPE_NAME = "Company Setup Step"

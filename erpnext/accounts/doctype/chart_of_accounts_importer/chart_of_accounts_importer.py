@@ -85,8 +85,6 @@ def validate_company(company: str):
 @frappe.whitelist()
 def import_coa(file_name: str, company: str):
 	frappe.only_for("Accounts Manager")
-
-	# delete existing data for accounts
 	frappe.has_permission("Company", "write", company, throw=True)
 
 	# create accounts
@@ -97,6 +95,17 @@ def import_coa(file_name: str, company: str):
 		data = generate_data_from_csv(file_doc)
 	else:
 		data = generate_data_from_excel(file_doc, extension)
+
+	replace_chart(data, company)
+
+
+def replace_chart(data: list, company: str, refill_defaults: bool = False):
+	"""Delete the company's accounts and create them again from rows in the template's columns.
+	With refill_defaults, the company's cash, bank, stock and other defaults are set from the new chart."""
+	frappe.only_for("Accounts Manager")
+
+	# delete existing data for accounts
+	frappe.has_permission("Company", "write", company, throw=True)
 
 	validate_columns(data)
 
@@ -109,7 +118,7 @@ def import_coa(file_name: str, company: str):
 	create_charts(company, custom_chart=forest, from_coa_importer=True)
 
 	# trigger on_update for company to reset default accounts
-	set_default_accounts(company)
+	set_default_accounts(company, refill_defaults)
 
 
 def get_file(file_name):
@@ -509,7 +518,7 @@ def validate_user_perms(company):
 		)
 
 
-def set_default_accounts(company):
+def set_default_accounts(company, refill_defaults=False):
 	from erpnext.setup.doctype.company.company import install_country_fixtures
 
 	company = frappe.get_doc("Company", company)
@@ -527,6 +536,10 @@ def set_default_accounts(company):
 			),
 		}
 	)
+	if refill_defaults:
+		# the old chart's defaults were cleared: set cash, bank, stock and the rest from the new account types
+		company.update_default_account = True
+		company.set_default_accounts()
 
 	company.save()
 	install_country_fixtures(company.name, company.country)

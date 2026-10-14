@@ -59,7 +59,7 @@
  "modified": "2026-10-09 17:59:22.222408",
  "modified_by": "Administrator",
  "module": "Setup",
- "name": "Company Onboarding Step",
+ "name": "Company Setup Step",
  "owner": "Administrator",
  "permissions": [],
  "row_format": "Dynamic",
