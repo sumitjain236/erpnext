@@ -126,8 +126,24 @@ class TestPartyImportProvider(ERPNextTestSuite):
 			"Supplier",
 			INSERT,
 			[
-				["Supplier Name", "Country", "Address Line 1", "City/Town", "Mobile No", "Email Address"],
-				[f"{PREFIX} Plain", "Germany", "1 Main St", "Berlin", "+49 30 111", "plain@example.com"],
+				[
+					"Supplier Name",
+					"Country",
+					"Address Line 1",
+					"City/Town",
+					"Mobile No",
+					"Email Address",
+					"Address",
+				],
+				[
+					f"{PREFIX} Plain",
+					"Germany",
+					"1 Main St",
+					"Berlin",
+					"+49 30 111",
+					"plain@example.com",
+					"1 Main St",
+				],
 			],
 		)
 		mapped = {}
@@ -150,6 +166,8 @@ class TestPartyImportProvider(ERPNextTestSuite):
 				"Mobile No": "contacts.mobile_no",
 				# Both Contact and Address have Email Address; the user picks one in the mapper.
 				"Email Address": None,
+				# Contact's Address is a link to an Address record, which this text can't fill
+				"Address": None,
 			},
 		)
 

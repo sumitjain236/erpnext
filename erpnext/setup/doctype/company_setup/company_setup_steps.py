@@ -198,8 +198,15 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 	)[0]
 	table = "opening_sales_invoices" if doctype == "Sales Invoice" else "opening_purchase_invoices"
 	drafts = [row for row in onboarding.get(table) if row.status != "Created"]
+	failed = sum(1 for row in drafts if row.status == "Failed")
 	currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
-	if totals.count:
+	if failed:
+		text = (
+			_("1 could not be posted. Open the table to see why.")
+			if failed == 1
+			else _("{0} could not be posted. Open the table to see why.").format(failed)
+		)
+	elif totals.count:
 		text = summary.format(totals.count, fmt_money(totals.outstanding, currency=currency))
 	elif drafts:
 		text = _("{0} invoices entered, not posted yet").format(len(drafts))
@@ -239,10 +246,19 @@ def check_books(onboarding) -> dict:
 
 
 def go_live(onboarding) -> dict:
+	summary = None
+	if onboarding.status == "Live":
+		temporary = get_temporary_opening_balance(onboarding.company)
+		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
+		summary = (
+			_("Live · {0} still in Temporary Opening").format(fmt_money(abs(temporary), currency=currency))
+			if temporary
+			else _("Live")
+		)
 	return {
 		"title": _("Go live"),
 		"description": _("Start using ERPNext. We point out anything left, but nothing stops you."),
-		"summary": onboarding.status == "Live" and _("Live"),
+		"summary": summary,
 		"done": onboarding.status == "Live",
 	}
 

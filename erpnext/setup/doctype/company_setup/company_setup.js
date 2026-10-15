@@ -7,7 +7,7 @@ frappe.ui.form.on("Company Setup", {
 			if (data.error) {
 				frappe.msgprint({ title: __("Invoices not posted"), message: data.error, indicator: "red" });
 			}
-			frm.reload_doc();
+			frm.reload_doc().then(() => !data.error && show_posting_result(frm, data.party_type));
 		});
 	},
 
@@ -15,6 +15,10 @@ frappe.ui.form.on("Company Setup", {
 		if (frm.is_new()) return;
 
 		frm.events.render(frm);
+		if (frm.reopen_opening_invoices) {
+			show_opening_invoices(frm, frm.reopen_opening_invoices);
+			delete frm.reopen_opening_invoices;
+		}
 		// steps are checked against the company's data each time the form opens
 		frm.call("check_steps").then((r) => r.message && frm.reload_doc());
 	},
@@ -24,6 +28,7 @@ frappe.ui.form.on("Company Setup", {
 		const steps = get_steps(frm);
 		make_page(frm, "onboarding_html").append(
 			make_company_card(frm),
+			make_live_note(frm),
 			make_overview_stats(frm),
 			make_checklist(frm, steps)
 		);
@@ -88,22 +93,32 @@ function make_overview_stats(frm) {
 const PARTY = {
 	Customer: {
 		table: "opening_sales_invoices",
+		name_field: "customer_name",
 		doctype: "Sales Invoice",
 		total_label: __("Receivable"),
 		report: __("receivables"),
 	},
 	Supplier: {
 		table: "opening_purchase_invoices",
+		name_field: "supplier_name",
 		doctype: "Purchase Invoice",
 		total_label: __("Payable"),
 		report: __("payables"),
 	},
 };
 
+// more new names than this are better added from a sheet
+const ADD_ONE_BY_ONE_LIMIT = 10;
+
 function make_invoice_stats(frm, party_type) {
 	const stats = frm.doc.__onload?.stats || {};
 	const currency = erpnext.get_currency(frm.doc.company);
-	const rows = frm.doc[PARTY[party_type].table] || [];
+	const all_rows = frm.doc[PARTY[party_type].table] || [];
+	// advances are negative rows; they aren't invoices and are shown apart
+	const rows = all_rows.filter((row) => flt(row.outstanding_amount) > 0);
+	const advance = -all_rows
+		.filter((row) => flt(row.outstanding_amount) < 0)
+		.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
 	const created = rows.filter((row) => row.status === "Created");
 	const total = rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
 	const parties = new Set(rows.map((row) => row.party_name));
@@ -127,6 +142,11 @@ function make_invoice_stats(frm, party_type) {
 		frappe.ui.stat_card({
 			label: PARTY[party_type].total_label,
 			value: format_currency(total, currency),
+			caption:
+				advance &&
+				(party_type === "Customer"
+					? __("Less {0} customers paid in advance", [format_currency(advance, currency)])
+					: __("Less {0} paid to suppliers in advance", [format_currency(advance, currency)])),
 		})
 	);
 }
@@ -192,6 +212,74 @@ function make_task_card(frm, step) {
 	);
 }
 
+// Where each report or list is in the software people move from
+const WHERE_TO_FIND = {
+	chart_of_accounts: [
+		["Tally", __("Display More Reports › List of Accounts, then Alt+E to export")],
+		["Zoho Books", __("Accountant › Chart of Accounts › Export")],
+		["QuickBooks", __("Settings › Chart of Accounts › Run Report › Export")],
+		["Excel", __("Download the sample chart and fill it in.")],
+	],
+	opening_balances: [
+		["Tally", __("Display More Reports › Trial Balance, Alt+F5 for every ledger, then Alt+E")],
+		["Zoho Books", __("Reports › Trial Balance")],
+		["QuickBooks", __("Reports › Trial Balance")],
+		["Excel", __("One row per account with its debit or credit.")],
+	],
+	opening_sales_invoices: [
+		["Tally", __("Display More Reports › Statements of Accounts › Outstandings › Receivables")],
+		["Zoho Books", __("Reports › AR Aging Details")],
+		["QuickBooks", __("Reports › Open Invoices")],
+		["Excel", __("One row per unpaid invoice: customer, invoice number, date, amount.")],
+	],
+	opening_purchase_invoices: [
+		["Tally", __("Display More Reports › Statements of Accounts › Outstandings › Payables")],
+		["Zoho Books", __("Reports › AP Aging Details")],
+		["QuickBooks", __("Reports › Unpaid Bills")],
+		["Excel", __("One row per unpaid bill: supplier, bill number, date, amount.")],
+	],
+};
+
+// The "Where do I find this?" section at the end of a dialog: open while nothing is entered yet,
+// folded once something is, and left out once anything is posted
+function where_to_find_fields(frm, task_name, { has_data, posted }) {
+	if (posted) return [];
+	return [
+		{
+			fieldname: "where_section",
+			fieldtype: "Section Break",
+			label: __("Where do I find this?"),
+			collapsible: 1,
+			collapsible_depends_on: has_data ? "eval:0" : "eval:1",
+		},
+		{
+			fieldname: "where_to_find",
+			fieldtype: "HTML",
+			options: make_where_table(frm, WHERE_TO_FIND[task_name]).outerHTML,
+		},
+	];
+}
+
+function make_where_table(frm, places) {
+	const $table = $(`<div class="flex flex-col gap-2"></div>`);
+	for (const [software, where] of places) {
+		$(`<div class="flex flex-col gap-0.5"></div>`)
+			.append($(`<div class="text-p-sm text-ink-gray-5"></div>`).text(software))
+			.append($(`<div class="text-p-sm text-ink-gray-8"></div>`).text(where))
+			.appendTo($table);
+	}
+	if (frm.doc.migration_date) {
+		$(`<div class="text-p-sm text-ink-gray-5 border-t pt-2"></div>`)
+			.text(
+				__("Take it as on {0}, the day before you start.", [
+					frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1)),
+				])
+			)
+			.appendTo($table);
+	}
+	return $table[0];
+}
+
 // Status icon, title, one line on what's done or left, and the buttons
 function make_task(frm, step, buttons) {
 	const [icon, color] = step.is_complete
@@ -203,14 +291,20 @@ function make_task(frm, step, buttons) {
 		: ["circle-dashed", "text-ink-gray-5"];
 	const note = step.is_skipped ? __("Skipped for now.") : step.summary || step.description;
 
-	const $task = $(`<div class="flex items-center gap-3"></div>`);
+	// more than two buttons go on a row of their own, so the text keeps its width
+	const stacked = buttons.length > 2;
+	const $task = $(`<div class="flex items-center gap-3 ${stacked ? "flex-wrap" : ""}"></div>`);
 	$(`<span class="shrink-0 ${color}"></span>`).html(frappe.utils.icon(icon, "md")).appendTo($task);
 	const $text = $(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).appendTo($task);
 	$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(step.title).appendTo($text);
 	if (note) $(`<div class="text-p-sm text-ink-gray-5"></div>`).text(note).appendTo($text);
 
 	if (buttons.length) {
-		const $actions = $(`<div class="flex flex-wrap justify-end items-center gap-2 shrink-0"></div>`);
+		const $actions = $(
+			`<div class="flex flex-wrap items-center gap-2 ${
+				stacked ? "w-full ps-8" : "justify-end shrink-0"
+			}"></div>`
+		);
 		buttons.forEach((opts) => $actions.append(frappe.ui.button(opts)));
 		$task.append($actions);
 	}
@@ -246,11 +340,7 @@ function skip_step(frm, step, skip) {
 }
 
 function show_migration_date(frm) {
-	const reports = [
-		[__("Unpaid customer invoices"), __("The receivables report. It goes in Selling.")],
-		[__("Unpaid supplier bills"), __("The payables report. It goes in Buying.")],
-		[__("Trial balance"), __("It goes in Accounts, as opening balances.")],
-	];
+	const bring = "eval:!doc.no_opening_data";
 	const dialog = new frappe.ui.Dialog({
 		title: __("When do you move to ERPNext?"),
 		fields: [
@@ -262,29 +352,66 @@ function show_migration_date(frm) {
 				default: frm.doc.migration_date,
 				description: __("Your balances come in as they stood at the end of the day before."),
 			},
-			{ fieldname: "reports", fieldtype: "HTML" },
+			{
+				fieldname: "no_opening_data",
+				fieldtype: "Check",
+				label: __("This is a new business. There is nothing to bring over."),
+				default: frm.doc.no_opening_data,
+			},
+			{ fieldname: "reports", fieldtype: "HTML", depends_on: bring },
+			{
+				fieldtype: "Section Break",
+				label: __("Where is each report?"),
+				collapsible: 1,
+				depends_on: bring,
+			},
+			{ fieldname: "where", fieldtype: "HTML" },
 		],
 		primary_action_label: __("Save"),
-		primary_action: (values) => save_migration_date(frm, dialog, values.migration_date, 0),
-		secondary_action_label: __("This is a new business, nothing to bring"),
-		secondary_action: () => {
-			const migration_date = dialog.get_value("migration_date");
-			if (!migration_date) return frappe.msgprint(__("Pick the migration date first."));
-			save_migration_date(frm, dialog, migration_date, 1);
-		},
+		primary_action: (values) =>
+			save_migration_date(frm, dialog, values.migration_date, values.no_opening_data ? 1 : 0),
 	});
 
-	const $reports = $(`<div class="flex flex-col gap-2"></div>`);
-	$(`<div class="text-base-medium text-ink-gray-8"></div>`)
-		.text(__("Keep these ready from your old software"))
+	const $reports = $(`<div class="flex flex-col gap-1"></div>`);
+	$(`<div class="text-base text-ink-gray-8"></div>`)
+		.text(__("Keep these three reports ready, all as on the day before you start:"))
 		.appendTo($reports);
-	for (const [title, description] of reports) {
-		$(`<div class="border-t pt-2"></div>`)
-			.append($(`<div class="text-base text-ink-gray-8"></div>`).text(title))
-			.append($(`<div class="text-p-sm text-ink-gray-5"></div>`).text(description))
-			.appendTo($reports);
+	const $list = $(`<ol class="text-base text-ink-gray-8 ps-5 mb-0"></ol>`).appendTo($reports);
+	for (const report of [
+		__("Trial balance"),
+		__("Unpaid customer invoices (who owes you, invoice by invoice)"),
+		__("Unpaid supplier bills (whom you owe, bill by bill)"),
+	]) {
+		$("<li></li>").text(report).appendTo($list);
 	}
+	$(`<div class="text-p-sm text-ink-gray-5 pt-1"></div>`)
+		.text(
+			__(
+				"You can also bring your customer and supplier lists. If you don't, names are created from the unpaid invoices."
+			)
+		)
+		.appendTo($reports);
 	dialog.get_field("reports").$wrapper.append($reports);
+
+	const $where = $(`<div class="flex flex-col gap-3"></div>`);
+	for (const [title, task_name] of [
+		[__("Trial balance"), "opening_balances"],
+		[__("Unpaid customer invoices"), "opening_sales_invoices"],
+		[__("Unpaid supplier bills"), "opening_purchase_invoices"],
+	]) {
+		$(`<div class="flex flex-col gap-1"></div>`)
+			.append($(`<div class="text-sm-medium text-ink-gray-8"></div>`).text(title))
+			.append(
+				WHERE_TO_FIND[task_name].map(([software, where]) =>
+					$(`<div class="text-p-sm text-ink-gray-8"></div>`).append(
+						$(`<span class="text-ink-gray-5"></span>`).text(`${software}: `),
+						document.createTextNode(where)
+					)
+				)
+			)
+			.appendTo($where);
+	}
+	dialog.get_field("where").$wrapper.append($where);
 	dialog.show();
 }
 
@@ -332,17 +459,43 @@ function see_books_button(frm) {
 	};
 }
 
-// What is done and what is left; nothing here stops going live
+// Once live, money still in Temporary Opening stays pointed out until it is explained
+function make_live_note(frm) {
+	const temporary = frm.doc.__onload?.stats?.temporary_opening;
+	if (frm.doc.status !== "Live" || !temporary) return [];
+	return frappe.ui.alert({
+		theme: "yellow",
+		title: __("Live · {0} still in Temporary Opening", [
+			format_currency(Math.abs(temporary), erpnext.get_currency(frm.doc.company)),
+		]),
+		description: __(
+			"Something from your old books is still missing, such as stock, an advance or a balance left out of your sheet. Add it and this goes away."
+		),
+		footer: () => $(`<div class="flex gap-2"></div>`).append(frappe.ui.button(see_books_button(frm))),
+	});
+}
+
+// What is done and what is left; money left in Temporary Opening needs a tick, nothing else stops going live
 function show_go_live(frm) {
 	const steps = get_steps(frm).filter((step) => step.name !== "go_live");
 	const stats = frm.doc.__onload?.stats || {};
 	const currency = erpnext.get_currency(frm.doc.company);
+	const temporary = format_currency(Math.abs(stats.temporary_opening || 0), currency);
 	const dialog = new frappe.ui.Dialog({
 		title: __("Go live"),
-		fields: [{ fieldname: "summary", fieldtype: "HTML" }],
+		fields: [
+			{ fieldname: "summary", fieldtype: "HTML" },
+			{
+				fieldname: "accept_temporary_opening",
+				fieldtype: "Check",
+				label: __("I understand {0} in Temporary Opening isn't explained yet", [temporary]),
+				hidden: !stats.temporary_opening,
+				onchange: () => set_primary_enabled(),
+			},
+		],
 		primary_action_label: __("Go live"),
-		primary_action: () =>
-			frm.call("go_live").then(() => {
+		primary_action: (values) =>
+			frm.call("go_live", { accept_temporary_opening: values.accept_temporary_opening }).then(() => {
 				dialog.hide();
 				frappe.show_alert({ message: __("{0} is live", [frm.doc.company]), indicator: "green" });
 				frm.reload_doc();
@@ -354,14 +507,27 @@ function show_go_live(frm) {
 	const $body = $(`<div class="flex flex-col gap-3"></div>`);
 	$(`<div class="text-p-sm text-ink-gray-6"></div>`)
 		.text(
-			frm.doc.migration_date
-				? __("{0} moves to ERPNext on {1}. Nothing here stops you.", [
+			[
+				frm.doc.migration_date &&
+					__("{0} moves to ERPNext on {1}.", [
 						frm.doc.company,
 						frappe.datetime.str_to_user(frm.doc.migration_date),
-				  ])
-				: __("Nothing here stops you.")
+					]),
+				stats.temporary_opening
+					? __("Only money left in Temporary Opening needs a tick.")
+					: __("Nothing here stops you."),
+			]
+				.filter(Boolean)
+				.join(" ")
 		)
 		.appendTo($body);
+	const set_primary_enabled = () =>
+		dialog
+			.get_primary_btn()
+			.prop(
+				"disabled",
+				Boolean(stats.temporary_opening) && !dialog.get_value("accept_temporary_opening")
+			);
 	const $list = $(`<div class="flex flex-col"></div>`).appendTo($body);
 	for (const step of steps) {
 		$list.append($(`<div class="border-t py-2"></div>`).append(make_task(frm, step, [])));
@@ -369,11 +535,11 @@ function show_go_live(frm) {
 	if (stats.temporary_opening) {
 		$body.append(
 			frappe.ui.alert({
-				theme: "yellow",
-				title: __("{0} is left in Temporary Opening", [
-					format_currency(Math.abs(stats.temporary_opening), currency),
-				]),
-				description: __("Fix it any time with a journal entry, or by adding what is missing."),
+				theme: "red",
+				title: __("{0} is left in Temporary Opening", [temporary]),
+				description: __(
+					"Your opening books don't add up yet: something from your old books is missing, such as stock, an advance or a balance left out of your sheet. You can still go live and add it later."
+				),
 				footer: () =>
 					$(`<div class="flex gap-2"></div>`).append(frappe.ui.button(see_books_button(frm))),
 			})
@@ -381,6 +547,7 @@ function show_go_live(frm) {
 	}
 	dialog.get_field("summary").$wrapper.append($body);
 	dialog.show();
+	set_primary_enabled();
 }
 
 // Buttons of each task on its own tab, by the last part of its hook path
@@ -456,6 +623,7 @@ function show_opening_balances(frm, result) {
 				label: __("Balances"),
 				cannot_add_rows: false,
 				in_place_edit: true,
+				on_delete_rows: () => update_totals(),
 				data: (frm.doc.opening_balances || [])
 					.filter((row) => row.status !== "Posted")
 					.map((row) => ({ ...row, name: undefined })),
@@ -477,6 +645,9 @@ function show_opening_balances(frm, result) {
 						columns: 2,
 						// a new account is added with this company's Add account, not the full form
 						only_select: 1,
+						filter_description: __(
+							"Customer, supplier, stock and temporary accounts aren't listed: they come in their own way."
+						),
 						get_query: () => ({
 							filters: [
 								["company", "=", company],
@@ -492,7 +663,10 @@ function show_opening_balances(frm, result) {
 								.get_value("Account", row.account, ["account_type", "root_type"])
 								.then((r) => {
 									Object.assign(row, r.message || {});
-									dialog.fields_dict.balances.grid.refresh();
+									// the row being edited isn't redrawn by a grid refresh
+									for (const fieldname of ["account_type", "root_type"]) {
+										this.grid_row?.refresh_field(fieldname);
+									}
 								});
 						},
 					},
@@ -531,6 +705,10 @@ function show_opening_balances(frm, result) {
 				],
 			},
 			{ fieldname: "totals", fieldtype: "HTML" },
+			...where_to_find_fields(frm, "opening_balances", {
+				has_data: (frm.doc.opening_balances || []).length > posted.length,
+				posted: posted.length,
+			}),
 		],
 		primary_action_label: __("Save"),
 		primary_action: () => {
@@ -808,6 +986,10 @@ function make_posting_preview(preview, currency) {
 	const expenses = sum(of("Expense"));
 	const profit = income - expenses;
 	const money = (value) => format_currency(value, currency);
+	// each account sits on the side its balance falls on, so Input GST (a debit under taxes) is an asset
+	const balance_sheet = of("Asset", "Liability", "Equity");
+	const debits = balance_sheet.filter((row) => row.balance > 0);
+	const credits = balance_sheet.filter((row) => row.balance < 0);
 
 	const $body = $(`<div class="flex flex-col gap-3"></div>`);
 	$(`<div class="text-p-sm text-ink-gray-6"></div>`)
@@ -820,6 +1002,20 @@ function make_posting_preview(preview, currency) {
 				: __("What the books show on the day before migration, with everything posted so far.")
 		)
 		.appendTo($body);
+	if (preview.left_out_invoices) {
+		$(`<div class="text-p-sm text-ink-gray-6"></div>`)
+			.text(
+				preview.left_out_invoices === 1
+					? __(
+							"1 invoice is left out: its customer or supplier isn't in ERPNext yet, or is disabled."
+					  )
+					: __(
+							"{0} invoices are left out: their customer or supplier isn't in ERPNext yet, or is disabled.",
+							[preview.left_out_invoices]
+					  )
+			)
+			.appendTo($body);
+	}
 	if (temporary) {
 		$body.append(
 			frappe.ui.alert({
@@ -839,14 +1035,14 @@ function make_posting_preview(preview, currency) {
 				$(`<div class="flex gap-6 pt-3"></div>`).append(
 					make_statement_side(
 						__("Assets"),
-						of("Asset"),
+						debits,
 						1,
 						money,
 						temporary?.balance > 0 ? [[__("Temporary Opening"), temporary.balance, true]] : []
 					),
 					make_statement_side(
 						__("Liabilities and Equity"),
-						of("Liability", "Equity"),
+						credits,
 						-1,
 						money,
 						[
@@ -954,7 +1150,7 @@ function invoice_buttons(frm, party_type) {
 			label: __("Post to books"),
 			disabled: !!blocker,
 			tooltip: blocker || undefined,
-			onclick: () => create_opening_invoices(frm, party_type, drafts),
+			onclick: () => post_opening_invoices(frm, party_type, { rows: drafts }),
 		},
 	];
 	if (rows.some((row) => row.status === "Created")) {
@@ -973,10 +1169,19 @@ function invoice_buttons(frm, party_type) {
 }
 
 function show_opening_invoices(frm, party_type, result) {
+	frm.call("get_invoice_names", { party_type: party_type }).then((r) =>
+		make_opening_invoices_dialog(frm, party_type, r.message, result)
+	);
+}
+
+function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const party = PARTY[party_type];
 	const rows = frm.doc[party.table] || [];
 	const created = rows.filter((row) => row.status === "Created").length;
-	const failed = rows.filter((row) => row.status === "Failed");
+	const disabled = new Set(names.disabled || []);
+	const data = rows
+		.filter((row) => row.status !== "Created")
+		.map((row) => ({ ...row, name: undefined, party: row.party || names.found?.[row.party_name] }));
 	const dialog = new frappe.ui.Dialog({
 		title: party_type === "Customer" ? __("Opening sales invoices") : __("Opening purchase invoices"),
 		size: "extra-large",
@@ -987,17 +1192,38 @@ function show_opening_invoices(frm, party_type, result) {
 				fieldtype: "Table",
 				label: __("Unpaid invoices"),
 				in_place_edit: true,
-				data: rows
-					.filter((row) => row.status !== "Created")
-					.map((row) => ({ ...row, name: undefined })),
+				on_delete_rows: () => refresh_state(),
+				data: data,
 				fields: [
 					{
 						fieldname: "party_name",
 						fieldtype: "Data",
-						label: __(party_type),
+						label: __("From sheet"),
 						in_list_view: 1,
 						columns: 3,
-						reqd: 1,
+						formatter: (value, df, options, doc) => {
+							const badge = value && get_party_badge(doc, names, disabled);
+							return `<span class="flex items-center gap-2 min-w-0">
+								<span class="truncate">${frappe.form.formatters.Data(value, df)}</span>
+								${badge ? `<span class="shrink-0">${badge}</span>` : ""}
+							</span>`;
+						},
+						onchange: () => refresh_state(),
+					},
+					{
+						fieldname: "party",
+						fieldtype: "Link",
+						options: party_type,
+						label: __(party_type),
+						in_list_view: 1,
+						columns: 2,
+						get_query: () => ({ filters: { disabled: 0 } }),
+						onchange: function () {
+							const row = this.doc;
+							if (row && row.party && !row.party_name) row.party_name = row.party;
+							this.grid_row?.refresh_field("party_name");
+							refresh_state();
+						},
 					},
 					{
 						fieldname: "invoice_number",
@@ -1011,15 +1237,9 @@ function show_opening_invoices(frm, party_type, result) {
 						fieldtype: "Date",
 						label: __("Invoice Date"),
 						in_list_view: 1,
-						columns: 2,
-					},
-					{
-						fieldname: "due_date",
-						fieldtype: "Date",
-						label: __("Due Date"),
-						in_list_view: 1,
 						columns: 1,
 					},
+					{ fieldname: "due_date", fieldtype: "Date", label: __("Due Date") },
 					{
 						fieldname: "outstanding_amount",
 						fieldtype: "Currency",
@@ -1027,31 +1247,58 @@ function show_opening_invoices(frm, party_type, result) {
 						in_list_view: 1,
 						columns: 2,
 						reqd: 1,
-						onchange: () => update_totals(),
+						onchange: () => refresh_state(),
 					},
 				],
 			},
-			{ fieldname: "totals", fieldtype: "HTML" },
+			...where_to_find_fields(frm, party.table, { has_data: data.length, posted: created }),
+			{ fieldname: "add_missing_section", fieldtype: "Section Break" },
+			{
+				fieldname: "add_missing",
+				fieldtype: "Check",
+				description:
+					party_type === "Customer"
+						? __(
+								"Each is saved like any new customer. If one can't be saved, its invoices stay as drafts and you see why."
+						  )
+						: __(
+								"Each is saved like any new supplier. If one can't be saved, its bills stay as drafts and you see why."
+						  ),
+			},
 		],
-		primary_action_label: __("Save"),
+		primary_action_label: __("Post to books"),
 		primary_action: () => {
 			const values = dialog.get_values();
 			if (!values) return;
-			frm.call("save_opening_invoices", { party_type: party_type, rows: values.invoices || [] }).then(
-				() => {
-					dialog.hide();
-					frm.reload_doc();
-				}
+			save().then(() =>
+				post_opening_invoices(frm, party_type, {
+					rows: values.invoices || [],
+					disabled: disabled,
+					add_missing: !!values.add_missing,
+					before_post: () => dialog.hide(),
+				})
 			);
 		},
+		secondary_action_label: __("Save draft"),
+		secondary_action: () => {
+			if (!dialog.get_values()) return;
+			save().then(() => dialog.hide());
+		},
 	});
+	const save = () =>
+		frm
+			.call("save_opening_invoices", {
+				party_type: party_type,
+				rows: dialog.get_value("invoices") || [],
+			})
+			.then(() => frm.reload_doc());
 
 	const $intro = dialog.get_field("intro").$wrapper;
 	$(`<div class="flex flex-wrap items-center justify-between gap-2 mb-3"></div>`)
 		.append(
 			$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
 				__(
-					"Every invoice still unpaid on the day before migration, from your {0} report. Each one becomes an opening invoice, so payments can be matched to it later.",
+					"Every invoice still unpaid on the day before migration, from your {0} report. Each one becomes an opening invoice, so payments can be matched to it later. Enter an advance as a negative amount.",
 					[party.report]
 				)
 			),
@@ -1074,88 +1321,370 @@ function show_opening_invoices(frm, party_type, result) {
 			)
 		)
 		.appendTo($intro);
+	const $stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
+	const $names = $(`<div class="flex flex-col gap-2 mb-3"></div>`).appendTo($intro);
 	const $notes = $(`<div class="flex flex-col gap-2 mb-3"></div>`).appendTo($intro);
 	if (result?.advances) {
 		$notes.append(
 			frappe.ui.alert({
-				theme: "yellow",
-				title: __("{0} rows with a negative amount were left out", [result.advances]),
-				description: __("Money paid in advance is not an invoice. Record it as an advance payment."),
+				theme: "blue",
+				title:
+					result.advances === 1
+						? __("1 row with a negative amount is an advance")
+						: __("{0} rows with a negative amount are advances", [result.advances]),
+				description:
+					party_type === "Customer"
+						? __(
+								"Money customers paid before any bill. Each one is posted as an advance, to be set against their next invoice."
+						  )
+						: __(
+								"Money you paid suppliers before any bill. Each one is posted as an advance, to be set against their next bill."
+						  ),
 			})
 		);
 	}
+	// missing and disabled names have their own banners
+	const failed = data.filter((row) => row.status === "Failed" && row.party && !disabled.has(row.party));
 	if (failed.length) {
 		$notes.append(
 			frappe.ui.alert({
 				theme: "red",
-				title: __("{0} invoices could not be posted", [failed.length]),
+				title:
+					failed.length === 1
+						? __("1 invoice could not be posted")
+						: __("{0} invoices could not be posted", [failed.length]),
 				description: failed.map((row) => `${row.party_name}: ${row.error}`).join("; "),
 			})
 		);
 	}
-	if (created) {
-		$(`<div class="text-p-sm text-ink-gray-5"></div>`)
-			.text(__("{0} invoices are posted already and stay as they are.", [created]))
-			.appendTo($notes);
-	}
-	frm.call("get_invoice_names", { party_type: party_type }).then((r) =>
-		$notes.prepend(make_name_notes(dialog, party_type, r.message))
-	);
-
-	const currency = erpnext.get_currency(frm.doc.company);
-	const update_totals = () => {
-		const data = dialog.fields_dict.invoices.df.data || [];
-		const total = data.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
-		dialog
-			.get_field("totals")
-			.$wrapper.empty()
-			.append(
-				$(`<div class="flex justify-end text-sm-medium text-ink-gray-8"></div>`).text(
-					__("{0} invoices · {1}", [data.length, format_currency(total, currency)])
-				)
-			);
-	};
-	dialog.show();
-	update_totals();
-}
-
-// New names, and names that look like an existing customer or supplier
-function make_name_notes(dialog, party_type, names) {
-	const $notes = $(`<div class="flex flex-col gap-2"></div>`);
-	for (const [name, existing] of Object.entries(names.suggestions || {})) {
-		const use_existing = () => {
-			for (const row of dialog.fields_dict.invoices.df.data || []) {
-				if (row.party_name === name) row.party_name = existing;
-			}
-			dialog.fields_dict.invoices.grid.refresh();
-			$alert.remove();
-		};
-		const $alert = frappe.ui.alert({
-			theme: "yellow",
-			title: __("{0} looks like {1}", [name, existing]),
-			footer: () =>
-				$(`<div class="flex gap-2"></div>`).append(
-					frappe.ui.button({ label: __("Use {0}", [existing]), onclick: use_existing }),
-					frappe.ui.button({
-						label: __("Keep as new"),
-						variant: "ghost",
-						onclick: () => $alert.remove(),
-					})
-				),
-		});
-		$notes.append($alert);
-	}
-	const fresh = (names.new || []).filter((name) => !names.suggestions?.[name]);
-	if (fresh.length) {
+	if (created || result?.skipped) {
 		$(`<div class="text-p-sm text-ink-gray-5"></div>`)
 			.text(
-				party_type === "Customer"
-					? __("New customers, added when you post: {0}", [fresh.join(", ")])
-					: __("New suppliers, added when you post: {0}", [fresh.join(", ")])
+				result?.skipped
+					? result.skipped === 1
+						? __("1 invoice on the sheet is posted already, so it was left out.")
+						: __("{0} invoices on the sheet are posted already, so they were left out.", [
+								result.skipped,
+						  ])
+					: created === 1
+					? __("1 invoice is posted already and stays as it is.")
+					: __("{0} invoices are posted already and stay as they are.", [created])
 			)
 			.appendTo($notes);
 	}
-	return $notes;
+
+	const currency = erpnext.get_currency(frm.doc.company);
+	const refresh_state = () => {
+		const state = get_party_state(dialog.get_value("invoices") || [], disabled);
+		$stats
+			.empty()
+			.toggle(!!state.names.length)
+			.append(state.names.length ? make_opening_invoice_stats(frm, party_type, state, currency) : []);
+		$names.empty().append(make_party_banners(party_type, state, () => make_add_party_menu()));
+		dialog.set_df_property("add_missing", "hidden", !state.new_names.length);
+		dialog.set_df_property(
+			"add_missing",
+			"label",
+			party_type === "Customer"
+				? state.new_names.length === 1
+					? __("Create {0} when posting", [state.new_names[0]])
+					: __("Create the {0} new customers when posting", [state.new_names.length])
+				: state.new_names.length === 1
+				? __("Create {0} when posting", [state.new_names[0]])
+				: __("Create the {0} new suppliers when posting", [state.new_names.length])
+		);
+		if (!state.new_names.length) dialog.set_value("add_missing", 0);
+	};
+	const link_rows = (name, party_name) => {
+		const rows = (dialog.get_value("invoices") || []).filter(
+			(row) => !row.party && row.party_name === name
+		);
+		rows.forEach((row) => (row.party = party_name));
+		dialog.fields_dict.invoices.grid.refresh();
+		refresh_state();
+		return rows.length;
+	};
+	const add_party = (name) =>
+		frappe.model.with_doctype(party_type, () => {
+			const doc = frappe.model.get_new_doc(party_type);
+			doc[party.name_field] = name;
+			frappe.ui.form.make_quick_entry(
+				party_type,
+				(saved) => {
+					// a full form passes itself; the quick entry passes the saved doc
+					const linked = link_rows(name, (saved.doc || saved).name);
+					frappe.show_alert({
+						message:
+							linked === 1
+								? __("{0} added. 1 invoice linked.", [name])
+								: __("{0} added. {1} invoices linked.", [name, linked]),
+						indicator: "green",
+					});
+				},
+				null,
+				doc
+			);
+		});
+	const make_add_party_menu = () => {
+		const state = get_party_state(dialog.get_value("invoices") || [], disabled);
+		const shown = state.new_names.slice(0, ADD_ONE_BY_ONE_LIMIT);
+		const rows = shown.map((name) => {
+			const invoices = state.invoices.filter((row) => !row.party && row.party_name === name);
+			const total = format_currency(
+				invoices.reduce((sum, row) => sum + flt(row.outstanding_amount), 0),
+				currency
+			);
+			const existing = names.suggestions?.[name];
+			if (!existing) {
+				return {
+					label: name,
+					icon: "user",
+					icon_right: "plus",
+					description:
+						party_type === "Customer"
+							? invoices.length === 1
+								? __("1 invoice · {0} · Create", [total])
+								: __("{0} invoices · {1} · Create", [invoices.length, total])
+							: invoices.length === 1
+							? __("1 bill · {0} · Create", [total])
+							: __("{0} bills · {1} · Create", [invoices.length, total]),
+					onclick: () => add_party(name),
+				};
+			}
+			return {
+				label: name,
+				icon: "user",
+				description: __("Did you mean {0}?", [existing]),
+				submenu: [
+					{
+						label: __("Use {0}", [existing]),
+						icon: "link",
+						description:
+							party_type === "Customer"
+								? __("An existing customer. Links its invoices.")
+								: __("An existing supplier. Links its bills."),
+						onclick: () => {
+							const linked = link_rows(name, existing);
+							frappe.show_alert({
+								message:
+									linked === 1
+										? __("1 invoice linked to {0}.", [existing])
+										: __("{0} invoices linked to {1}.", [linked, existing]),
+								indicator: "green",
+							});
+						},
+					},
+					{
+						label: __("Create {0}", [name]),
+						icon: "plus",
+						description:
+							party_type === "Customer"
+								? __("A new customer. Opens its form.")
+								: __("A new supplier. Opens its form."),
+						onclick: () => add_party(name),
+					},
+				],
+			};
+		});
+		if (state.new_names.length > shown.length) {
+			rows.push({
+				label: __("And {0} more", [state.new_names.length - shown.length]),
+				icon: "ellipsis",
+				description: __("Too many to add one by one. Use a sheet for these."),
+				disabled: true,
+			});
+		}
+		const create_group = {
+			group: __("Create now"),
+			options: [
+				{
+					label: __("Fill one by one"),
+					icon: "user-plus",
+					description: __("Pick a name to open its form."),
+					submenu: rows,
+				},
+			],
+		};
+		const sheet_group = {
+			group: __("Use a sheet"),
+			options: [
+				{
+					label: __("Download as sheet"),
+					icon: "download",
+					description: __("These names in the import sheet."),
+					onclick: () =>
+						open_url_post(
+							"/api/method/erpnext.setup.doctype.company_setup.opening_invoices.download_new_parties",
+							{ company: frm.doc.company, party_type: party_type }
+						),
+				},
+				{
+					label: __("Import filled sheet"),
+					icon: "upload",
+					description: __("Back through the standard import."),
+					onclick: import_parties,
+				},
+			],
+		};
+		return frappe.ui.dropdown({
+			button: {
+				label:
+					state.new_names.length === 1
+						? __("Add {0}", [state.new_names[0]])
+						: party_type === "Customer"
+						? __("Add {0} customers", [state.new_names.length])
+						: __("Add {0} suppliers", [state.new_names.length]),
+				icon_right: "chevron-down",
+			},
+			// with many new names a sheet is the quicker way
+			options:
+				state.new_names.length > ADD_ONE_BY_ONE_LIMIT
+					? [sheet_group, create_group]
+					: [create_group, sheet_group],
+		});
+	};
+	// the import runs in its own dialog; this one comes back after it, with the names matched again
+	const import_parties = () =>
+		save().then(() => {
+			dialog.hide();
+			frappe.require("data_import_tools.bundle.js", () =>
+				frappe.data_import.open_data_import_dialog({
+					reference_doctype: party_type,
+					import_type: "Insert New Records",
+					on_close: () => show_opening_invoices(frm, party_type),
+				})
+			);
+		});
+
+	// a quick entry that opens the full form takes the page: keep the rows and come back to them
+	const route = frappe.get_route_str();
+	dialog.onhide = () => {
+		if (frappe.get_route_str() === route) return;
+		frm.reopen_opening_invoices = party_type;
+		frm.call("save_opening_invoices", {
+			party_type: party_type,
+			rows: dialog.get_value("invoices") || [],
+		});
+	};
+	dialog.show();
+	refresh_state();
+}
+
+// What the rows say about their customers or suppliers: new names, found ones and disabled ones
+function get_party_state(rows, disabled) {
+	const unique = (list) => [...new Set(list)];
+	const named = rows.filter((row) => row.party_name || row.party);
+	const invoices = named.filter((row) => flt(row.outstanding_amount) > 0);
+	return {
+		invoices: invoices,
+		advance: -named
+			.filter((row) => flt(row.outstanding_amount) < 0)
+			.reduce((sum, row) => sum + flt(row.outstanding_amount), 0),
+		names: unique(named.map((row) => row.party || row.party_name)),
+		new_names: unique(named.filter((row) => !row.party).map((row) => row.party_name)),
+		found: unique(named.filter((row) => row.party && !disabled.has(row.party)).map((row) => row.party)),
+		disabled: unique(named.filter((row) => disabled.has(row.party)).map((row) => row.party)),
+	};
+}
+
+function get_party_badge(row, names, disabled) {
+	if (!row?.party) return frappe.ui.badge.html({ label: __("New"), theme: "orange" });
+	if (disabled.has(row.party)) return frappe.ui.badge.html({ label: __("Disabled"), theme: "red" });
+	if (names.similar?.[row.party_name] === row.party) {
+		return frappe.ui.badge.html({ label: __("Similar name"), theme: "blue" });
+	}
+	return "";
+}
+
+function make_opening_invoice_stats(frm, party_type, state, currency) {
+	const total = state.invoices.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
+	const day_before =
+		frm.doc.migration_date &&
+		frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1));
+	const found_caption = [
+		state.found.length && __("{0} found", [state.found.length]),
+		state.disabled.length && __("{0} disabled", [state.disabled.length]),
+	]
+		.filter(Boolean)
+		.join(" · ");
+	return [
+		frappe.ui.stat_card({
+			label: __("On your sheet"),
+			value: format_currency(total, currency),
+			caption: state.advance
+				? party_type === "Customer"
+					? __("Less {0} customers paid in advance", [format_currency(state.advance, currency)])
+					: __("Less {0} paid to suppliers in advance", [format_currency(state.advance, currency)])
+				: day_before && __("On {0}", [day_before]),
+		}),
+		frappe.ui.stat_card({
+			label: party_type === "Customer" ? __("Invoices") : __("Bills"),
+			value: format_number(state.invoices.length, null, 0),
+			caption:
+				state.names.length === 1
+					? __("From {0}", [state.names[0]])
+					: party_type === "Customer"
+					? __("From {0} customers", [state.names.length])
+					: __("From {0} suppliers", [state.names.length]),
+		}),
+		frappe.ui.stat_card({
+			label: party_type === "Customer" ? __("Customers") : __("Suppliers"),
+			value: state.new_names.length
+				? __("{0} new", [state.new_names.length])
+				: __("All {0} found", [state.names.length]),
+			caption: state.new_names.length
+				? found_caption
+				: state.disabled.length
+				? __("{0} disabled", [state.disabled.length])
+				: __("Ready to post"),
+		}),
+	];
+}
+
+function make_party_banners(party_type, state, make_add_menu) {
+	const banners = [];
+	const list = (names) =>
+		names.length > 3
+			? __("{0} and {1} more", [names.slice(0, 3).join(", "), names.length - 3])
+			: names.join(", ");
+	if (state.new_names.length) {
+		banners.push(
+			frappe.ui.alert({
+				theme: "yellow",
+				title:
+					party_type === "Customer"
+						? state.new_names.length === 1
+							? __("{0} isn't a customer in ERPNext yet", [state.new_names[0]])
+							: __("{0} customers aren't in ERPNext yet", [state.new_names.length])
+						: state.new_names.length === 1
+						? __("{0} isn't a supplier in ERPNext yet", [state.new_names[0]])
+						: __("{0} suppliers aren't in ERPNext yet", [state.new_names.length]),
+				description:
+					state.new_names.length === 1
+						? __("Add it here, or tick the box at the end to create it when posting.")
+						: list(state.new_names) +
+						  ". " +
+						  __("Add them here, or tick the box at the end to create them when posting."),
+				footer: make_add_menu,
+			})
+		);
+	}
+	if (state.disabled.length) {
+		banners.push(
+			frappe.ui.alert({
+				theme: "red",
+				title:
+					state.disabled.length === 1
+						? __("{0} is disabled", [state.disabled[0]])
+						: __("{0} are disabled", [list(state.disabled)]),
+				description:
+					state.disabled.length === 1
+						? __("Its invoices won't be posted. Enable it first.")
+						: __("Their invoices won't be posted. Enable them first."),
+			})
+		);
+	}
+	return banners;
 }
 
 function upload_opening_invoices(frm, party_type, dialog) {
@@ -1183,38 +1712,154 @@ function upload_opening_invoices(frm, party_type, dialog) {
 	);
 }
 
-function create_opening_invoices(frm, party_type, drafts) {
+// Ask before posting, saying what is posted and what stays a draft, then post and say how it went
+function post_opening_invoices(frm, party_type, { rows, disabled = new Set(), add_missing, before_post }) {
 	const currency = erpnext.get_currency(frm.doc.company);
-	const total = drafts.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
-	const args = [
-		drafts.length,
-		format_currency(total, currency),
-		frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1)),
-	];
-	frappe.confirm(
+	const money = (list) =>
+		format_currency(
+			list.reduce((sum, row) => sum + flt(row.outstanding_amount), 0),
+			currency
+		);
+	const named = rows.filter((row) => row.status !== "Created" && (row.party_name || row.party));
+	const can_post = (row) => (row.party || add_missing) && !disabled.has(row.party);
+	const posting = named.filter(can_post);
+	const waiting = named.filter((row) => !can_post(row));
+	const new_names = add_missing
+		? [...new Set(named.filter((row) => !row.party).map((row) => row.party_name))]
+		: [];
+	if (!posting.length) {
+		frappe.msgprint(
+			party_type === "Customer"
+				? __("None of these invoices can be posted yet: add or enable their customers first.")
+				: __("None of these bills can be posted yet: add or enable their suppliers first.")
+		);
+		return;
+	}
+	const day_before = frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1));
+	const lines = [
 		party_type === "Customer"
+			? posting.length === 1
+				? __(
+						"Post 1 unpaid invoice ({0}) as an opening invoice, recording what the customer owed on {1}? Nothing is sent to the customer.",
+						[money(posting), day_before]
+				  )
+				: __(
+						"Post {0} unpaid invoices ({1}) as opening invoices, recording what customers owed on {2}? Nothing is sent to customers.",
+						[posting.length, money(posting), day_before]
+				  )
+			: posting.length === 1
 			? __(
-					"Post {0} unpaid invoices ({1}) to the books as opening invoices? They record what customers owed on {2}. Nothing is sent to customers. New names become customers.",
-					args
+					"Post 1 unpaid bill ({0}) as an opening invoice, recording what you owed the supplier on {1}? Nothing is sent to the supplier.",
+					[money(posting), day_before]
 			  )
 			: __(
-					"Post {0} unpaid bills ({1}) to the books as opening invoices? They record what you owed suppliers on {2}. Nothing is sent to suppliers. New names become suppliers.",
-					args
+					"Post {0} unpaid bills ({1}) as opening invoices, recording what you owed suppliers on {2}? Nothing is sent to suppliers.",
+					[posting.length, money(posting), day_before]
 			  ),
-		() =>
-			frm.call("create_opening_invoices", { party_type: party_type }).then((r) => {
-				if (r.message === "queued") {
-					frappe.show_alert({
-						message: __(
-							"Posting the invoices in the background. This page updates when they are done."
-						),
-						indicator: "blue",
-					});
-				} else {
-					frm.reload_doc();
-				}
-			})
-	);
+	];
+	if (new_names.length) {
+		lines.push(
+			party_type === "Customer"
+				? __("New customers are added first: {0}.", [new_names.join(", ")])
+				: __("New suppliers are added first: {0}.", [new_names.join(", ")])
+		);
+	}
+	if (waiting.length) {
+		lines.push(
+			party_type === "Customer"
+				? waiting.length === 1
+					? __("1 invoice ({0}) stays as a draft until its customer is added or enabled.", [
+							money(waiting),
+					  ])
+					: __("{0} invoices ({1}) stay as drafts until their customer is added or enabled.", [
+							waiting.length,
+							money(waiting),
+					  ])
+				: waiting.length === 1
+				? __("1 bill ({0}) stays as a draft until its supplier is added or enabled.", [
+						money(waiting),
+				  ])
+				: __("{0} bills ({1}) stay as drafts until their supplier is added or enabled.", [
+						waiting.length,
+						money(waiting),
+				  ])
+		);
+	}
+	const advances = posting.filter((row) => flt(row.outstanding_amount) < 0).length;
+	if (advances) {
+		lines.push(
+			advances === 1
+				? __("1 negative row is posted as an advance.")
+				: __("{0} negative rows are posted as advances.", [advances])
+		);
+	}
+	frappe.confirm(lines.join(" "), () => {
+		before_post?.();
+		frm.call("create_opening_invoices", {
+			party_type: party_type,
+			add_missing: add_missing ? 1 : 0,
+		}).then((r) => {
+			if (r.message === "queued") {
+				frappe.show_alert({
+					message: __(
+						"Posting the invoices in the background. This page updates when they are done."
+					),
+					indicator: "blue",
+				});
+			} else {
+				frm.reload_doc().then(() => show_posting_result(frm, party_type, new_names));
+			}
+		});
+	});
+}
+
+// Say which new names were added and why any row stays a draft, not only in the table
+function show_posting_result(frm, party_type, new_names = []) {
+	const rows = frm.doc[PARTY[party_type].table] || [];
+	const failed = rows.filter((row) => row.status === "Failed");
+	const added = new_names.filter((name) => rows.some((row) => row.party_name === name && row.party));
+	if (!failed.length) {
+		frappe.show_alert({
+			message: added.length
+				? __("Posted. Added {0}.", [added.join(", ")])
+				: party_type === "Customer"
+				? __("Invoices posted.")
+				: __("Bills posted."),
+			indicator: "green",
+		});
+		return;
+	}
+	const $message = $("<div></div>");
+	if (added.length) {
+		$(`<p></p>`)
+			.text(
+				party_type === "Customer"
+					? __("New customers added: {0}.", [added.join(", ")])
+					: __("New suppliers added: {0}.", [added.join(", ")])
+			)
+			.appendTo($message);
+	}
+	$(`<p></p>`)
+		.text(__("The rest are posted. Fix the reason below, then post again: only these rows are tried."))
+		.appendTo($message);
+	const $list = $(`<ul class="mb-0"></ul>`).appendTo($message);
+	for (const row of failed) {
+		$("<li></li>")
+			.text(`${row.party_name}${row.invoice_number ? ` (${row.invoice_number})` : ""}: ${row.error}`)
+			.appendTo($list);
+	}
+	frappe.msgprint({
+		title:
+			party_type === "Customer"
+				? failed.length === 1
+					? __("1 invoice could not be posted")
+					: __("{0} invoices could not be posted", [failed.length])
+				: failed.length === 1
+				? __("1 bill could not be posted")
+				: __("{0} bills could not be posted", [failed.length]),
+		message: $message.html(),
+		indicator: "red",
+	});
 }
 
 function import_buttons(frm, doctype) {
@@ -1438,6 +2083,10 @@ function show_chart_import(frm) {
 				change: () => preview(),
 			},
 			{ fieldname: "preview", fieldtype: "HTML" },
+			...where_to_find_fields(frm, "chart_of_accounts", {
+				has_data: false,
+				posted: frm.doc.chart_of_accounts_source === "Imported",
+			}),
 		],
 		primary_action_label: __("Replace chart"),
 		primary_action: ({ file }) =>
@@ -1455,10 +2104,21 @@ function show_chart_import(frm) {
 							freeze: true,
 							freeze_message: __("Importing the chart..."),
 						})
-						.then(() => {
+						.then((r) => {
 							dialog.hide();
 							frm.reload_doc();
-							frappe.show_alert({ message: __("Chart imported"), indicator: "green" });
+							const added = r.message?.added_accounts || [];
+							frappe.show_alert(
+								{
+									message: added.length
+										? __("Chart imported. Added accounts ERPNext needs: {0}", [
+												added.join(", "),
+										  ])
+										: __("Chart imported"),
+									indicator: "green",
+								},
+								added.length ? 10 : 5
+							);
 						})
 			),
 	});

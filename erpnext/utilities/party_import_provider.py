@@ -284,6 +284,10 @@ def _add_plain_headers(schema: dict, tables: tuple) -> None:
 	for table in schema["child_tables"]:
 		if table["fieldname"] in tables:
 			for df in table["fields"]:
+				# a sheet's "Address" column holds the address itself, not a link to one
+				if df.get("fieldtype") == "Link" and df.get("options") in ("Address", "Contact"):
+					df["import_labels"] = []
+					continue
 				df["import_labels"] = [
 					header
 					for header in _plain_headers(df)
