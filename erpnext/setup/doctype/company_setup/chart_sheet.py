@@ -8,12 +8,15 @@ closing columns, of which the closing ones are used.
 """
 
 import csv
-from io import StringIO
+import re
+from io import BytesIO, StringIO
 
 import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt
-from frappe.utils.xlsxutils import make_xlsx
+from frappe.utils.csvutils import read_csv_content
+from frappe.utils.xlsxutils import make_xlsx, read_xls_file_from_attached_file
+from openpyxl import load_workbook
 
 from erpnext.accounts.doctype.chart_of_accounts_importer.chart_of_accounts_importer import (
 	build_forest,
@@ -35,12 +38,30 @@ REQUIRED_ROOT_TYPES = ("Asset", "Liability", "Income", "Expense")
 # account takes the difference, so these accounts get no opening balance of their own
 NO_OPENING_BALANCE = ("Receivable", "Payable", "Stock", "Temporary")
 BALANCE_SHEET_COLUMNS = ("Account Number", "Account Name", "Debit", "Credit")
-# the amount columns a sheet may have, the closing ones first: they are the balances on the day
-AMOUNT_COLUMNS = (
-	("closing_debit", "closing_credit"),
-	("debit", "credit"),
-	("opening_debit", "opening_credit"),
-)
+GROUP_COLUMNS = ("group", "under", "parent_group", "account_group")
+NAME_COLUMNS = ("account_name", "account", "particulars", "ledger", "ledger_name", "name")
+# how far down a report's headings may be, under its title rows
+HEADING_ROWS = 15
+# a report's own lines that add up the others
+TOTAL_LINE = re.compile(r"^(grand\s+)?total(\s+for\s.*)?:?$", re.IGNORECASE)
+# the groups other software keeps customers, suppliers and stock under (Tally, Busy, QuickBooks)
+PARTY_GROUPS = {
+	"Receivable": (
+		"sundry debtors",
+		"debtors",
+		"accounts receivable",
+		"accounts receivable a r",
+		"trade receivables",
+	),
+	"Payable": (
+		"sundry creditors",
+		"creditors",
+		"accounts payable",
+		"accounts payable a p",
+		"trade payables",
+	),
+	"Stock": ("stock in hand", "closing stock", "inventory", "inventory asset"),
+}
 
 
 def read_chart_sheet(file_url: str) -> frappe._dict:
@@ -93,31 +114,145 @@ def read_rows(file_doc, extension: str, as_dict: bool = False) -> list:
 
 
 def read_balance_sheet(file_url: str) -> list[frappe._dict]:
-	"""The accounts of a balances sheet or trial balance that have a balance."""
-	file_doc, extension = get_file(file_url)
-	rows = read_rows(file_doc, extension, as_dict=True)
-	headers = rows[0].keys() if rows else ()
-	amounts = next((pair for pair in AMOUNT_COLUMNS if set(pair) <= set(headers)), None)
-	name_column = next((key for key in ("account_name", "account", "particulars") if key in headers), None)
-	if not amounts or not name_column:
+	"""The lines of a balances sheet or trial balance, as exported from other software: under a few
+	title rows, with group lines that total the lines indented under them, and a total at the end.
+	Each line knows the groups it is under; group lines are marked, totals left out."""
+	rows = read_report(file_url)
+	keys = [[get_column_key(value) for value in row.cells] for row in rows]
+	heading, amounts = next(
+		(
+			(i, get_amount_columns(keys[max(i - 3, 0) : i + 1]))
+			for i in range(min(len(keys), HEADING_ROWS))
+			if get_amount_columns(keys[max(i - 3, 0) : i + 1])
+		),
+		(None, None),
+	)
+	if heading is None:
 		frappe.throw(
 			_(
 				"The sheet needs an Account Name column and Debit and Credit columns (or Closing Debit and Closing Credit)."
 			)
 		)
+	debit_column, credit_column = amounts
+	# the name heading may sit rows above the amounts, like Tally's "Particulars"
+	name_column = next(
+		(row.index(key) for row in reversed(keys[: heading + 1]) for key in NAME_COLUMNS if key in row), 0
+	)
+	number_column = keys[heading].index("account_number") if "account_number" in keys[heading] else None
+	# a report may name each account's group in a column, as Busy does, instead of indenting
+	group_column = next((keys[heading].index(key) for key in GROUP_COLUMNS if key in keys[heading]), None)
 
-	balances = []
-	for row in rows:
-		debit, credit = flt(row.get(amounts[0])), flt(row.get(amounts[1]))
-		number, name = cstr(row.get("account_number")).strip(), cstr(row.get(name_column)).strip()
-		if name and (debit or credit):
-			label = f"{number} - {name}" if number else name
-			balances.append(
-				frappe._dict(
-					account_name=name, account_number=number, label=label, debit=debit, credit=credit
-				)
+	lines = []
+	for row in rows[heading + 1 :]:
+		name = cstr(get_cell(row.cells, name_column)).strip()
+		if not name or TOTAL_LINE.match(name):
+			continue
+		number = cstr(get_cell(row.cells, number_column)).strip()
+		lines.append(
+			frappe._dict(
+				account_name=name,
+				account_number=number,
+				label=f"{number} - {name}" if number else name,
+				debit=get_amount(get_cell(row.cells, debit_column)),
+				credit=get_amount(get_cell(row.cells, credit_column)),
+				indent=get_cell(row.indents, name_column) or 0,
+				group=cstr(get_cell(row.cells, group_column)).strip(),
 			)
+		)
+
+	balances, parents = [], []
+	for line, after in zip(lines, [*lines[1:], None], strict=True):
+		while parents and parents[-1].indent >= line.indent:
+			parents.pop()
+		line.groups = [parent.account_name for parent in parents] + ([line.group] if line.group else [])
+		# a line with lines indented under it is a group, and its amount only totals theirs
+		line.is_group = bool(after and after.indent > line.indent)
+		if line.is_group:
+			parents.append(line)
+		if line.is_group or line.debit or line.credit:
+			balances.append(line)
 	return balances
+
+
+def read_report(file_url: str) -> list[frappe._dict]:
+	"""Every row of an uploaded csv or Excel sheet as it is, with how far each cell's text is
+	indented: reports from accounting software indent each account under its group. A csv keeps no
+	indent, as Frappe's reader trims its values."""
+	file_doc, extension = get_file(file_url)
+	content = file_doc.get_content()
+	if extension == "xlsx":
+		sheet = load_workbook(BytesIO(content), data_only=True).active
+		return [
+			frappe._dict(cells=[cell.value for cell in row], indents=[get_indent(cell) for cell in row])
+			for row in sheet.iter_rows()
+		]
+	rows = read_csv_content(content) if extension == "csv" else read_xls_file_from_attached_file(content)
+	return [frappe._dict(cells=row, indents=[get_indent(value) for value in row]) for row in rows]
+
+
+def get_indent(cell) -> float:
+	value = getattr(cell, "value", cell)
+	if not isinstance(value, str):
+		return 0
+	indent = cell.alignment.indent if hasattr(cell, "alignment") else 0
+	return indent + len(value) - len(value.lstrip())
+
+
+def get_amount_columns(heading_rows: list[list[str]]) -> tuple[int, int] | None:
+	"""The debit and credit columns of the last heading row, the closing ones first: they are the
+	balances on the day. Any heading with debit or Dr in it counts, like Busy's "Dr. Amount (Rs.)",
+	and a label like "Closing Balance" in a row above counts for the columns under it."""
+	width = max(len(row) for row in heading_rows)
+	above = [set() for _ in range(width)]
+	for row in heading_rows:
+		label = ""
+		for index in range(width):
+			# a merged label is in its first cell only, and covers the empty ones after it
+			label = get_cell(row, index) or label
+			above[index] |= set(label.split("_"))
+	found = {}
+	for index, key in enumerate(heading_rows[-1]):
+		words = set(key.split("_"))
+		debit, credit = bool(words & {"debit", "dr"}), bool(words & {"credit", "cr"})
+		# a "Dr/Cr" column says which side, it holds no amount
+		if debit != credit:
+			rank = 0 if "closing" in above[index] else 2 if "opening" in above[index] else 1
+			found.setdefault(("debit" if debit else "credit", rank), index)
+	return next(
+		(
+			(found[("debit", rank)], found[("credit", rank)])
+			for rank in (0, 1, 2)
+			if ("debit", rank) in found and ("credit", rank) in found
+		),
+		None,
+	)
+
+
+def get_amount(value) -> float:
+	"""A number cell, or the number in a text cell past a currency like "Rs." or "$"; brackets or a
+	minus before it make it negative."""
+	if not isinstance(value, str):
+		return flt(value)
+	number = re.search(r"\d[\d,]*(\.\d+)?", value)
+	if not number:
+		return 0
+	amount = flt(number.group().replace(",", ""))
+	return -amount if value.strip().startswith("(") or "-" in value[: number.start()] else amount
+
+
+def get_column_key(value) -> str:
+	return re.sub(r"[^a-z0-9]+", "_", cstr(value).lower()).strip("_")
+
+
+def get_cell(cells: list, index: int | None):
+	return cells[index] if index is not None and index < len(cells) else None
+
+
+def get_party_group_type(names: list[str]) -> str | None:
+	"""Receivable, Payable or Stock when one of these names is the group other software keeps
+	customers, suppliers or stock under."""
+	keys = {get_column_key(name).replace("_", " ") for name in names}
+	return next((account_type for account_type, groups in PARTY_GROUPS.items() if keys & set(groups)), None)
 
 
 @frappe.whitelist()
@@ -194,7 +329,11 @@ def download_chart_template(company: str, template: str):
 	if template == "Current Chart":
 		rows = [rows[0], *get_current_chart_rows(onboarding)]
 
-	frappe.response["filename"] = f"{frappe.scrub(company)}_chart_of_accounts.xlsx"
+	frappe.response["filename"] = (
+		f"{frappe.scrub(company)}_chart_of_accounts.xlsx"
+		if template == "Current Chart"
+		else "sample_chart_of_accounts.xlsx"
+	)
 	frappe.response["filecontent"] = make_xlsx(rows, "Chart of Accounts").getvalue()
 	frappe.response["type"] = "binary"
 

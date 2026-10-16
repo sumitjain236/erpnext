@@ -19,8 +19,10 @@ frappe.ui.form.on("Company Setup", {
 			show_opening_invoices(frm, frm.reopen_opening_invoices);
 			delete frm.reopen_opening_invoices;
 		}
-		// steps are checked against the company's data each time the form opens
-		frm.call("check_steps").then((r) => r.message && frm.reload_doc());
+		// a step done or undone since the last save, from the company's data, is saved now
+		if (frm.doc.__onload?.steps_changed) {
+			frm.call("check_steps").then((r) => r.message && frm.reload_doc());
+		}
 	},
 
 	async render(frm) {
@@ -761,6 +763,8 @@ function show_opening_balances(frm, result) {
 		)
 		.appendTo($intro);
 	if (result) $intro.append(make_upload_result(frm, dialog, result));
+	const year_note = make_fiscal_year_note(frm);
+	if (year_note) $(`<div class="mb-3"></div>`).append(year_note).appendTo($intro);
 	if (posted.length) {
 		$(`<div class="text-p-sm text-ink-gray-5 mb-3"></div>`)
 			.text(__("{0} balances are posted already and stay as they are.", [posted.length]))
@@ -805,6 +809,7 @@ function add_balance_account(frm, balances_dialog) {
 	const dialog = new frappe.ui.Dialog({
 		title: __("Add account"),
 		fields: [
+			{ fieldname: "group_note", fieldtype: "HTML" },
 			{ fieldname: "account_name", fieldtype: "Data", label: __("Account Name"), reqd: 1 },
 			{
 				fieldname: "account_type",
@@ -843,7 +848,17 @@ function add_balance_account(frm, balances_dialog) {
 				.then((r) =>
 					frappe.db.get_value("Account", r.message, ["account_type", "root_type"]).then((info) => {
 						const grid = balances_dialog.fields_dict.balances.grid;
-						grid.df.data.push({ account: r.message, ...info.message });
+						const name = values.account_name.trim().toLowerCase();
+						// the sheet's label may carry the account number: "1001 - Rent Deposit"
+						const waiting = grid.df.data.find(
+							(row) =>
+								!row.account &&
+								[row.original_account, cstr(row.original_account).split(" - ").pop()].some(
+									(label) => cstr(label).trim().toLowerCase() === name
+								)
+						);
+						if (waiting) Object.assign(waiting, { account: r.message, ...info.message });
+						else grid.df.data.push({ account: r.message, ...info.message });
 						grid.refresh();
 						dialog.hide();
 					})
@@ -858,6 +873,40 @@ function add_balance_account(frm, balances_dialog) {
 			.then((r) => r.message?.name && dialog.set_value("parent_account", r.message.name));
 	};
 	dialog.show();
+	show_group_chart_note(company, dialog.get_field("group_note").$wrapper);
+}
+
+// ERPNext keeps one chart for a group of companies: accounts are added in the parent and copied to
+// its subsidiaries, and a subsidiary can't add one of its own unless the company allows it
+function show_group_chart_note(company, $wrapper) {
+	Promise.all([
+		frappe.db.get_list("Company", { filters: { parent_company: company }, fields: ["name"] }),
+		frappe.db.get_value("Company", company, [
+			"parent_company",
+			"allow_account_creation_against_child_company",
+		]),
+	]).then(([subsidiaries, r]) => {
+		const { parent_company, allow_account_creation_against_child_company } = r.message || {};
+		let note;
+		if (subsidiaries.length) {
+			note = frappe.ui.alert({
+				theme: "blue",
+				title: __("Also added to {0}", [subsidiaries.map((row) => row.name).join(", ")]),
+				description: __(
+					"ERPNext keeps the chart of a group of companies the same, so an account added here is added to its subsidiaries too."
+				),
+			});
+		} else if (parent_company && !allow_account_creation_against_child_company) {
+			note = frappe.ui.alert({
+				theme: "yellow",
+				title: __("Accounts of {0} are added in {1}", [company, parent_company]),
+				description: __(
+					"ERPNext keeps a group's chart in its parent company. To add accounts here instead, turn on Allow Account Creation Against Child Company on this company."
+				),
+			});
+		}
+		if (note) $wrapper.append($(`<div class="mb-3"></div>`).append(note));
+	});
 }
 
 function upload_opening_balances(frm, dialog) {
@@ -952,6 +1001,20 @@ function make_upload_result(frm, dialog, result) {
 	return $result;
 }
 
+// Opening entries are dated the day before the migration date, in a year a new site may not have
+function make_fiscal_year_note(frm) {
+	const missing = frm.doc.__onload?.missing_fiscal_year;
+	if (!missing) return null;
+	return frappe.ui.alert({
+		theme: "blue",
+		title: __("The financial year {0} is added when you post", [missing.year]),
+		description: __(
+			"Opening entries are dated {0}, the day before you start, and ERPNext doesn't have that year yet.",
+			[frappe.datetime.str_to_user(missing.date)]
+		),
+	});
+}
+
 // The books on the day before the migration date; with can_post, as they will be after posting
 function show_posting_preview(frm, can_post = true) {
 	frm.call("preview_opening_balances").then((r) => {
@@ -964,7 +1027,7 @@ function show_posting_preview(frm, can_post = true) {
 			primary_action_label: can_post ? __("Post") : __("Done"),
 			primary_action: () =>
 				can_post
-					? frm.call("post_opening_balances").then(() => {
+					? frm.call({ doc: frm.doc, method: "post_opening_balances", freeze: true }).then(() => {
 							dialog.hide();
 							frm.reload_doc();
 					  })
@@ -972,6 +1035,9 @@ function show_posting_preview(frm, can_post = true) {
 			secondary_action_label: can_post ? __("Back") : undefined,
 			secondary_action: can_post ? () => dialog.hide() : undefined,
 		});
+		const year_note = can_post && make_fiscal_year_note(frm);
+		if (year_note)
+			dialog.get_field("preview").$wrapper.append($(`<div class="mb-3"></div>`).append(year_note));
 		dialog.get_field("preview").$wrapper.append(make_posting_preview(preview, currency));
 		dialog.show();
 	});
@@ -1273,7 +1339,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			save().then(() =>
 				post_opening_invoices(frm, party_type, {
 					rows: values.invoices || [],
-					disabled: disabled,
+					// neither a disabled party's invoices nor those in another currency are posted
+					disabled: new Set([...disabled, ...Object.keys(names.other_currency || {})]),
 					add_missing: !!values.add_missing,
 					before_post: () => dialog.hide(),
 				})
@@ -1324,6 +1391,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const $stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
 	const $names = $(`<div class="flex flex-col gap-2 mb-3"></div>`).appendTo($intro);
 	const $notes = $(`<div class="flex flex-col gap-2 mb-3"></div>`).appendTo($intro);
+	const year_note = make_fiscal_year_note(frm);
+	if (year_note) $notes.append(year_note);
 	if (result?.advances) {
 		$notes.append(
 			frappe.ui.alert({
@@ -1357,6 +1426,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			})
 		);
 	}
+	if (result?.unused_columns?.length) {
+		$notes.append(
+			frappe.ui.alert({
+				theme: "yellow",
+				title: __("Not read from your sheet: {0}", [result.unused_columns.join(", ")]),
+				description: __(
+					"Only the name, invoice number, invoice date, due date and outstanding amount are read. Rename a column to one of these if it holds them, then upload again."
+				),
+			})
+		);
+	}
 	if (created || result?.skipped) {
 		$(`<div class="text-p-sm text-ink-gray-5"></div>`)
 			.text(
@@ -1380,17 +1460,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			.empty()
 			.toggle(!!state.names.length)
 			.append(state.names.length ? make_opening_invoice_stats(frm, party_type, state, currency) : []);
-		$names.empty().append(make_party_banners(party_type, state, () => make_add_party_menu()));
+		$names.empty().append(make_party_banners(party_type, state, names, () => make_add_party_menu()));
 		dialog.set_df_property("add_missing", "hidden", !state.new_names.length);
 		dialog.set_df_property(
 			"add_missing",
 			"label",
 			party_type === "Customer"
 				? state.new_names.length === 1
-					? __("Create {0} when posting", [state.new_names[0]])
+					? __("Create {0} when posting", [frappe.utils.escape_html(state.new_names[0])])
 					: __("Create the {0} new customers when posting", [state.new_names.length])
 				: state.new_names.length === 1
-				? __("Create {0} when posting", [state.new_names[0]])
+				? __("Create {0} when posting", [frappe.utils.escape_html(state.new_names[0])])
 				: __("Create the {0} new suppliers when posting", [state.new_names.length])
 		);
 		if (!state.new_names.length) dialog.set_value("add_missing", 0);
@@ -1512,16 +1592,21 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 					label: __("Download as sheet"),
 					icon: "download",
 					description: __("These names in the import sheet."),
+					// the sheet lists the names still new once saved, without those linked here
 					onclick: () =>
-						open_url_post(
-							"/api/method/erpnext.setup.doctype.company_setup.opening_invoices.download_new_parties",
-							{ company: frm.doc.company, party_type: party_type }
+						save().then(() =>
+							open_url_post(
+								"/api/method/erpnext.setup.doctype.company_setup.opening_invoices.download_new_parties",
+								{ company: frm.doc.company, party_type: party_type }
+							)
 						),
 				},
 				{
 					label: __("Import filled sheet"),
 					icon: "upload",
 					description: __("Back through the standard import."),
+					// the standard import is open to System Managers only
+					condition: () => frappe.model.can_create("Data Import"),
 					onclick: import_parties,
 				},
 			],
@@ -1590,6 +1675,8 @@ function get_party_state(rows, disabled) {
 function get_party_badge(row, names, disabled) {
 	if (!row?.party) return frappe.ui.badge.html({ label: __("New"), theme: "orange" });
 	if (disabled.has(row.party)) return frappe.ui.badge.html({ label: __("Disabled"), theme: "red" });
+	const other_currency = names.other_currency?.[row.party];
+	if (other_currency) return frappe.ui.badge.html({ label: other_currency, theme: "red" });
 	if (names.similar?.[row.party_name] === row.party) {
 		return frappe.ui.badge.html({ label: __("Similar name"), theme: "blue" });
 	}
@@ -1641,7 +1728,24 @@ function make_opening_invoice_stats(frm, party_type, state, currency) {
 	];
 }
 
-function make_party_banners(party_type, state, make_add_menu) {
+// Names that may be a typo: of a party ERPNext has, or of another new name on the sheet
+function get_look_alike_notes(party_type, state, names) {
+	const is_new = (name) => state.new_names.includes(name);
+	return [
+		...Object.entries(names.suggestions || {})
+			.filter(([name]) => is_new(name))
+			.map(([name, existing]) =>
+				party_type === "Customer"
+					? __("{0} looks like {1}, a customer you have.", [name, existing])
+					: __("{0} looks like {1}, a supplier you have.", [name, existing])
+			),
+		...(names.look_alikes || [])
+			.filter((pair) => pair.every(is_new))
+			.map(([name, other]) => __("{0} and {1} look like the same name spelt two ways.", [name, other])),
+	].slice(0, 3);
+}
+
+function make_party_banners(party_type, state, names, make_add_menu) {
 	const banners = [];
 	const list = (names) =>
 		names.length > 3
@@ -1659,13 +1763,33 @@ function make_party_banners(party_type, state, make_add_menu) {
 						: state.new_names.length === 1
 						? __("{0} isn't a supplier in ERPNext yet", [state.new_names[0]])
 						: __("{0} suppliers aren't in ERPNext yet", [state.new_names.length]),
-				description:
+				description: [
 					state.new_names.length === 1
 						? __("Add it here, or tick the box at the end to create it when posting.")
 						: list(state.new_names) +
 						  ". " +
 						  __("Add them here, or tick the box at the end to create them when posting."),
+					...get_look_alike_notes(party_type, state, names),
+				].join(" "),
 				footer: make_add_menu,
+			})
+		);
+	}
+	const other_currency = state.found.filter((party) => names.other_currency?.[party]);
+	if (other_currency.length) {
+		banners.push(
+			frappe.ui.alert({
+				theme: "red",
+				title:
+					other_currency.length === 1
+						? __("{0} is billed in {1}", [
+								other_currency[0],
+								names.other_currency[other_currency[0]],
+						  ])
+						: __("{0} are billed in another currency", [list(other_currency)]),
+				description: __(
+					"Opening invoices in another currency can't be posted here yet. They stay as drafts."
+				),
 			})
 		);
 	}
@@ -1723,6 +1847,7 @@ function post_opening_invoices(frm, party_type, { rows, disabled = new Set(), ad
 	const named = rows.filter((row) => row.status !== "Created" && (row.party_name || row.party));
 	const can_post = (row) => (row.party || add_missing) && !disabled.has(row.party);
 	const posting = named.filter(can_post);
+	const invoices = posting.filter((row) => flt(row.outstanding_amount) > 0);
 	const waiting = named.filter((row) => !can_post(row));
 	const new_names = add_missing
 		? [...new Set(named.filter((row) => !row.party).map((row) => row.party_name))]
@@ -1738,30 +1863,35 @@ function post_opening_invoices(frm, party_type, { rows, disabled = new Set(), ad
 	const day_before = frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1));
 	const lines = [
 		party_type === "Customer"
-			? posting.length === 1
+			? invoices.length === 1
 				? __(
 						"Post 1 unpaid invoice ({0}) as an opening invoice, recording what the customer owed on {1}? Nothing is sent to the customer.",
-						[money(posting), day_before]
+						[money(invoices), day_before]
 				  )
 				: __(
 						"Post {0} unpaid invoices ({1}) as opening invoices, recording what customers owed on {2}? Nothing is sent to customers.",
-						[posting.length, money(posting), day_before]
+						[invoices.length, money(invoices), day_before]
 				  )
-			: posting.length === 1
+			: invoices.length === 1
 			? __(
 					"Post 1 unpaid bill ({0}) as an opening invoice, recording what you owed the supplier on {1}? Nothing is sent to the supplier.",
-					[money(posting), day_before]
+					[money(invoices), day_before]
 			  )
 			: __(
 					"Post {0} unpaid bills ({1}) as opening invoices, recording what you owed suppliers on {2}? Nothing is sent to suppliers.",
-					[posting.length, money(posting), day_before]
+					[invoices.length, money(invoices), day_before]
 			  ),
 	];
+	if (!invoices.length) lines.shift();
 	if (new_names.length) {
 		lines.push(
 			party_type === "Customer"
-				? __("New customers are added first: {0}.", [new_names.join(", ")])
-				: __("New suppliers are added first: {0}.", [new_names.join(", ")])
+				? __("New customers are added first: {0}.", [
+						new_names.map(frappe.utils.escape_html).join(", "),
+				  ])
+				: __("New suppliers are added first: {0}.", [
+						new_names.map(frappe.utils.escape_html).join(", "),
+				  ])
 		);
 	}
 	if (waiting.length) {
@@ -1785,6 +1915,8 @@ function post_opening_invoices(frm, party_type, { rows, disabled = new Set(), ad
 				  ])
 		);
 	}
+	const missing_year = frm.doc.__onload?.missing_fiscal_year;
+	if (missing_year) lines.push(__("The financial year {0} is added first.", [missing_year.year]));
 	const advances = posting.filter((row) => flt(row.outstanding_amount) < 0).length;
 	if (advances) {
 		lines.push(
@@ -1795,9 +1927,11 @@ function post_opening_invoices(frm, party_type, { rows, disabled = new Set(), ad
 	}
 	frappe.confirm(lines.join(" "), () => {
 		before_post?.();
-		frm.call("create_opening_invoices", {
-			party_type: party_type,
-			add_missing: add_missing ? 1 : 0,
+		frm.call({
+			doc: frm.doc,
+			method: "create_opening_invoices",
+			args: { party_type: party_type, add_missing: add_missing ? 1 : 0 },
+			freeze: true,
 		}).then((r) => {
 			if (r.message === "queued") {
 				frappe.show_alert({
@@ -1864,7 +1998,7 @@ function show_posting_result(frm, party_type, new_names = []) {
 
 function import_buttons(frm, doctype) {
 	return [
-		{
+		frappe.model.can_create("Data Import") && {
 			label: __("Import {0}", [__(doctype)]),
 			icon: "upload",
 			onclick: () =>
@@ -1883,7 +2017,7 @@ function import_buttons(frm, doctype) {
 			icon_right: "arrow-up-right",
 			onclick: () => frappe.set_route("List", doctype),
 		},
-	];
+	].filter(Boolean);
 }
 
 function show_chart(company) {

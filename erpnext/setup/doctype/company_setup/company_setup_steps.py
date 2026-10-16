@@ -133,7 +133,9 @@ def opening_balances(onboarding) -> dict:
 	if onboarding.no_opening_data and not rows:
 		summary = _("Nothing to bring")
 	elif posted:
-		summary = _("{0} accounts posted").format(len(rows))
+		summary = _("1 account posted") if len(rows) == 1 else _("{0} accounts posted").format(len(rows))
+	elif len(rows) == 1:
+		summary = _("1 account entered, not posted yet")
 	else:
 		summary = rows and _("{0} accounts entered, not posted yet").format(len(rows))
 	return {
@@ -209,7 +211,12 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 	elif totals.count:
 		text = summary.format(totals.count, fmt_money(totals.outstanding, currency=currency))
 	elif drafts:
-		text = _("{0} invoices entered, not posted yet").format(len(drafts))
+		invoices = sum(1 for row in drafts if flt(row.outstanding_amount) > 0)
+		text = (
+			_("{0} invoices entered, not posted yet").format(invoices)
+			if invoices
+			else _("{0} advances entered, not posted yet").format(len(drafts))
+		)
 	elif onboarding.no_opening_data:
 		text = _("Nothing to bring")
 	else:
@@ -227,7 +234,7 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 def check_books(onboarding) -> dict:
 	temporary = get_temporary_opening_balance(onboarding.company)
 	posted = all_opening_balances_posted(onboarding) or has_opening_invoices(onboarding.company)
-	if onboarding.no_opening_data:
+	if onboarding.no_opening_data and not posted:
 		summary = _("Nothing to bring")
 	elif posted and temporary:
 		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
@@ -240,7 +247,8 @@ def check_books(onboarding) -> dict:
 			"Compare with your old books. Done when everything is posted and Temporary Opening is zero."
 		),
 		"summary": summary,
-		"done": bool(onboarding.no_opening_data) or (posted and not temporary and not has_drafts(onboarding)),
+		"done": (bool(onboarding.no_opening_data) and not posted)
+		or (posted and not temporary and not has_drafts(onboarding)),
 		"tab": "accounts_tab",
 	}
 

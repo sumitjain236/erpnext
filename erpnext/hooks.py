@@ -445,6 +445,7 @@ doc_events = {
 		],
 		"on_cancel": [
 			"erpnext.regional.italy.utils.sales_invoice_on_cancel",
+			"erpnext.setup.doctype.company_setup.company_setup.release_posted_rows",
 		],
 		"on_trash": "erpnext.regional.check_deletion_permission",
 	},
@@ -453,6 +454,10 @@ doc_events = {
 			"erpnext.regional.united_arab_emirates.utils.update_grand_total_for_rcm",
 			"erpnext.regional.united_arab_emirates.utils.validate_returns",
 		],
+		"on_cancel": "erpnext.setup.doctype.company_setup.company_setup.release_posted_rows",
+	},
+	"Journal Entry": {
+		"on_cancel": "erpnext.setup.doctype.company_setup.company_setup.release_posted_rows",
 	},
 	"Payment Entry": {
 		"on_trash": "erpnext.regional.check_deletion_permission",

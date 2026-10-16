@@ -9,7 +9,8 @@ import frappe
 from frappe.contacts.doctype.address.address import get_default_address
 from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 from frappe.utils import flt, formatdate
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment
 
 from erpnext.accounts.party import get_party_account
 from erpnext.accounts.utils import get_fiscal_year
@@ -20,7 +21,7 @@ from erpnext.setup.doctype.company_setup.company_setup import (
 	get_chart_import_blocker,
 )
 from erpnext.setup.doctype.company_setup.company_setup_steps import HOOK_NAME, get_step_paths
-from erpnext.setup.doctype.company_setup.opening_invoices import download_new_parties
+from erpnext.setup.doctype.company_setup.opening_invoices import download_new_parties, ensure_fiscal_year
 from erpnext.tests.utils import ERPNextTestSuite
 
 COMPANY = "_Test Company"
@@ -101,6 +102,11 @@ def step_status(doc) -> dict:
 def extra_step(onboarding) -> dict:
 	"""A step another app could add through the hook."""
 	return {"title": "Extra step", "description": "", "done": False}
+
+
+def broken_step(onboarding) -> dict:
+	"""A step of another app with a bug in it."""
+	raise ZeroDivisionError
 
 
 @contextmanager
@@ -195,6 +201,15 @@ class TestCompanySetup(ERPNextTestSuite):
 		# a step no app adds any more is dropped
 		doc.save()
 		self.assertNotIn(extra, [row.step_key for row in doc.steps])
+
+	def test_a_failing_hooked_step_does_not_stop_the_setup(self):
+		broken = f"{__name__}.broken_step"
+		with hooked_steps({"app_one": [broken]}):
+			doc = get_onboarding()
+			doc.save()
+			company = make_company()
+		self.assertNotIn(broken, [row.step_key for row in doc.steps])
+		self.assertTrue(frappe.db.exists("Company Setup", company))
 
 	def test_chart_step_is_done_from_the_choice(self):
 		doc = get_onboarding()
@@ -463,6 +478,18 @@ class TestChartImport(ERPNextTestSuite):
 			frappe.db.get_value("Company", self.company, "round_off_account"), "5300 - Round Off - _TOC"
 		)
 
+	def test_import_keeps_the_default_accounts_by_name(self):
+		# a big company's chart: several receivable accounts, the usual one first
+		sheet = [
+			*SHEET,
+			"Debtors,Current Assets,1131,1100,0,Receivable,Asset,INR,,",
+			"Retention Money Receivable,Current Assets,1132,1100,0,Receivable,Asset,INR,,",
+		]
+		self.doc.import_chart(make_sheet(sheet))
+
+		receivable = frappe.db.get_value("Company", self.company, "default_receivable_account")
+		self.assertEqual(frappe.db.get_value("Account", receivable, "account_name"), "Debtors")
+
 	def test_preview_changes_nothing(self):
 		before = frappe.db.count("Account", {"company": self.company})
 		preview = self.doc.preview_chart(make_sheet(SHEET))
@@ -565,6 +592,31 @@ def make_customer(name: str, disabled: int = 0) -> str:
 	).insert()
 	frappe.set_user(user)
 	return customer.name
+
+
+def has_year(date: str) -> bool:
+	return bool(
+		frappe.db.exists(
+			"Fiscal Year", {"year_start_date": ("<=", date), "year_end_date": (">=", date), "disabled": 0}
+		)
+	)
+
+
+def make_xlsx_file(name: str, rows: list[tuple], indent_column: int | None = None) -> str:
+	"""An Excel file of these rows; with indent_column, a row's extra last value is that cell's indent."""
+	workbook = Workbook()
+	width = max(len(row) for row in rows) - (1 if indent_column else 0)
+	for row in rows:
+		workbook.active.append(row[:width])
+		if indent_column and len(row) > width:
+			workbook.active.cell(workbook.active.max_row, indent_column).alignment = Alignment(indent=row[-1])
+	content = BytesIO()
+	workbook.save(content)
+	return (
+		frappe.get_doc({"doctype": "File", "file_name": name, "content": content.getvalue(), "is_private": 1})
+		.insert()
+		.file_url
+	)
 
 
 def make_file(name: str, rows: list[str]) -> str:
@@ -681,6 +733,77 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.assertEqual(result["left_out"], {"Receivable": 10000})
 		self.assertEqual(result["groups"], 1)
 
+	def test_tally_trial_balance_as_exported(self):
+		cash_name = frappe.db.get_value("Account", self.cash, "account_name")
+		capital_name = frappe.db.get_value("Account", self.capital, "account_name")
+		# Tally's Excel export: title rows, headings over a few rows, ledgers indented under groups
+		rows = [
+			("Kapoor Interiors",),
+			("Trial Balance",),
+			("Particulars", "Kapoor Interiors"),
+			(None, "Closing Balance"),
+			(None, "Debit", "Credit"),
+			("Capital Account", None, 1000, 0),
+			(capital_name, None, 1000, 2),
+			("Current Assets", 1000, None, 0),
+			("Sundry Debtors", 700, None, 2),
+			("Mehta Residency", 700, None, 4),
+			("Cash-in-Hand", 300, None, 2),
+			(cash_name, 300, None, 4),
+			("Grand Total", 1000, 1000, 0),
+		]
+		result = self.doc.import_opening_balances(make_xlsx_file("tally_tb.xlsx", rows, indent_column=1))
+		self.assertEqual(
+			[(row.account, row.debit, row.credit) for row in self.doc.opening_balances],
+			[(self.capital, 0, 1000), (self.cash, 300, 0)],
+		)
+		self.assertEqual((result["groups"], result["left_out"]), (4, {"Receivable": 700}))
+
+	def test_trial_balance_takes_the_closing_columns_named_in_the_row_above(self):
+		cash_name = frappe.db.get_value("Account", self.cash, "account_name")
+		self.doc.import_opening_balances(
+			make_file(
+				"tb.csv",
+				[
+					",Opening Balance,,Transactions,,Closing Balance,,",
+					"Particulars,Debit,Credit,Debit,Credit,Debit,Credit,Dr/Cr",
+					f"{cash_name},100,,900,,1000,,Dr",
+				],
+			)
+		)
+		self.assertEqual(
+			[(row.account, row.debit, row.credit) for row in self.doc.opening_balances],
+			[(self.cash, 1000, 0)],
+		)
+
+	def test_trial_balance_indent_is_read_from_the_name_column(self):
+		cash_name = frappe.db.get_value("Account", self.cash, "account_name")
+		rows = [
+			("Account Number", "Account Name", "Debit", "Credit"),
+			(None, "Current Assets", 300, None, 0),
+			("A100", cash_name, 300, None, 2),
+		]
+		result = self.doc.import_opening_balances(make_xlsx_file("tb.xlsx", rows, indent_column=2))
+		self.assertEqual([row.debit for row in self.doc.opening_balances], [300])
+		self.assertEqual(result["groups"], 1)
+
+	def test_busy_trial_balance_with_a_group_column(self):
+		cash_name = frappe.db.get_value("Account", self.cash, "account_name")
+		result = self.doc.import_opening_balances(
+			make_file(
+				"busy_tb.csv",
+				[
+					"Trial Balance as on 31-03-2026",
+					"Particulars,Group,Dr. Amount (Rs.),Cr. Amount (Rs.)",
+					f"{cash_name},Cash-in-hand,300,",
+					"Opening Stock,Stock-in-hand,1500,",
+					"Total,,1800,",
+				],
+			)
+		)
+		self.assertEqual([(row.account, row.debit) for row in self.doc.opening_balances], [(self.cash, 300)])
+		self.assertEqual(result["left_out"], {"Stock": 1500})
+
 	def test_a_receivables_total_line_is_left_out_with_customers(self):
 		group = frappe.db.get_value(
 			"Account",
@@ -708,6 +831,22 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
 		self.assertRaises(frappe.ValidationError, self.doc.post_opening_balances)
 
+	def test_cancelling_a_posted_entry_lets_it_be_posted_again(self):
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_balances(
+			[{"account": self.cash, "debit": 1000}, {"account": self.capital, "credit": 1000}]
+		)
+		(entry,) = self.doc.post_opening_balances()
+		frappe.get_doc("Journal Entry", entry).cancel()
+
+		self.doc.reload()
+		self.assertEqual(
+			{(row.status, row.journal_entry) for row in self.doc.opening_balances}, {("Draft", None)}
+		)
+		self.doc.post_opening_balances()
+		self.doc.reload()
+		self.assertEqual({row.status for row in self.doc.opening_balances}, {"Posted"})
+
 	def test_post_balances_against_temporary_opening(self):
 		sales = get_account(self.company, root_type="Income")
 		self.doc.migration_date = "2026-04-01"
@@ -728,6 +867,27 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.assertEqual(company_setup_steps.get_temporary_opening_balance(self.company), -400 + 100)
 		self.assertEqual({row.status for row in self.doc.opening_balances}, {"Posted"})
 		self.assertEqual(step_status(self.doc)["opening_balances"], "Done")
+
+	def test_check_your_books_follows_balances_posted_after_nothing_to_bring(self):
+		self.doc.migration_date = "2026-04-01"
+		self.doc.no_opening_data = 1
+		self.doc.save_opening_balances([{"account": self.cash, "debit": 1000}])
+		self.doc.post_opening_balances()
+		self.doc.run_method("onload")
+		step = self.doc.get_onload().steps[step_key(self.doc, "check_books")]
+		self.assertIn("left in Temporary Opening", step["summary"])
+		self.assertNotEqual(step_status(self.doc)["check_books"], "Done")
+
+	def test_last_years_depreciation_posts_in_a_depreciation_entry(self):
+		depreciation = get_account(self.company, account_type="Depreciation")
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_balances(
+			[{"account": self.cash, "debit": 1000}, {"account": depreciation, "debit": 200}]
+		)
+		entries = self.doc.post_opening_balances()
+
+		voucher_types = {frappe.db.get_value("Journal Entry", name, "voucher_type") for name in entries}
+		self.assertEqual(voucher_types, {"Opening Entry", "Depreciation Entry"})
 
 	def test_preview_shows_the_books_after_posting(self):
 		self.doc.migration_date = "2026-04-01"
@@ -765,10 +925,29 @@ class TestOpeningBalances(ERPNextTestSuite):
 
 	def test_post_adds_the_financial_year_it_falls_in(self):
 		frappe.set_user("Administrator")
-		self.doc.migration_date = "2041-04-01"
+		# test sites have years up to 2050 only
+		self.doc.migration_date = "2071-04-01"
 		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
 		self.doc.post_opening_balances()
-		self.assertTrue(get_fiscal_year("2041-03-31", company=self.company, boolean=True))
+		self.assertTrue(has_year("2071-03-31"))
+
+	def test_a_missing_financial_year_is_pointed_out_before_posting(self):
+		self.doc.migration_date = "2073-04-01"
+		self.doc.run_method("onload")
+		self.assertEqual(self.doc.get_onload().missing_fiscal_year, {"year": "2073", "date": "2073-03-31"})
+
+	def test_post_adds_the_financial_year_again_after_a_failed_post(self):
+		frappe.set_user("Administrator")
+		self.doc.migration_date = "2072-04-01"
+		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
+		# a first post that adds the year, then fails and is rolled back with the year still cached
+		frappe.db.savepoint("failed_post")
+		ensure_fiscal_year("2072-03-31", self.company)
+		get_fiscal_year("2072-03-31", company=self.company, boolean=True)
+		frappe.db.rollback(save_point="failed_post")
+
+		self.doc.post_opening_balances()
+		self.assertTrue(has_year("2072-03-31"))
 
 	def test_post_adds_a_temporary_account_when_the_chart_has_none(self):
 		# like an imported chart: no temporary account at all
@@ -835,6 +1014,20 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		)
 		self.assertEqual(self.doc.get_invoice_names("Customer")["suggestions"], {"Pátil Homs": homes})
 
+	def test_two_spellings_of_one_new_name_are_pointed_out(self):
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{"party_name": "Ramesh Kumar Agarwal", "outstanding_amount": 10},
+				{"party_name": "Ramesh Kumar Agrawal", "outstanding_amount": 20},
+				{"party_name": "Global Hospitals Hyderabad", "outstanding_amount": 30},
+			],
+		)
+		self.assertEqual(
+			self.doc.get_invoice_names("Customer")["look_alikes"],
+			[["Ramesh Kumar Agarwal", "Ramesh Kumar Agrawal"]],
+		)
+
 	def test_a_similar_name_links_only_when_one_party_matches(self):
 		cafe = make_customer("Café Brew Lane Pvt. Ltd.")
 		twin = make_customer("Twin Traders")
@@ -898,7 +1091,9 @@ class TestOpeningInvoices(ERPNextTestSuite):
 				],
 			),
 		)
-		self.assertEqual(result, {"added": 3, "advances": 1, "skipped": 0})
+		self.assertEqual(
+			result, {"added": 3, "advances": 1, "skipped": 0, "repeated": 0, "unused_columns": []}
+		)
 		self.assertEqual(
 			[(row.invoice_number, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
 			[("OB-INV-1", 1200), ("OB-INV-2", 800), (None, -300)],
@@ -919,7 +1114,10 @@ class TestOpeningInvoices(ERPNextTestSuite):
 			"Total,,,,,",
 		]
 		result = self.doc.import_opening_invoices("Customer", make_file("bills.csv", report))
-		self.assertEqual(result, {"added": 3, "advances": 1, "skipped": 0})
+		self.assertEqual(
+			result,
+			{"added": 3, "advances": 1, "skipped": 0, "repeated": 0, "unused_columns": ["Overdue by days"]},
+		)
 		self.assertEqual(
 			[(row.invoice_number, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
 			[("KI/141", 236000), (None, -30000), (None, 12500)],
@@ -933,6 +1131,111 @@ class TestOpeningInvoices(ERPNextTestSuite):
 			),
 		)
 		self.assertEqual(self.doc.opening_purchase_invoices[0].outstanding_amount, -20000)
+
+	def test_busy_bills_with_a_dr_cr_column_and_a_named_total(self):
+		frappe.local.user_date_format = "dd-mm-yyyy"
+		self.addCleanup(setattr, frappe.local, "user_date_format", None)
+		report = [
+			"Bill-wise Outstanding (Receivable) as on 31-03-2026",
+			"Party Name,Bill No.,Bill Date,Bill Amt.,Pending Amt.,Dr/Cr,Their Ref",
+			f"{self.customer.customer_name},SI/1012,12-02-2026,145600,98750,Dr,PO-7",
+			f"{self.customer.customer_name},,22-03-2026,,50000,Cr,",
+			"Total,,,,48750,Dr,",
+		]
+		result = self.doc.import_opening_invoices("Customer", make_file("busy.csv", report))
+		self.assertEqual(
+			[(row.invoice_number, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
+			[("SI/1012", 98750), (None, -50000)],
+		)
+		self.assertEqual(result["unused_columns"], ["Bill Amt.", "Their Ref"])
+
+	def test_tally_bills_with_dr_and_cr_columns(self):
+		name = self.customer.customer_name
+		report = [
+			"Bills Receivable",
+			"Date,Ref. No.,Party's Name,Pending Amount,,Due on",
+			",,,Dr,Cr,",
+			f"2026-01-10,KI/1,{name},5000,,2026-02-09",
+			f"2026-03-01,On Account,{name},,800,",
+			",,Grand Total,5000,800,",
+		]
+		result = self.doc.import_opening_invoices("Customer", make_file("tally_drcr.csv", report))
+		self.assertEqual(
+			[(row.invoice_number, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
+			[("KI/1", 5000), (None, -800)],
+		)
+		self.assertEqual(result["advances"], 1)
+
+	def test_busy_bill_wise_report_grouped_by_party(self):
+		name = self.customer.customer_name
+		report = [
+			"Outstanding Analysis (Bill-wise) - Sundry Debtors",
+			"Party / Bill No.,Bill Date,Bill Amt.,Pending Amt.,Dr/Cr",
+			f"M/s {name},,,,",
+			'BLR-1306,25/11/2025,"2,23,430.00","2,23,430.00",Dr',
+			'BLR-1336,07/02/2026,"2,57,912.00","77,373.60",Dr',
+			'Total,,,"3,00,803.60",Dr',
+			'Grand Total,,,"3,00,803.60",Dr',
+		]
+		self.doc.import_opening_invoices("Customer", make_file("busy_billwise.csv", report))
+		self.assertEqual(
+			[
+				(row.party_name, row.invoice_number, row.outstanding_amount)
+				for row in self.doc.opening_sales_invoices
+			],
+			[(f"M/s {name}", "BLR-1306", 223430), (f"M/s {name}", "BLR-1336", 77373.6)],
+		)
+
+	def test_a_total_in_another_column_is_not_an_invoice(self):
+		report = [
+			"Debtors outstanding - 31 Mar 2026",
+			"Customer,Bill No,Bill Date,Amount (Rs),Their Bill No",
+			f"{self.customer.customer_name},FM/311,2026-01-31,212400,PO-9",
+			",,Total,212400,",
+		]
+		result = self.doc.import_opening_invoices("Customer", make_file("excel.csv", report))
+		self.assertEqual(
+			[(row.invoice_number, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
+			[("FM/311", 212400)],
+		)
+		self.assertEqual(result["unused_columns"], ["Their Bill No"])
+
+	def test_amounts_with_a_currency_and_a_name_that_starts_with_total(self):
+		report = [
+			"Customer,Invoice No,Outstanding",
+			'Total Environment Systems,T-1,"Rs. 1,250.00"',
+			"Total,,1250",
+		]
+		self.doc.import_opening_invoices("Customer", make_file("rs.csv", report))
+		self.assertEqual(
+			[(row.party_name, row.outstanding_amount) for row in self.doc.opening_sales_invoices],
+			[("Total Environment Systems", 1250)],
+		)
+
+	def test_quickbooks_open_invoices_grouped_by_customer(self):
+		report = [
+			"Maple Street Goods",
+			"Open Invoices",
+			",Date,Transaction Type,Num,Due Date,Amount,Open Balance",
+			f"{self.customer.customer_name},,,,,,",
+			',2026-05-12,Invoice,1042,2026-06-11,"1,250.00","1,250.00"',
+			",2026-06-20,Invoice,1058,2026-07-20,845.50,600.00",
+			f'Total for {self.customer.customer_name},,,,,,"$1,850.00"',
+			"Quechee Gorge Village Inc.,,,,,,",
+			",2026-06-18,Payment,,,,(1500.00)",
+		]
+		self.doc.import_opening_invoices("Customer", make_file("qbo.csv", report))
+		self.assertEqual(
+			[
+				(row.party_name, row.invoice_number, row.outstanding_amount)
+				for row in self.doc.opening_sales_invoices
+			],
+			[
+				(self.customer.customer_name, "1042", 1250),
+				(self.customer.customer_name, "1058", 600),
+				("Quechee Gorge Village Inc.", None, -1500),
+			],
+		)
 
 	def test_busy_columns_and_day_first_dates(self):
 		# the format the site writes dates in, as Indian sites usually do
@@ -1061,6 +1364,36 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertIn("Mobile No (Contact)", header)
 		self.assertEqual([row[0] for row in rows[1:]], ["Onboarding Sheet Customer"])
 
+	def test_a_customer_billed_in_another_currency_is_pointed_out_and_not_posted(self):
+		frappe.set_user("Administrator")
+		receivable = get_account(self.company, account_type="Receivable")
+		export = frappe.get_doc(
+			{
+				"doctype": "Account",
+				"account_name": "Debtors - Export",
+				"company": self.company,
+				"parent_account": frappe.db.get_value("Account", receivable, "parent_account"),
+				"account_type": "Receivable",
+				"account_currency": "USD",
+			}
+		).insert()
+		customer = frappe.get_doc("Customer", make_customer("Onboarding Export Customer"))
+		customer.default_currency = "USD"
+		customer.append("accounts", {"company": self.company, "account": export.name})
+		customer.save()
+		frappe.set_user("onboarding.accounts@example.com")
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_invoices(
+			"Customer", [{"party_name": "Onboarding Export Customer", "outstanding_amount": 100}]
+		)
+		self.assertEqual(self.doc.get_invoice_names("Customer")["other_currency"], {customer.name: "USD"})
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+
+		row = self.doc.opening_sales_invoices[0]
+		self.assertEqual(row.status, "Failed")
+		self.assertIn("in USD", row.error)
+
 	def test_a_failed_invoice_is_undone_alone(self):
 		self.doc.migration_date = "2026-04-01"
 		self.doc.save_opening_invoices(
@@ -1089,6 +1422,53 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		step = self.doc.get_onload().steps[step_key(self.doc, "opening_sales_invoices")]
 		self.assertEqual(step["summary"], "1 could not be posted. Open the table to see why.")
 
+	def test_a_save_keeps_posted_invoices(self):
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{
+					"party_name": self.customer.customer_name,
+					"invoice_number": "OB-KEEP-1",
+					"outstanding_amount": 100,
+				}
+			],
+		)
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+
+		# a client sends the form without the posted row
+		self.doc.opening_sales_invoices = []
+		self.doc.save()
+		self.doc.reload()
+		self.assertEqual(
+			[(row.invoice_number, row.status) for row in self.doc.opening_sales_invoices],
+			[("OB-KEEP-1", "Created")],
+		)
+		self.doc.migration_date = "2026-03-01"
+		self.assertRaises(frappe.ValidationError, self.doc.save)
+
+	def test_a_repeated_row_in_one_sheet_is_posted_once(self):
+		row = {
+			"party_name": self.customer.customer_name,
+			"invoice_number": "OB-TWICE-1",
+			"invoice_date": "2026-01-01",
+			"outstanding_amount": 700,
+		}
+		result = self.doc.import_opening_invoices(
+			"Customer",
+			make_file(
+				"twice.csv",
+				[
+					"Customer,Invoice No,Invoice Date,Outstanding",
+					f"{row['party_name']},OB-TWICE-1,2026-01-01,700",
+					f"{row['party_name']},OB-TWICE-1,2026-01-01,700",
+				],
+			),
+		)
+		self.assertEqual((result["added"], result["repeated"]), (1, 1))
+		self.assertEqual(len(self.doc.opening_sales_invoices), 1)
+
 	def test_upload_again_leaves_out_posted_invoices(self):
 		sheet = make_file(
 			"receivables.csv",
@@ -1104,7 +1484,9 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.doc.reload()
 
 		result = self.doc.import_opening_invoices("Customer", sheet)
-		self.assertEqual(result, {"added": 1, "advances": 0, "skipped": 1})
+		self.assertEqual(
+			result, {"added": 1, "advances": 0, "skipped": 1, "repeated": 0, "unused_columns": []}
+		)
 		self.assertEqual(
 			[(row.invoice_number, row.status) for row in self.doc.opening_sales_invoices],
 			[("OB-AGAIN-1", "Created"), ("OB-AGAIN-2", "Draft")],

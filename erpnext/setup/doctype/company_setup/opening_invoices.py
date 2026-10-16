@@ -18,17 +18,18 @@ from frappe import _
 from frappe.core.doctype.data_import.exporter import Exporter
 from frappe.model import table_fields
 from frappe.utils import add_days, add_years, cstr, flt, get_user_date_format, getdate, strip_html
-from frappe.utils.csvutils import read_csv_content
-from frappe.utils.xlsxutils import (
-	build_xlsx_response,
-	make_xlsx,
-	read_xls_file_from_attached_file,
-	read_xlsx_file_from_attached_file,
-)
+from frappe.utils.xlsxutils import build_xlsx_response, make_xlsx
 
-from erpnext.accounts.doctype.chart_of_accounts_importer.chart_of_accounts_importer import get_file
 from erpnext.accounts.party import get_party_account
 from erpnext.accounts.utils import get_fiscal_year
+from erpnext.setup.doctype.company_setup.chart_sheet import (
+	HEADING_ROWS,
+	TOTAL_LINE,
+	get_amount,
+	get_cell,
+	get_column_key,
+	read_report,
+)
 
 TABLES = {"Customer": "opening_sales_invoices", "Supplier": "opening_purchase_invoices"}
 INVOICE_TYPES = {"Customer": "Sales", "Supplier": "Purchase"}
@@ -68,6 +69,7 @@ COLUMN_NAMES = {
 		"bill_number",
 		"voucher_no",
 		"ref_no",
+		"num",
 	),
 	"invoice_date": ("invoice_date", "date", "bill_date", "voucher_date"),
 	"due_date": ("due_date", "due_on"),
@@ -75,18 +77,34 @@ COLUMN_NAMES = {
 		"outstanding",
 		"outstanding_amount",
 		"pending_amount",
+		"pending_amt",
 		"pending",
+		"open_balance",
 		"balance_due",
 		"balance",
 		"amount",
 	),
+	# which side an amount is on, when a report puts it in a column of its own (Busy)
+	"side": ("dr_cr", "cr_dr"),
+}
+# the words that mark a column when none of its usual headings is there, the likeliest first
+COLUMN_WORDS = {
+	"party_name": ({"customer"}, {"supplier"}, {"vendor"}, {"party"}),
+	"invoice_number": ({"bill", "no"}, {"invoice", "no"}, {"bill", "number"}, {"invoice", "number"}),
+	"outstanding_amount": ({"outstanding"}, {"pending"}, {"balance"}, {"amount"}),
+}
+# words that rule a column out, like a bill's full amount or one in a foreign currency
+COLUMN_WORDS_EXCLUDED = {
+	"party_name": {"bill", "group", "ledger"},
+	"invoice_number": {"date", "amount", "amt"},
+	"outstanding_amount": {"bill", "fc", "foreign", "rate"},
 }
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 # only Latin accents: marks in other scripts, like Hindi vowel signs, change the name
 ACCENTS = re.compile("[\u0300-\u036f]")
+# how alike two names must be to look like one spelt two ways
+LOOK_ALIKE = 0.85
 LEGAL_WORDS = re.compile(r"\b(private|pvt|limited|ltd|llp|inc)\b")
-# how far down a report's headings may be, under its title rows
-HEADING_ROWS = 15
 # above this many invoices are made in the background
 BACKGROUND_FROM = 50
 
@@ -142,78 +160,150 @@ def get_suggestions(parties: frappe._dict, names: list[str]) -> dict[str, str]:
 	for name in set(names):
 		key = get_similar_key(name)
 		if key and not find_party(parties, name):
-			match = get_close_matches(key, known, n=1, cutoff=0.85)
+			match = get_close_matches(key, known, n=1, cutoff=LOOK_ALIKE)
 			if match:
 				suggestions[name] = next(iter(parties.similar[match[0]]))
 	return suggestions
 
 
+def get_look_alikes(names: list[str]) -> list[list[str]]:
+	"""Pairs of new names that look like one customer or supplier spelt two ways. A typo keeps the
+	first letter, so names are only compared with those starting the same, which keeps a sheet of
+	thousands of new names quick."""
+	by_letter = {}
+	for name in names:
+		key = get_similar_key(name)
+		if key:
+			by_letter.setdefault(key[0], []).append((key, name))
+	pairs = []
+	for group in by_letter.values():
+		for i, (key, name) in enumerate(group):
+			others = group[i + 1 :]
+			matches = set(
+				get_close_matches(key, [other for other, _ in others], n=len(others) or 1, cutoff=LOOK_ALIKE)
+			)
+			pairs += [[name, other_name] for other, other_name in others if other in matches]
+	return pairs
+
+
 def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
-	"""The rows of a receivables or payables report, and how many are advances. The headings may
-	sit under a few title rows, as in Tally's export."""
-	file_doc, extension = get_file(file_url)
-	content = file_doc.get_content()
-	if extension == "csv":
-		rows = read_csv_content(content)
-	elif extension == "xlsx":
-		rows = read_xlsx_file_from_attached_file(fcontent=content)
-	else:
-		rows = read_xls_file_from_attached_file(content)
-	keys = [[re.sub(r"[^a-z0-9]+", "_", cstr(value).lower()).strip("_") for value in row] for row in rows]
-	start = next(
-		(
-			i
-			for i, row in enumerate(keys[:HEADING_ROWS])
-			if set(row) & set(COLUMN_NAMES["party_name"])
-			and set(row) & set(COLUMN_NAMES["outstanding_amount"])
-		),
-		None,
+	"""The rows of a receivables or payables report, how many are advances, and the columns that
+	were not used. Reports from other software are read as exported: headings under title rows,
+	totals and subtotals anywhere, an amount split into Dr and Cr columns (Tally), and bills grouped
+	under a line naming their customer or supplier (QuickBooks, Busy)."""
+	rows = [row.cells for row in read_report(file_url)]
+	keys = [[get_column_key(value) for value in row] for row in rows]
+	start = next((i for i, row in enumerate(keys[:HEADING_ROWS]) if is_heading_row(row)), None)
+	sheet = get_sheet_columns(
+		keys[start] if start is not None else [],
+		keys[start + 1] if start is not None and start + 1 < len(keys) else [],
 	)
-	if start is None:
+	if sheet.columns["party_name"] is None:
 		frappe.throw(_("The sheet needs a Name column and an Outstanding column."))
-	headers = keys[start]
-	columns = {
-		field: next((headers.index(name) for name in names if name in headers), None)
-		for field, names in COLUMN_NAMES.items()
-	}
 
-	def cell(row, field):
-		index = columns[field]
-		return row[index] if index is not None and index < len(row) else None
-
-	invoices, advances = [], 0
-	for row in rows[start + 1 :]:
-		name = cstr(cell(row, "party_name")).strip()
-		amount = get_sheet_amount(cell(row, "outstanding_amount"), party_type)
-		if not name or not amount:
+	invoices, advances, party = [], 0, None
+	for row in rows[start + 1 + sheet.sub_heading :]:
+		if any(TOTAL_LINE.match(value.strip()) for value in row if isinstance(value, str)):
+			party = None
+			continue
+		name = cstr(get_cell(row, sheet.columns["party_name"])).strip()
+		amount = get_row_amount(row, sheet, party_type)
+		if not amount:
+			# in a grouped report, a line with just a name heads the bills under it
+			party = name if sheet.grouped and name else party
+			continue
+		invoice_number = cstr(get_cell(row, sheet.columns["invoice_number"])).strip()
+		if sheet.party_and_bill:
+			name, invoice_number = party, name
+		elif sheet.grouped and not name:
+			name = party
+		if not name:
 			continue
 		if amount < 0:
 			advances += 1
-		invoice_number = cstr(cell(row, "invoice_number")).strip()
 		invoices.append(
 			{
 				"party_name": name,
 				# Tally's mark for an amount set against no bill
 				"invoice_number": None if invoice_number.lower() in ("", "on account") else invoice_number,
-				"invoice_date": get_sheet_date(cell(row, "invoice_date")),
-				"due_date": get_sheet_date(cell(row, "due_date")),
+				"invoice_date": get_sheet_date(get_cell(row, sheet.columns["invoice_date"])),
+				"due_date": get_sheet_date(get_cell(row, sheet.columns["due_date"])),
 				"outstanding_amount": amount,
 			}
 		)
-	return frappe._dict(invoices=invoices, advances=advances)
+	unused = [
+		cstr(label).strip()
+		for index, label in enumerate(rows[start])
+		if index not in sheet.used and cstr(label).strip()
+	]
+	return frappe._dict(invoices=invoices, advances=advances, unused_columns=unused)
 
 
-def get_sheet_amount(value, party_type: str) -> float:
-	"""An amount cell; text like Tally's "30,000.00 Cr" is an advance when it is on the other side
-	from what the customer owes us, or we owe the supplier."""
-	if not isinstance(value, str):
-		return flt(value)
-	text = value.strip()
-	side = text[-2:].lower()
+def is_heading_row(keys: list[str]) -> bool:
+	"""A row of column headings with an amount among them, not a title like "Debtors outstanding"."""
+	return sum(1 for key in keys if key) > 1 and find_column(keys, "outstanding_amount") is not None
+
+
+def get_sheet_columns(headers: list[str], below: list[str]) -> frappe._dict:
+	"""Which column holds what in a receivables or payables report, from its heading row and the
+	row under it."""
+	columns = {field: find_column(headers, field) for field in COLUMN_NAMES}
+	sheet = frappe._dict(columns=columns, grouped=False, party_and_bill=False, credit=None, sub_heading=0)
+	# Busy's bill-wise report: "Party / Bill No.", a party's line, then its bills
+	mixed = next((i for i, key in enumerate(headers) if {"party", "bill"} <= set(key.split("_"))), None)
+	if columns["party_name"] is None and mixed is not None:
+		columns["party_name"], sheet.party_and_bill = mixed, True
+	# QuickBooks: the customer's name in a first column with no heading, over its bills
+	elif columns["party_name"] is None and headers and not headers[0]:
+		columns["party_name"] = 0
+	sheet.grouped = sheet.party_and_bill or (columns["party_name"] == 0 and headers and not headers[0])
+	# Tally: "Pending Amount" over a Dr and a Cr column, named on the row under the heading
+	if columns["outstanding_amount"] is not None and "dr" in below and "cr" in below:
+		columns["outstanding_amount"], sheet.credit, sheet.sub_heading = (
+			below.index("dr"),
+			below.index("cr"),
+			1,
+		)
+	sheet.used = {index for index in [*columns.values(), sheet.credit] if index is not None}
+	return sheet
+
+
+def find_column(headers: list[str], field: str) -> int | None:
+	"""The column of a field: by one of its usual headings, else by the words in a heading, like
+	"Outstanding (INR)" or "Their Bill No"."""
+	for name in COLUMN_NAMES[field]:
+		if name in headers:
+			return headers.index(name)
+	for words in COLUMN_WORDS.get(field, ()):
+		for index, key in enumerate(headers):
+			found = set(key.split("_"))
+			if words <= found and not found & COLUMN_WORDS_EXCLUDED.get(field, set()):
+				return index
+	return None
+
+
+def get_row_amount(row: list, sheet: frappe._dict, party_type: str) -> float:
+	if sheet.credit is not None:
+		debit = get_cell(row, sheet.columns["outstanding_amount"])
+		if get_amount(debit):
+			return get_sheet_amount(debit, party_type, "dr")
+		return get_sheet_amount(get_cell(row, sheet.credit), party_type, "cr")
+	return get_sheet_amount(
+		get_cell(row, sheet.columns["outstanding_amount"]), party_type, get_cell(row, sheet.columns["side"])
+	)
+
+
+def get_sheet_amount(value, party_type: str, side=None) -> float:
+	"""An amount cell; text like Tally's "30,000.00 Cr", or a Dr/Cr column beside it, is an advance
+	when it is on the other side from what the customer owes us, or we owe the supplier."""
+	text = cstr(value).strip()
+	side = cstr(side).strip().lower() or text[-2:].lower()
+	if side in ("dr", "cr") and text[-2:].lower() == side:
+		text = text[:-2]
+	amount = get_amount(text if isinstance(value, str) else value)
 	if side not in ("dr", "cr"):
-		return flt(text)
+		return amount
 	usual = "dr" if party_type == "Customer" else "cr"
-	amount = flt(text[:-2])
 	return amount if side == usual else -amount
 
 
@@ -307,6 +397,17 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 				{"status": "Failed", "error": _("{0} is disabled. Enable it first.").format(row.party)}
 			)
 			continue
+		party_currency = get_party_currency(party_type, row.party, company)
+		if party_currency != currency:
+			row.update(
+				{
+					"status": "Failed",
+					"error": _(
+						"{0}'s account is in {1}. Opening invoices in another currency can't be posted here yet."
+					).format(row.party, party_currency),
+				}
+			)
+			continue
 		# dated as in the old books when the books have that year, so ageing stays right
 		posting_date = row.invoice_date if has_fiscal_year(row.invoice_date, company) else day_before
 		savepoint = f"opening_invoice_{row.idx}"
@@ -340,7 +441,13 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 			doc = frappe.get_doc(invoice)
 			doc.flags.ignore_mandatory = True
 			doc.flags.dont_auto_add_taxes = True
-			doc.insert(set_name=invoice.get("invoice_number"))
+			number = invoice.get("invoice_number")
+			if number and frappe.db.get_value(doc.doctype, number, "docstatus") == 2:
+				# posted again after a cancel: ERPNext's amended name, like "INV-1-1"
+				doc.amended_from = number
+				doc.insert()
+			else:
+				doc.insert(set_name=number)
 			doc.submit()
 			row.update({"status": "Created", "invoice": doc.name, "error": None})
 		except Exception as e:
@@ -350,6 +457,12 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 
 	onboarding.flags.posting = True
 	onboarding.save()
+
+
+def get_party_currency(party_type: str, party: str, company: str) -> str:
+	"""The currency of the receivable or payable account a customer's or supplier's invoices go to."""
+	account = get_party_account(party_type, party, company)
+	return frappe.get_cached_value("Account", account, "account_currency")
 
 
 def get_new_names(onboarding, party_type: str, parties: frappe._dict) -> list[str]:
@@ -466,11 +579,12 @@ def has_fiscal_year(date, company: str) -> bool:
 	return bool(date) and bool(get_fiscal_year(date, company=company, boolean=True))
 
 
-def ensure_fiscal_year(date, company: str):
-	"""Add the financial year the opening entries fall in. Migrating on the first day of a year
-	dates them on the last day of the year before, which a new site usually doesn't have."""
-	if has_fiscal_year(date, company):
-		return
+def get_missing_fiscal_year(date, company: str) -> frappe._dict | None:
+	"""The financial year a date falls in, when ERPNext doesn't have it yet. Migrating on the first
+	day of a year dates the opening entries on the last day of the year before, which a new site
+	usually doesn't have."""
+	if not date or has_fiscal_year(date, company):
+		return None
 	latest = frappe.get_all(
 		"Fiscal Year", fields=["year_start_date"], order_by="year_start_date desc", limit=1
 	)
@@ -480,14 +594,22 @@ def ensure_fiscal_year(date, company: str):
 	while add_years(start, 1) <= getdate(date):
 		start = add_years(start, 1)
 	end = add_days(add_years(start, 1), -1)
-	frappe.get_doc(
-		{
-			"doctype": "Fiscal Year",
-			"year": str(start.year) if start.year == end.year else f"{start.year}-{end.year}",
-			"year_start_date": start,
-			"year_end_date": end,
-		}
-	).insert()
+	return frappe._dict(
+		year=str(start.year) if start.year == end.year else f"{start.year}-{end.year}",
+		year_start_date=start,
+		year_end_date=end,
+	)
+
+
+def ensure_fiscal_year(date, company: str):
+	"""Add the financial year the opening entries fall in, when ERPNext doesn't have it yet."""
+	# a failed posting rolls the year back, but not ERPNext's cached list of years
+	frappe.cache.delete_key("fiscal_years")
+	year = get_missing_fiscal_year(date, company)
+	if year:
+		frappe.get_doc({"doctype": "Fiscal Year", **year}).insert()
+		# so the form doesn't take a year undone by a failed posting for one that is there
+		frappe.db.after_rollback.add(lambda: frappe.cache.delete_key("fiscal_years"))
 
 
 def get_temporary_account(company: str, create: bool = False) -> str | None:
