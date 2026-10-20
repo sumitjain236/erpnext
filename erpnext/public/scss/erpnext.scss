@@ -683,3 +683,39 @@ body[data-route="pos"] {
 		margin: 2px 0 4px 24px;
 	}
 }
+
+// Company Setup: a stepper's first and last step line up with the content below
+.company-setup-stepper {
+	margin-inline: calc(var(--spacing) * -2);
+	width: auto;
+}
+
+// Company Setup: the names table sits right under its heading, without a form section's top gap
+.company-setup-names .form-section .section-body {
+	padding-top: 0;
+}
+
+.company-setup-names .grid-field > .control-label {
+	display: none;
+}
+
+// Company Setup: invoice rows aren't picked for anything, so the table has no tick column
+.company-setup-invoices .row-check {
+	display: none;
+}
+
+// Company Setup: a software name beside where its report is
+.company-setup-where {
+	display: grid;
+	grid-template-columns: 6rem minmax(0, 1fr);
+}
+
+// Company Setup: each checklist row opens its task
+.company-setup-step {
+	cursor: pointer;
+
+	&:hover,
+	&:focus-visible {
+		background-color: var(--surface-gray-2);
+	}
+}

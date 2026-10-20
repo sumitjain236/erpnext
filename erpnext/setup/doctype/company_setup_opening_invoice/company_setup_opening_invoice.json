@@ -10,6 +10,8 @@
   "party_type",
   "party_name",
   "party",
+  "create_party",
+  "account",
   "invoice_number",
   "column_break_dates",
   "invoice_date",
@@ -105,12 +107,25 @@
    "fieldtype": "Small Text",
    "label": "Error",
    "read_only": 1
+  },
+  {
+   "fieldname": "account",
+   "fieldtype": "Link",
+   "label": "Account",
+   "options": "Account"
+  },
+  {
+   "default": "0",
+   "description": "The name on the sheet becomes a new customer or supplier when posted.",
+   "fieldname": "create_party",
+   "fieldtype": "Check",
+   "label": "Create as new"
   }
  ],
  "grid_page_length": 50,
  "istable": 1,
  "links": [],
- "modified": "2026-10-15 23:12:52.918084",
+ "modified": "2026-10-19 17:49:52.355102",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup Opening Invoice",

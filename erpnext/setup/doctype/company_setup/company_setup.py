@@ -8,6 +8,7 @@ from frappe.model import default_fields
 from frappe.model.document import Document
 from frappe.query_builder.functions import Sum
 from frappe.utils import add_days, cint, cstr, flt, fmt_money, formatdate, getdate, now_datetime, sbool
+from frappe.utils.background_jobs import is_job_enqueued
 
 from erpnext.accounts.doctype.account.account import get_account_autoname
 from erpnext.accounts.doctype.account.chart_of_accounts.chart_of_accounts import build_tree_from_json
@@ -32,13 +33,16 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	ensure_fiscal_year,
 	find_party,
 	get_exact_key,
+	get_invoice_accounts,
 	get_look_alikes,
 	get_missing_fiscal_year,
 	get_parties,
 	get_party_currency,
+	get_posted_names,
 	get_suggestions,
 	get_table,
 	get_temporary_account,
+	match_party,
 	read_invoice_sheet,
 )
 
@@ -84,17 +88,15 @@ class CompanySetup(Document):
 		from erpnext.setup.doctype.company_setup_opening_invoice.company_setup_opening_invoice import (
 			CompanySetupOpeningInvoice,
 		)
-		from erpnext.setup.doctype.company_setup_step.company_setup_step import (
-			CompanySetupStep,
-		)
+		from erpnext.setup.doctype.company_setup_step.company_setup_step import CompanySetupStep
 
 		chart_of_accounts_source: DF.Literal["", "Existing", "Imported"]
 		company: DF.Link
+		migration_date: DF.Date | None
 		no_opening_data: DF.Check
 		opening_balances: DF.Table[CompanySetupOpeningBalance]
 		opening_purchase_invoices: DF.Table[CompanySetupOpeningInvoice]
 		opening_sales_invoices: DF.Table[CompanySetupOpeningInvoice]
-		migration_date: DF.Date | None
 		status: DF.Literal["In Progress", "Live"]
 		steps: DF.Table[CompanySetupStep]
 	# end: auto-generated types
@@ -125,6 +127,7 @@ class CompanySetup(Document):
 			!= [(row.step_key, row.status) for row in self.steps],
 		)
 		self.set_onload("chart_import_blocked", get_chart_import_blocker(self.company))
+		self.set_onload("posting", self.get_posting())
 		day_before = self.migration_date and add_days(self.migration_date, -1)
 		missing_year = get_missing_fiscal_year(day_before, self.company)
 		self.set_onload(
@@ -190,7 +193,7 @@ class CompanySetup(Document):
 		"""A draft invoice was unpaid before the migration date, so it is dated before it and owes
 		something, or is an advance paid before it."""
 		day_before = self.migration_date and getdate(add_days(self.migration_date, -1))
-		for table in TABLES.values():
+		for party_type, table in TABLES.items():
 			for row in self.get(table):
 				if row.status == "Created":
 					continue
@@ -201,8 +204,13 @@ class CompanySetup(Document):
 						)
 					)
 				if day_before and row.invoice_date and getdate(row.invoice_date) > day_before:
+					message = (
+						_("Row {0}: bill {1} is dated after {2}, so it belongs in the new books.")
+						if party_type == "Supplier"
+						else _("Row {0}: invoice {1} is dated after {2}, so it belongs in the new books.")
+					)
 					frappe.throw(
-						_("Row {0}: invoice {1} is dated after {2}, so it belongs in the new books.").format(
+						message.format(
 							row.idx, frappe.bold(row.invoice_number or row.party_name), formatdate(day_before)
 						)
 					)
@@ -264,9 +272,39 @@ class CompanySetup(Document):
 		for idx, row in enumerate(self.steps, 1):
 			row.idx = idx
 
+	def get_posting(self) -> list[str]:
+		"""Customer and/or Supplier, when their opening invoices are being posted in the background."""
+		return [
+			party_type
+			for party_type in TABLES
+			if is_job_enqueued(f"company_setup_invoices::{self.company}::{party_type}")
+		]
+
+	def is_posting(self) -> bool:
+		"""Opening invoices are being posted in the background for this company."""
+		return bool(self.get_posting())
+
+	def use_latest(self):
+		"""Lock the row and start from what is saved, if it changed since this was loaded."""
+		modified = frappe.db.get_value(self.doctype, self.name, "modified", for_update=True)
+		if str(modified) != str(self.modified):
+			self.reload()
+
+	def start_change(self):
+		"""Before a change is saved: none while a posting runs, and on top of the latest save."""
+		if self.is_posting():
+			frappe.throw(
+				_("Invoices are being posted in the background. Try again once they are done."),
+				title=_("Posting in progress"),
+			)
+		self.use_latest()
+
 	@frappe.whitelist()
 	def check_steps(self) -> bool:
 		"""Save when a step's status changed. The form calls this each time it opens."""
+		if self.is_posting():
+			return False
+		self.use_latest()
 		before = [(row.step_key, row.status) for row in self.steps]
 		self.update_steps()
 		changed = before != [(row.step_key, row.status) for row in self.steps]
@@ -277,6 +315,7 @@ class CompanySetup(Document):
 	@frappe.whitelist()
 	def skip_step(self, step_key: str, skip: int = 1):
 		"""Skip a step, or bring a skipped step back. A step that is done stays done."""
+		self.start_change()
 		row = next((row for row in self.steps if row.step_key == step_key), None)
 		if not row:
 			frappe.throw(_("Step {0} not found").format(step_key))
@@ -286,12 +325,14 @@ class CompanySetup(Document):
 	@frappe.whitelist()
 	def use_existing_chart(self):
 		"""Keep the chart of accounts made during setup."""
+		self.start_change()
 		self.chart_of_accounts_source = "Existing"
 		self.save()
 
 	@frappe.whitelist()
 	def change_chart_choice(self):
 		"""Undo the chart choice, so the step asks again."""
+		self.start_change()
 		self.chart_of_accounts_source = ""
 		self.save()
 
@@ -318,6 +359,7 @@ class CompanySetup(Document):
 			"credit": sum(balance.credit for balance in kept),
 			"left_out": {account_type: amount for account_type, amount in left_out.items() if amount},
 			"draft_balances": len(self.opening_balances),
+			"added_accounts": get_missing_system_accounts(self.company, set(types.values())),
 		}
 
 	@frappe.whitelist()
@@ -325,6 +367,7 @@ class CompanySetup(Document):
 		"""Replace the chart with the sheet's. Its balances become draft opening balances, and the
 		accounts ERPNext needs that the sheet lacks are added."""
 		self.check_permission("write")
+		self.start_change()
 		sheet = read_chart_sheet(file_url)
 		old_names = {
 			row.account: frappe.db.get_value("Account", row.account, "account_name")
@@ -333,8 +376,10 @@ class CompanySetup(Document):
 		}
 
 		default_names = get_default_account_names(self.company)
+		party_accounts = get_party_account_names(self.company)
 		replace_chart(sheet.rows, self.company, refill_defaults=True)
 		keep_default_accounts(self.company, default_names)
+		keep_party_accounts(self.company, party_accounts)
 		added = add_system_accounts(self.company)
 		self.chart_of_accounts_source = "Imported"
 		if sheet.balances:
@@ -355,6 +400,7 @@ class CompanySetup(Document):
 	def save_opening_balances(self, rows: list | str):
 		"""Replace the draft opening balances with these rows. Posted ones stay as they are."""
 		self.check_permission("write")
+		self.start_change()
 		self.opening_balances = [row for row in self.opening_balances if row.status == "Posted"]
 		for row in frappe.parse_json(rows):
 			# one side per row, as a journal entry needs: a credit typed as a negative debit too
@@ -410,20 +456,31 @@ class CompanySetup(Document):
 			for row in self.opening_balances
 			if row.account and row.status != "Posted"
 		]
-		# invoices land on their customer's or supplier's account; one without an enabled one won't post
+		# invoices land on their customer's or supplier's account, a name confirmed as new on the
+		# company's default one; posting leaves out a disabled party and one in another currency
 		draft_invoices, left_out = 0, 0
+		currency = frappe.get_cached_value("Company", self.company, "default_currency")
 		for party_type, sign in (("Customer", 1), ("Supplier", -1)):
 			parties, accounts = get_parties(party_type), {}
 			for row in self.get(TABLES[party_type]):
 				if row.status == "Created":
 					continue
 				party = row.party if row.party in parties.names else find_party(parties, row.party_name)
-				if not party or party in parties.disabled:
+				if party and party not in accounts:
+					accounts[party] = get_party_account(party_type, party, self.company)
+				account = row.account or (
+					accounts[party]
+					if party
+					else row.create_party and get_party_account(party_type, None, self.company)
+				)
+				if (
+					not account
+					or party in parties.disabled
+					or frappe.get_cached_value("Account", account, "account_currency") != currency
+				):
 					left_out += 1
 					continue
-				if party not in accounts:
-					accounts[party] = get_party_account(party_type, party, self.company)
-				drafts.append((accounts[party], sign * flt(row.outstanding_amount)))
+				drafts.append((account, sign * flt(row.outstanding_amount)))
 				draft_invoices += 1
 		for account, difference in drafts:
 			balances[account] = balances.get(account, 0) + difference
@@ -472,6 +529,7 @@ class CompanySetup(Document):
 		"""Post the draft balances on the day before the migration date, balanced against Temporary Opening.
 		Balance sheet accounts go in an opening entry; income and expenses so far in an ordinary one."""
 		self.check_permission("write")
+		self.start_change()
 		# post what is saved, checked as when it was saved
 		self.reload()
 		self.validate_opening_balances()
@@ -567,10 +625,13 @@ class CompanySetup(Document):
 		is one of them again is left out (skipped), and so is a row repeating one above it with the same
 		invoice number (repeated)."""
 		self.check_permission("write")
+		self.start_change()
 		table = get_table(party_type)
 		parties = get_parties(party_type)
+		accounts = get_invoice_accounts(self.company, party_type)
 		posted = [row for row in self.get(table) if row.status == "Created"]
 		posted_keys = {get_invoice_key(row) for row in posted}
+		posted_names = get_posted_names(self, party_type)
 		self.set(table, posted)
 		skipped, repeated, seen = 0, 0, set()
 		for row in frappe.parse_json(rows):
@@ -586,12 +647,27 @@ class CompanySetup(Document):
 				repeated += 1
 				continue
 			seen.add(key)
+			if row.account and row.account not in accounts:
+				frappe.throw(
+					_("{0} isn't a receivable account of {1} in its currency.").format(
+						row.account, self.company
+					)
+					if party_type == "Customer"
+					else _("{0} isn't a payable account of {1} in its currency.").format(
+						row.account, self.company
+					),
+					title=_("Wrong account"),
+				)
 			self.append(
 				table,
 				{
 					"party_type": party_type,
 					"party_name": name,
-					"party": row.party if row.party in parties.names else find_party(parties, name),
+					"party": row.party
+					if row.party in parties.names
+					else match_party(parties, posted_names, name),
+					"create_party": cint(row.create_party) if not row.party else 0,
+					"account": row.account,
 					"invoice_number": row.invoice_number,
 					"invoice_date": row.invoice_date,
 					"due_date": row.due_date,
@@ -622,11 +698,12 @@ class CompanySetup(Document):
 		disabled parties."""
 		self.check_permission("read")
 		parties = get_parties(party_type)
+		posted_names = get_posted_names(self, party_type)
 		new, similar, found = {}, {}, {}
 		for row in self.get(get_table(party_type)):
 			if row.status == "Created":
 				continue
-			match = find_party(parties, row.party_name)
+			match = match_party(parties, posted_names, row.party_name)
 			party = row.party if row.party in parties.names else match
 			if not party:
 				totals = new.setdefault(row.party_name, {"invoices": 0, "amount": 0})
@@ -641,7 +718,19 @@ class CompanySetup(Document):
 			}:
 				similar[row.party_name] = party
 		drafts = {row.party for row in self.get(get_table(party_type)) if row.status != "Created"}
+		accounts = get_invoice_accounts(self.company, party_type)
 		return {
+			# with one account there is nothing to choose
+			"accounts": accounts if len(accounts) > 1 else [],
+			# an account in another currency isn't one to pick; posting leaves those rows out
+			"party_accounts": {
+				party: account
+				for party in sorted((drafts | set(found.values())) - {None})
+				if (account := get_party_account(party_type, party, self.company)) in accounts
+			}
+			if len(accounts) > 1
+			else {},
+			"can_create": frappe.has_permission(party_type, "create"),
 			"new": sorted(new),
 			"totals": new,
 			"suggestions": get_suggestions(parties, list(new)),
@@ -655,12 +744,17 @@ class CompanySetup(Document):
 		}
 
 	@frappe.whitelist()
-	def create_opening_invoices(self, party_type: str, add_missing: bool = False) -> str:
-		"""Post the draft rows as opening invoices: right away, or in the background when many. With
-		add_missing, first add the customers or suppliers ERPNext doesn't have yet."""
+	def create_opening_invoices(self, party_type: str) -> str:
+		"""Post the draft rows as opening invoices: right away, or in the background when many. The
+		names confirmed as new are added first."""
 		self.check_permission("write")
-		add_missing = sbool(add_missing)
-		if add_missing and not frappe.has_permission(party_type, "create"):
+		self.start_change()
+		confirmed_new = any(
+			row.create_party and not row.party
+			for row in self.get(get_table(party_type))
+			if row.status != "Created"
+		)
+		if confirmed_new and not frappe.has_permission(party_type, "create"):
 			frappe.throw(
 				_("You can't add a {0}. Ask someone who can, or post without adding them.").format(
 					_(party_type)
@@ -669,13 +763,17 @@ class CompanySetup(Document):
 			)
 		drafts = [row for row in self.get(get_table(party_type)) if row.status != "Created"]
 		if not drafts:
-			frappe.throw(_("There are no invoices to post."))
+			frappe.throw(
+				_("There are no bills to post.")
+				if party_type == "Supplier"
+				else _("There are no invoices to post.")
+			)
 		if not self.migration_date:
 			frappe.throw(
-				_("Set the migration date first, so invoices without a date can be dated the day before.")
+				_("Set the migration date first, so rows without a date can be dated the day before.")
 			)
 		if len(drafts) < BACKGROUND_FROM:
-			create_invoices(self.company, party_type, add_missing)
+			create_invoices(self.company, party_type)
 			return "done"
 		frappe.enqueue(
 			create_invoices_in_background,
@@ -684,7 +782,6 @@ class CompanySetup(Document):
 			deduplicate=True,
 			company=self.company,
 			party_type=party_type,
-			add_missing=add_missing,
 			now=frappe.in_test,
 		)
 		return "queued"
@@ -694,6 +791,7 @@ class CompanySetup(Document):
 		"""Mark the company as working in ERPNext. Whatever is left is only pointed out, but an
 		amount left in Temporary Opening has to be accepted on purpose."""
 		self.check_permission("write")
+		self.start_change()
 		temporary = get_temporary_opening_balance(self.company)
 		if temporary and not sbool(accept_temporary_opening):
 			currency = frappe.get_cached_value("Company", self.company, "default_currency")
@@ -756,12 +854,16 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 		if balance.get("is_group"):
 			groups += 1
 			continue
-		party_group = get_party_group_type([balance.account_name, *balance.get("groups", [])])
+		name = find_account(company, balance.account_number, balance.account_name)
+		account = accounts.get(name) or frappe._dict()
+		# an account of the chart keeps its balance whatever group the sheet puts it under, like a
+		# provision for bad debts kept with the debtors
+		party_group = not (
+			account and not account.is_group and account.account_type not in NO_OPENING_BALANCE
+		) and get_party_group_type([balance.account_name, *balance.get("groups", [])])
 		if party_group:
 			left_out[party_group] = flt(left_out.get(party_group)) + flt(balance.debit) - flt(balance.credit)
 			continue
-		name = find_account(company, balance.account_number, balance.account_name)
-		account = accounts.get(name) or frappe._dict()
 		account_type = account.account_type or get_party_account_type(balance.account_name)
 		if account.is_group:
 			# a total like "Accounts Receivable" stands for what its sub-accounts hold
@@ -816,6 +918,56 @@ def keep_default_accounts(company: str, default_names: dict[str, str]):
 			values[fieldname] = account
 	if values:
 		frappe.db.set_value("Company", company, values)
+
+
+def get_party_account_names(company: str) -> list[dict]:
+	"""The company's customer, supplier and group accounts, as account names that a new chart can have again."""
+	rows = frappe.get_all(
+		"Party Account",
+		filters={"company": company},
+		fields=["parent", "parenttype", "parentfield", "idx", "account", "advance_account"],
+	)
+	for row in rows:
+		for field in ("account", "advance_account"):
+			row[field] = row[field] and frappe.db.get_value("Account", row[field], "account_name")
+	return rows
+
+
+def keep_party_accounts(company: str, rows: list[dict]):
+	"""Add back the Party Account rows the chart replace deletes, pointing at the new accounts of the
+	same name. A row whose account the new chart lacks is left out, so the company default applies."""
+
+	def find(account_name):
+		return account_name and frappe.db.get_value(
+			"Account", {"company": company, "account_name": account_name, "is_group": 0}
+		)
+
+	for row in rows:
+		account, advance_account = find(row.account), find(row.advance_account)
+		if not (account or advance_account):
+			continue
+		frappe.get_doc(
+			{
+				"doctype": "Party Account",
+				"parent": row.parent,
+				"parenttype": row.parenttype,
+				"parentfield": row.parentfield,
+				"idx": row.idx,
+				"company": company,
+				"account": account,
+				"advance_account": advance_account,
+			}
+		).db_insert()
+
+
+def get_missing_system_accounts(company: str, account_types: set) -> list[str]:
+	"""The accounts add_system_accounts would add for a chart with these account types."""
+	perpetual = frappe.get_cached_value("Company", company, "enable_perpetual_inventory")
+	return [
+		_(account_type)
+		for account_type, _root_type, _fieldname, for_stock in SYSTEM_ACCOUNTS
+		if (perpetual or not for_stock) and account_type not in account_types
+	]
 
 
 def add_system_accounts(company: str) -> list[str]:

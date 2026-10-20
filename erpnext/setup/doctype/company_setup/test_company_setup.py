@@ -21,7 +21,11 @@ from erpnext.setup.doctype.company_setup.company_setup import (
 	get_chart_import_blocker,
 )
 from erpnext.setup.doctype.company_setup.company_setup_steps import HOOK_NAME, get_step_paths
-from erpnext.setup.doctype.company_setup.opening_invoices import download_new_parties, ensure_fiscal_year
+from erpnext.setup.doctype.company_setup.opening_invoices import (
+	download_new_parties,
+	ensure_fiscal_year,
+	get_invoice_accounts,
+)
 from erpnext.tests.utils import ERPNextTestSuite
 
 COMPANY = "_Test Company"
@@ -238,6 +242,28 @@ class TestCompanySetup(ERPNextTestSuite):
 		doc.skip_step(key, skip=0)
 		self.assertEqual(step_status(doc)["opening_balances"], "Not Started")
 
+	def test_steps_are_checked_after_a_save_from_elsewhere(self):
+		opened = get_onboarding()
+		# like a background posting saving the document while the form was open
+		other = get_onboarding()
+		other.migration_date = "2026-04-01"
+		other.save()
+
+		opened.check_steps()
+		self.assertEqual(step_status(opened)["migration_date"], "Done")
+
+	def test_nothing_is_changed_while_invoices_post_in_the_background(self):
+		doc = get_onboarding()
+		with patch("erpnext.setup.doctype.company_setup.company_setup.is_job_enqueued", return_value=True):
+			self.assertRaises(
+				frappe.ValidationError,
+				doc.save_opening_invoices,
+				"Customer",
+				[{"party_name": "Onboarding Busy Customer", "outstanding_amount": 100}],
+			)
+			# opening the form while posting changes nothing either
+			self.assertFalse(doc.check_steps())
+
 	def test_done_step_stays_done_when_skipped(self):
 		doc = get_onboarding()
 		doc.use_existing_chart()
@@ -313,9 +339,14 @@ class TestCompanySetup(ERPNextTestSuite):
 		doc.flags.posting = True
 		doc.append("opening_balances", {"original_account": "Cash", "debit": 100, "status": "Posted"})
 		doc.append("opening_sales_invoices", {"party_name": "X", "outstanding_amount": 10})
+		doc.append("opening_purchase_invoices", {"party_name": "Y", "outstanding_amount": 10})
+		doc.append("opening_purchase_invoices", {"party_name": "Z", "outstanding_amount": 10})
 		with patch.object(company_setup_steps, "get_temporary_opening_balance", return_value=0):
 			doc.save()
-		self.assertEqual(step_status(doc)["check_books"], "Not Started")
+			self.assertEqual(step_status(doc)["check_books"], "Not Started")
+			self.assertEqual(
+				company_setup_steps.check_books(doc)["summary"], "1 invoice and 2 bills still to post"
+			)
 
 	def test_go_live(self):
 		doc = get_onboarding()
@@ -466,6 +497,9 @@ class TestChartImport(ERPNextTestSuite):
 	def test_import_adds_the_accounts_erpnext_posts_to(self):
 		# a chart from other software has a round off account at most, and no stock-not-billed one
 		sheet = [*SHEET, "Round Off,Expenses,5300,5000,0,Round Off,Expense,INR,,"]
+		self.assertEqual(
+			self.doc.preview_chart(make_sheet(sheet))["added_accounts"], ["Stock Received But Not Billed"]
+		)
 		result = self.doc.import_chart(make_sheet(sheet))
 
 		srbnb = frappe.db.get_value("Company", self.company, "stock_received_but_not_billed")
@@ -489,6 +523,28 @@ class TestChartImport(ERPNextTestSuite):
 
 		receivable = frappe.db.get_value("Company", self.company, "default_receivable_account")
 		self.assertEqual(frappe.db.get_value("Account", receivable, "account_name"), "Debtors")
+
+	def test_import_keeps_customer_and_group_accounts_by_name(self):
+		sheet = [*SHEET, "Debtors - Export,Current Assets,1131,1100,0,Receivable,Asset,INR,,"]
+		self.doc.import_chart(make_sheet(sheet))
+		customer = make_customer("_Test Setup Export Customer")
+		group = frappe.db.get_value("Customer Group", {"is_group": 0})
+		set_party_account("Customer", customer, self.company, "1131 - Debtors - Export - _TOC")
+		set_party_account("Customer Group", group, self.company, "1131 - Debtors - Export - _TOC")
+
+		self.doc.import_chart(
+			make_sheet([*sheet, "Debtors - Old,Current Assets,1133,1100,0,Receivable,Asset,INR,,"])
+		)
+
+		for doctype, name in (("Customer", customer), ("Customer Group", group)):
+			self.assertEqual(
+				frappe.get_all(
+					"Party Account",
+					{"parenttype": doctype, "parent": name, "company": self.company},
+					pluck="account",
+				),
+				["1131 - Debtors - Export - _TOC"],
+			)
 
 	def test_preview_changes_nothing(self):
 		before = frappe.db.count("Account", {"company": self.company})
@@ -592,6 +648,15 @@ def make_customer(name: str, disabled: int = 0) -> str:
 	).insert()
 	frappe.set_user(user)
 	return customer.name
+
+
+def set_party_account(doctype: str, name: str, company: str, account: str):
+	user = frappe.session.user
+	frappe.set_user("Administrator")
+	doc = frappe.get_doc(doctype, name)
+	doc.set("accounts", [{"company": company, "account": account}])
+	doc.save()
+	frappe.set_user(user)
 
 
 def has_year(date: str) -> bool:
@@ -804,6 +869,35 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.assertEqual([(row.account, row.debit) for row in self.doc.opening_balances], [(self.cash, 300)])
 		self.assertEqual(result["left_out"], {"Stock": 1500})
 
+	def test_an_account_of_the_chart_under_the_debtors_group_keeps_its_balance(self):
+		user = frappe.session.user
+		frappe.set_user("Administrator")
+		receivable = get_account(self.company, account_type="Receivable")
+		provision = frappe.get_doc(
+			{
+				"doctype": "Account",
+				"account_name": "Provision for Doubtful Debts",
+				"company": self.company,
+				"parent_account": frappe.db.get_value("Account", receivable, "parent_account"),
+			}
+		).insert()
+		frappe.set_user(user)
+		result = self.doc.import_opening_balances(
+			make_file(
+				"busy_tb.csv",
+				[
+					"Particulars,Group,Debit,Credit",
+					"Onboarding Customer A,Sundry Debtors,900,",
+					"Provision for Doubtful Debts,Sundry Debtors,,200",
+					"Total,,900,200",
+				],
+			)
+		)
+		self.assertEqual(
+			[(row.account, row.credit) for row in self.doc.opening_balances], [(provision.name, 200)]
+		)
+		self.assertEqual(result["left_out"], {"Receivable": 900})
+
 	def test_a_receivables_total_line_is_left_out_with_customers(self):
 		group = frappe.db.get_value(
 			"Account",
@@ -1013,6 +1107,25 @@ class TestOpeningInvoices(ERPNextTestSuite):
 			],
 		)
 		self.assertEqual(self.doc.get_invoice_names("Customer")["suggestions"], {"Pátil Homs": homes})
+
+	def test_indian_name_styles_match(self):
+		icici = make_customer("ICICI Bank Ltd")
+		godrej = make_customer("Godrej & Boyce Mfg Co Ltd")
+		adani = make_customer("Adani Realty Pvt Ltd")
+		mahindra = make_customer("Mahindra Lifespace Developers Ltd")
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{"party_name": "M/s I.C.I.C.I. BANK", "outstanding_amount": 10},
+				{"party_name": "Godrej and Boyce Mfg. Co. Ltd.", "outstanding_amount": 20},
+				{"party_name": "M/s ADANI REALTY", "outstanding_amount": 30},
+				{"party_name": "M/s MAHINDRA LIFESPACE", "outstanding_amount": 40},
+			],
+		)
+		self.assertEqual([row.party for row in self.doc.opening_sales_invoices], [icici, godrej, adani, None])
+		self.assertEqual(
+			self.doc.get_invoice_names("Customer")["suggestions"], {"M/s MAHINDRA LIFESPACE": mahindra}
+		)
 
 	def test_two_spellings_of_one_new_name_are_pointed_out(self):
 		self.doc.save_opening_invoices(
@@ -1291,18 +1404,19 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		make_user(user, "Sales User")
 		frappe.set_user(user)
 
-	def test_add_missing_makes_one_customer_for_a_name_on_two_rows(self):
+	def test_a_name_confirmed_as_new_makes_one_customer_for_two_rows(self):
 		self.allow_adding_customers()
 		self.doc.migration_date = "2026-04-01"
 		self.doc.save_opening_invoices(
 			"Customer",
 			[
-				{"party_name": "Onboarding Twice Customer", "outstanding_amount": 100},
-				{"party_name": "Onboarding Twice Customer", "outstanding_amount": 200},
+				{"party_name": "Onboarding Twice Customer", "outstanding_amount": 100, "create_party": 1},
+				{"party_name": "Onboarding Twice Customer", "outstanding_amount": 200, "create_party": 1},
 			],
 		)
-		self.doc.create_opening_invoices("Customer", add_missing=True)
-		self.doc.create_opening_invoices("Customer", add_missing=True)
+		self.doc.create_opening_invoices("Customer")
+		# posting again from the same, older copy finds the rows posted
+		self.assertRaises(frappe.ValidationError, self.doc.create_opening_invoices, "Customer")
 		self.doc.reload()
 
 		rows = self.doc.opening_sales_invoices
@@ -1310,7 +1424,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertEqual(frappe.db.count("Customer", {"customer_name": "Onboarding Twice Customer"}), 1)
 		self.assertEqual(rows[0].party, rows[1].party)
 
-	def test_add_missing_keeps_mandatory_fields(self):
+	def test_a_name_confirmed_as_new_keeps_mandatory_fields(self):
 		self.allow_adding_customers()
 		# like a custom app making a field mandatory, with no default to fill it
 		make_property_setter("Customer", "tax_id", "reqd", 1, "Check")
@@ -1320,10 +1434,14 @@ class TestOpeningInvoices(ERPNextTestSuite):
 			"Customer",
 			[
 				{"party_name": self.customer.customer_name, "outstanding_amount": 100},
-				{"party_name": "Onboarding Incomplete Customer", "outstanding_amount": 200},
+				{
+					"party_name": "Onboarding Incomplete Customer",
+					"outstanding_amount": 200,
+					"create_party": 1,
+				},
 			],
 		)
-		self.doc.create_opening_invoices("Customer", add_missing=True)
+		self.doc.create_opening_invoices("Customer")
 		self.doc.reload()
 
 		known, new = self.doc.opening_sales_invoices
@@ -1331,17 +1449,57 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertIn("Tax ID", new.error)
 		self.assertFalse(frappe.db.exists("Customer", {"customer_name": "Onboarding Incomplete Customer"}))
 
-	def test_add_missing_needs_permission_to_add_customers(self):
+	def test_a_name_confirmed_as_new_needs_permission_to_add_customers(self):
 		frappe.set_user("Administrator")
 		frappe.set_user(make_user("onboarding.no.customers@example.com", "Accounts Manager"))
 		self.doc = frappe.get_doc("Company Setup", self.company)
 		self.doc.migration_date = "2026-04-01"
 		self.doc.save_opening_invoices(
-			"Customer", [{"party_name": "Onboarding Not Allowed Customer", "outstanding_amount": 100}]
+			"Customer",
+			[{"party_name": "Onboarding Not Allowed Customer", "outstanding_amount": 100, "create_party": 1}],
 		)
-		self.assertRaises(
-			frappe.PermissionError, self.doc.create_opening_invoices, "Customer", add_missing=True
+		self.assertFalse(self.doc.get_invoice_names("Customer")["can_create"])
+		self.assertRaises(frappe.PermissionError, self.doc.create_opening_invoices, "Customer")
+
+	def test_only_names_confirmed_as_new_are_added(self):
+		self.allow_adding_customers()
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{"party_name": "Onboarding Confirmed Customer", "outstanding_amount": 100, "create_party": 1},
+				{"party_name": "Onboarding Unconfirmed Customer", "outstanding_amount": 200},
+			],
 		)
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+
+		confirmed, unconfirmed = self.doc.opening_sales_invoices
+		self.assertEqual((confirmed.status, unconfirmed.status), ("Created", "Failed"))
+		self.assertFalse(frappe.db.exists("Customer", {"customer_name": "Onboarding Unconfirmed Customer"}))
+
+	def test_a_name_posted_on_an_earlier_sheet_is_linked_on_the_next(self):
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{
+					"party_name": "ONBOARDING DELHI SPELLING",
+					"party": self.customer.name,
+					"outstanding_amount": 100,
+				}
+			],
+		)
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+		self.assertEqual(self.doc.opening_sales_invoices[0].status, "Created")
+
+		# the next office's sheet spells the name the same way
+		self.doc.save_opening_invoices(
+			"Customer", [{"party_name": "Onboarding Delhi Spelling", "outstanding_amount": 200}]
+		)
+		self.assertEqual(self.doc.opening_sales_invoices[-1].party, self.customer.name)
+		self.assertEqual(self.doc.get_invoice_names("Customer")["new"], [])
 
 	def test_sheet_for_new_customers_has_the_new_names_and_mandatory_columns(self):
 		self.allow_adding_customers()
@@ -1386,13 +1544,85 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.doc.save_opening_invoices(
 			"Customer", [{"party_name": "Onboarding Export Customer", "outstanding_amount": 100}]
 		)
-		self.assertEqual(self.doc.get_invoice_names("Customer")["other_currency"], {customer.name: "USD"})
+		names = self.doc.get_invoice_names("Customer")
+		self.assertEqual(names["other_currency"], {customer.name: "USD"})
+		# its USD account is no account to pick, so saving the rows as shown doesn't stop on it
+		self.add_receivable_account("Debtors - Domestic")
+		self.assertNotIn(customer.name, self.doc.get_invoice_names("Customer")["party_accounts"])
+		# nor does the books' preview count it
+		self.assertEqual(self.doc.preview_opening_balances()["left_out_invoices"], 1)
 		self.doc.create_opening_invoices("Customer")
 		self.doc.reload()
 
 		row = self.doc.opening_sales_invoices[0]
 		self.assertEqual(row.status, "Failed")
 		self.assertIn("in USD", row.error)
+
+	def add_receivable_account(self, account_name):
+		user = frappe.session.user
+		frappe.set_user("Administrator")
+		receivable = get_account(self.company, account_type="Receivable")
+		account = frappe.get_doc(
+			{
+				"doctype": "Account",
+				"account_name": account_name,
+				"company": self.company,
+				"parent_account": frappe.db.get_value("Account", receivable, "parent_account"),
+				"account_type": "Receivable",
+			}
+		).insert()
+		frappe.set_user(user)
+		return receivable, account.name
+
+	def test_invoices_post_to_their_customers_account_and_keep_it(self):
+		self.assertEqual(self.doc.get_invoice_names("Customer")["accounts"], [])
+		receivable, export = self.add_receivable_account("Debtors - Export")
+		self.doc.migration_date = "2026-04-01"
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{
+					"party_name": self.customer.customer_name,
+					"account": export,
+					"invoice_number": "OB-SINV-EXP-1",
+					"outstanding_amount": 500,
+				},
+				{"party_name": self.customer.customer_name, "account": export, "outstanding_amount": -100},
+			],
+		)
+		names = self.doc.get_invoice_names("Customer")
+		self.assertEqual(set(names["accounts"]), {receivable, export})
+		self.assertEqual(names["party_accounts"], {self.customer.name: receivable})
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+
+		rows = self.doc.opening_sales_invoices
+		self.assertEqual([row.status for row in rows], ["Created"] * 2, [row.error for row in rows])
+		self.assertEqual(frappe.db.get_value("Sales Invoice", "OB-SINV-EXP-1", "debit_to"), export)
+		advance = frappe.get_doc("Journal Entry", rows[1].invoice)
+		self.assertEqual(next(line.account for line in advance.accounts if line.party), export)
+		# the account belongs to the customer: its later invoices go there too
+		self.assertEqual(get_party_account("Customer", self.customer.name, self.company), export)
+
+	def test_only_the_companys_receivable_or_payable_accounts_can_be_picked(self):
+		_receivable, export = self.add_receivable_account("Debtors - Export")
+		income = get_account(self.company, root_type="Income")
+		for account in (income, get_account(COMPANY, account_type="Receivable")):
+			with self.assertRaises(frappe.ValidationError):
+				self.doc.save_opening_invoices(
+					"Customer",
+					[
+						{
+							"party_name": self.customer.customer_name,
+							"account": account,
+							"outstanding_amount": 1,
+						}
+					],
+				)
+		# an employee advance is payable too, but an asset: never a supplier's account
+		for account in get_invoice_accounts(self.company, "Supplier"):
+			self.assertEqual(frappe.db.get_value("Account", account, "root_type"), "Liability")
+		self.assertIn(export, get_invoice_accounts(self.company, "Customer"))
 
 	def test_a_failed_invoice_is_undone_alone(self):
 		self.doc.migration_date = "2026-04-01"
@@ -1420,7 +1650,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertNotIn("<", second.error)
 		self.doc.run_method("onload")
 		step = self.doc.get_onload().steps[step_key(self.doc, "opening_sales_invoices")]
-		self.assertEqual(step["summary"], "1 could not be posted. Open the table to see why.")
+		self.assertEqual(step["summary"], "1 posted · 1 left to post: 1 failed, fix them and post again")
 
 	def test_a_save_keeps_posted_invoices(self):
 		self.doc.migration_date = "2026-04-01"

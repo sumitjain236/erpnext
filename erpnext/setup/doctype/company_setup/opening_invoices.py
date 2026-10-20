@@ -34,6 +34,8 @@ from erpnext.setup.doctype.company_setup.chart_sheet import (
 TABLES = {"Customer": "opening_sales_invoices", "Supplier": "opening_purchase_invoices"}
 INVOICE_TYPES = {"Customer": "Sales", "Supplier": "Purchase"}
 PARTY_NAME_FIELDS = {"Customer": "customer_name", "Supplier": "supplier_name"}
+PARTY_ACCOUNT_FIELDS = {"Customer": "debit_to", "Supplier": "credit_to"}
+INVOICE_ACCOUNT_TYPES = {"Customer": ("Receivable", "Asset"), "Supplier": ("Payable", "Liability")}
 # filled from Selling or Buying Settings when a new one is added
 PARTY_DEFAULTS = {"Customer": ("customer_group", "territory"), "Supplier": ("supplier_group",)}
 # the columns of the sheet for new customers or suppliers, besides their other mandatory fields
@@ -104,9 +106,14 @@ ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 ACCENTS = re.compile("[\u0300-\u036f]")
 # how alike two names must be to look like one spelt two ways
 LOOK_ALIKE = 0.85
+# letters of initials like "I.C.I.C.I.", apart after punctuation is removed
+INITIALS = re.compile(r"\b(\w) (?=\w\b)")
+LEADING_MS = re.compile(r"^(m s|ms|messrs) ")
 LEGAL_WORDS = re.compile(r"\b(private|pvt|limited|ltd|llp|inc)\b")
 # above this many invoices are made in the background
 BACKGROUND_FROM = 50
+# how often, in rows, a background posting tells the form how far it is
+PROGRESS_EVERY = 10
 
 
 def get_table(party_type: str) -> str:
@@ -132,14 +139,15 @@ def get_parties(party_type: str) -> frappe._dict:
 
 
 def get_exact_key(name: str) -> str:
-	return " ".join(cstr(name).casefold().split())
+	return " ".join(cstr(name).casefold().rstrip(" .").split())
 
 
 def get_similar_key(name: str) -> str:
-	"""A name without case, accents, punctuation or words like Pvt Ltd."""
-	text = ACCENTS.sub("", unicodedata.normalize("NFKD", cstr(name)))
-	text = re.sub(r"[\W_]+", " ", text.casefold())
-	return " ".join(LEGAL_WORDS.sub(" ", text).split())
+	"""A name without case, accents, punctuation, words like Pvt Ltd or a leading M/s, with "&" read
+	as "and" and initials joined, so "M/s I.C.I.C.I. Bank" is "icici bank"."""
+	text = ACCENTS.sub("", unicodedata.normalize("NFKD", cstr(name))).casefold().replace("&", " and ")
+	key = " ".join(LEGAL_WORDS.sub(" ", re.sub(r"[\W_]+", " ", text)).split())
+	return INITIALS.sub(r"\1", LEADING_MS.sub("", key))
 
 
 def find_party(parties: frappe._dict, name: str) -> str | None:
@@ -152,18 +160,61 @@ def find_party(parties: frappe._dict, name: str) -> str | None:
 	return None
 
 
+def get_posted_names(onboarding, party_type: str) -> dict[str, str]:
+	"""The customer or supplier each name on an earlier sheet went to, by its name key, so the next
+	office's sheet links the same spelling without asking again."""
+	return {
+		get_similar_key(row.party_name): row.party
+		for row in onboarding.get(get_table(party_type))
+		if row.status == "Created" and row.party and row.party_name
+	}
+
+
+def match_party(parties: frappe._dict, posted: dict[str, str], name: str) -> str | None:
+	"""find_party, else the customer or supplier an earlier sheet's same spelling went to."""
+	party = find_party(parties, name)
+	if not party:
+		party = posted.get(get_similar_key(name))
+	return party if party in parties.names else None
+
+
 def get_suggestions(parties: frappe._dict, names: list[str]) -> dict[str, str]:
-	"""For names that are not a customer or supplier yet, the ID of one that looks almost the same,
-	like a typo of it."""
+	"""For names that are not a customer or supplier yet, the ID of one that looks almost the same:
+	a typo of it, or its short form, like "Mahindra Lifespace" for "Mahindra Lifespace Developers Ltd"."""
 	known = [key for key, matches in parties.similar.items() if len(matches) == 1]
 	suggestions = {}
 	for name in set(names):
 		key = get_similar_key(name)
-		if key and not find_party(parties, name):
-			match = get_close_matches(key, known, n=1, cutoff=LOOK_ALIKE)
-			if match:
-				suggestions[name] = next(iter(parties.similar[match[0]]))
+		if not key or find_party(parties, name):
+			continue
+		match = get_close_matches(key, known, n=1, cutoff=LOOK_ALIKE) or get_short_form_of(key, known)
+		if match:
+			suggestions[name] = next(iter(parties.similar[match[0]]))
 	return suggestions
+
+
+def get_short_form_of(key: str, known: list[str]) -> list[str]:
+	"""The known name this one is a short form of: each of its words starts a word of the known name,
+	in order and from the first, like "afcons infra" for "afcons infrastructure". When several fit,
+	the one with the fewest words besides."""
+	words = key.split()
+	if len(words) < 2:
+		return []
+	fits = []
+	for other in known:
+		other_words = other.split()
+		if not other_words[0].startswith(words[0]):
+			continue
+		found = 0
+		for word in other_words:
+			if found < len(words) and word.startswith(words[found]):
+				found += 1
+		if found == len(words):
+			fits.append((len(other_words), other))
+	fits.sort()
+	if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+		return [fits[0][1]]
+	return []
 
 
 def get_look_alikes(names: list[str]) -> list[list[str]]:
@@ -336,18 +387,18 @@ def download_opening_invoices(company: str, party_type: str):
 	frappe.response["type"] = "binary"
 
 
-def create_invoices(company: str, party_type: str, add_missing: bool = False):
+def create_invoices(company: str, party_type: str):
 	"""Post every draft row as an opening invoice, one posting at a time."""
 	# a second posting waits here, then finds the rows posted
 	frappe.db.get_value("Company Setup", company, "name", for_update=True)
-	post_invoices(frappe.get_doc("Company Setup", company), party_type, add_missing)
+	post_invoices(frappe.get_doc("Company Setup", company), party_type)
 
 
-def create_invoices_in_background(company: str, party_type: str, add_missing: bool = False):
+def create_invoices_in_background(company: str, party_type: str):
 	"""create_invoices as a background job, telling the open form when done or why not."""
 	event = {"company": company, "party_type": party_type}
 	try:
-		create_invoices(company, party_type, add_missing)
+		create_invoices(company, party_type)
 	except Exception as e:
 		frappe.db.rollback()
 		# shown by the form, which may be waiting for a background job
@@ -363,26 +414,34 @@ def create_invoices_in_background(company: str, party_type: str, add_missing: bo
 	)
 
 
-def post_invoices(onboarding, party_type: str, add_missing: bool = False):
+def post_invoices(onboarding, party_type: str):
 	"""Each draft row whose customer or supplier exists and is enabled becomes an opening invoice in
-	its own savepoint, so a failed row is undone alone and noted on the row."""
+	its own savepoint, so a failed row is undone alone and noted on the row. The names confirmed as new
+	are added first."""
 	company = onboarding.company
 	day_before = add_days(onboarding.migration_date, -1)
 	ensure_fiscal_year(day_before, company)
 	temporary = get_temporary_account(company, create=True)
 	currency = frappe.get_cached_value("Company", company, "default_currency")
 	parties = get_parties(party_type)
-	not_added = {}
-	if add_missing:
-		not_added = add_parties(onboarding, party_type, parties)
+	not_added = add_parties(onboarding, party_type, parties)
+	if not_added is not None:
 		parties = get_parties(party_type)
+	not_added = not_added or {}
 
 	tool = frappe.new_doc("Opening Invoice Creation Tool")
 	tool.company = company
 	tool.invoice_type = INVOICE_TYPES[party_type]
-	for row in onboarding.get(get_table(party_type)):
-		if row.status == "Created":
-			continue
+	drafts = [row for row in onboarding.get(get_table(party_type)) if row.status != "Created"]
+	for done, row in enumerate(drafts):
+		# the open form shows how far the posting is
+		if not done % PROGRESS_EVERY:
+			frappe.publish_realtime(
+				"company_setup_invoices_progress",
+				{"company": company, "party_type": party_type, "done": done, "total": len(drafts)},
+				doctype="Company Setup",
+				docname=company,
+			)
 		row.party = row.party if row.party in parties.names else find_party(parties, row.party_name)
 		if not row.party:
 			error = (
@@ -397,7 +456,8 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 				{"status": "Failed", "error": _("{0} is disabled. Enable it first.").format(row.party)}
 			)
 			continue
-		party_currency = get_party_currency(party_type, row.party, company)
+		account = row.account or get_party_account(party_type, row.party, company)
+		party_currency = frappe.get_cached_value("Account", account, "account_currency")
 		if party_currency != currency:
 			row.update(
 				{
@@ -413,6 +473,8 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 		savepoint = f"opening_invoice_{row.idx}"
 		frappe.db.savepoint(savepoint)
 		try:
+			if account != get_party_account(party_type, row.party, company):
+				keep_party_account(company, party_type, row.party, account)
 			if flt(row.outstanding_amount) < 0:
 				voucher = post_advance(company, party_type, row.party, row, posting_date, temporary)
 				row.update({"status": "Created", "invoice": voucher, "error": None})
@@ -433,6 +495,7 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 				],
 			)
 			invoice = tool.get_invoices()[0]
+			invoice[PARTY_ACCOUNT_FIELDS[party_type]] = account
 			# the amounts are in the company's currency, whatever the party usually uses
 			invoice.currency = currency
 			if party_type == "Supplier":
@@ -459,14 +522,44 @@ def post_invoices(onboarding, party_type: str, add_missing: bool = False):
 	onboarding.save()
 
 
+def get_invoice_accounts(company: str, party_type: str) -> list[str]:
+	"""The accounts a customer's or supplier's opening invoices can go to, in the company's currency.
+	An employee advance is a payable account too, but an asset, so it isn't one of them."""
+	account_type, root_type = INVOICE_ACCOUNT_TYPES[party_type]
+	return frappe.get_all(
+		"Account",
+		filters={
+			"company": company,
+			"account_type": account_type,
+			"root_type": root_type,
+			"is_group": 0,
+			"disabled": 0,
+			"account_currency": frappe.get_cached_value("Company", company, "default_currency"),
+		},
+		pluck="name",
+		order_by="lft",
+	)
+
+
+def keep_party_account(company: str, party_type: str, party: str, account: str):
+	"""Save the account picked in the table on the customer or supplier, so later invoices go there."""
+	doc = frappe.get_doc(party_type, party)
+	row = next((row for row in doc.accounts if row.company == company), None) or doc.append(
+		"accounts", {"company": company}
+	)
+	row.account = account
+	doc.save()
+
+
 def get_party_currency(party_type: str, party: str, company: str) -> str:
 	"""The currency of the receivable or payable account a customer's or supplier's invoices go to."""
 	account = get_party_account(party_type, party, company)
 	return frappe.get_cached_value("Account", account, "account_currency")
 
 
-def get_new_names(onboarding, party_type: str, parties: frappe._dict) -> list[str]:
-	"""The names on the draft rows that are no customer or supplier yet."""
+def get_new_names(onboarding, party_type: str, parties: frappe._dict, confirmed: bool = False) -> list[str]:
+	"""The names on the draft rows that are no customer or supplier yet; with confirmed, only those the
+	user confirmed as new."""
 	return sorted(
 		{
 			row.party_name
@@ -475,6 +568,7 @@ def get_new_names(onboarding, party_type: str, parties: frappe._dict) -> list[st
 			and row.party_name
 			and row.party not in parties.names
 			and not find_party(parties, row.party_name)
+			and (row.create_party or not confirmed)
 		}
 	)
 
@@ -490,11 +584,15 @@ def make_party(party_type: str, name: str):
 	return party
 
 
-def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str, str]:
-	"""Add each customer or supplier the draft rows name that ERPNext doesn't have, each with a normal
-	save so mandatory fields apply. Returns why each one that could not be added was not."""
+def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str, str] | None:
+	"""Add each customer or supplier confirmed as new that ERPNext doesn't have, each with a normal
+	save so mandatory fields apply. Returns why each one that could not be added was not, or None when
+	none was confirmed."""
+	names = get_new_names(onboarding, party_type, parties, confirmed=True)
+	if not names:
+		return None
 	not_added = {}
-	for name in get_new_names(onboarding, party_type, parties):
+	for name in names:
 		frappe.db.savepoint("opening_party")
 		shown_before = len(frappe.local.message_log)
 		try:
@@ -554,7 +652,7 @@ def post_advance(company: str, party_type: str, party: str, row, posting_date, t
 	je.append(
 		"accounts",
 		{
-			"account": get_party_account(party_type, party, company),
+			"account": row.account or get_party_account(party_type, party, company),
 			"party_type": party_type,
 			"party": party,
 			"is_advance": "Yes",

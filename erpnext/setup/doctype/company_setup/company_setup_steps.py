@@ -117,11 +117,27 @@ def chart_of_accounts(onboarding) -> dict:
 	else:
 		description = _("Keep the chart made during setup, or import your own.")
 	done = bool(onboarding.chart_of_accounts_source)
+	summary = None
+	if done:
+		count = frappe.db.count("Account", {"company": onboarding.company})
+		# posting adds Temporary Opening to an imported chart: counted apart, so the number stays the sheet's
+		added = onboarding.chart_of_accounts_source == "Imported" and frappe.db.count(
+			"Account",
+			{
+				"company": onboarding.company,
+				"account_type": "Temporary",
+				"account_name": _("Temporary Opening"),
+			},
+		)
+		summary = (
+			_("{0} accounts · plus Temporary Opening").format(number(count - added))
+			if added
+			else _("{0} accounts").format(number(count))
+		)
 	return {
 		"title": _("Chart of Accounts"),
 		"description": description,
-		"summary": done
-		and _("{0} accounts").format(frappe.db.count("Account", {"company": onboarding.company})),
+		"summary": summary,
 		"done": done,
 		"tab": "accounts_tab",
 	}
@@ -133,11 +149,21 @@ def opening_balances(onboarding) -> dict:
 	if onboarding.no_opening_data and not rows:
 		summary = _("Nothing to bring")
 	elif posted:
-		summary = _("1 account posted") if len(rows) == 1 else _("{0} accounts posted").format(len(rows))
-	elif len(rows) == 1:
-		summary = _("1 account entered, not posted yet")
+		summary = (
+			_("1 account posted") if len(rows) == 1 else _("{0} accounts posted").format(number(len(rows)))
+		)
+	elif rows:
+		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
+		difference = flt(sum(flt(row.debit) - flt(row.credit) for row in rows), 2)
+		summary = (
+			_("{0} ready to post · difference {1}").format(
+				number(len(rows)), fmt_money(abs(difference), currency=currency)
+			)
+			if difference
+			else _("{0} ready to post · balanced").format(number(len(rows)))
+		)
 	else:
-		summary = rows and _("{0} accounts entered, not posted yet").format(len(rows))
+		summary = None
 	return {
 		"title": _("Opening balances"),
 		"description": _("Bank, cash, loans, capital, tax and other balances from your old books."),
@@ -165,7 +191,7 @@ def opening_sales_invoices(onboarding) -> dict:
 		"Sales Invoice",
 		_("Opening sales invoices"),
 		_("Customer invoices still unpaid on the day before migration."),
-		_("{0} unpaid invoices · {1} receivable"),
+		_("All {0} posted · {1}"),
 		"selling_tab",
 	)
 
@@ -187,7 +213,7 @@ def opening_purchase_invoices(onboarding) -> dict:
 		"Purchase Invoice",
 		_("Opening purchase invoices"),
 		_("Supplier bills still unpaid on the day before migration."),
-		_("{0} unpaid bills · {1} payable"),
+		_("All {0} posted · {1}"),
 		"buying_tab",
 	)
 
@@ -202,21 +228,34 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 	drafts = [row for row in onboarding.get(table) if row.status != "Created"]
 	failed = sum(1 for row in drafts if row.status == "Failed")
 	currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
-	if failed:
+	# counted like the Overview cards: invoices without the advances, the amount net of them
+	posted = [row for row in onboarding.get(table) if row.status == "Created"]
+	posted_count = number(sum(1 for row in posted if flt(row.outstanding_amount) > 0))
+	if drafts and totals.count:
 		text = (
-			_("1 could not be posted. Open the table to see why.")
-			if failed == 1
-			else _("{0} could not be posted. Open the table to see why.").format(failed)
+			_("{0} posted · {1} left to post: {2} failed, fix them and post again").format(
+				posted_count, number(len(drafts)), failed
+			)
+			if failed
+			else _("{0} posted · {1} left to post").format(posted_count, number(len(drafts)))
+		)
+	elif failed:
+		text = _("{0} ready to post · {1} failed, fix them and post again").format(
+			number(len(drafts)), failed
 		)
 	elif totals.count:
-		text = summary.format(totals.count, fmt_money(totals.outstanding, currency=currency))
-	elif drafts:
-		invoices = sum(1 for row in drafts if flt(row.outstanding_amount) > 0)
-		text = (
-			_("{0} invoices entered, not posted yet").format(invoices)
-			if invoices
-			else _("{0} advances entered, not posted yet").format(len(drafts))
+		text = summary.format(
+			posted_count,
+			fmt_money(sum(flt(row.outstanding_amount) for row in posted), currency=currency),
 		)
+	elif drafts:
+		to_review = len({row.party_name for row in drafts if not row.party and not row.create_party})
+		amount = fmt_money(sum(flt(row.outstanding_amount) for row in drafts), currency=currency)
+		text = _("{0} ready to post · {1}").format(number(len(drafts)), amount)
+		if to_review:
+			text += " · " + (
+				_("1 name to review") if to_review == 1 else _("{0} names to review").format(to_review)
+			)
 	elif onboarding.no_opening_data:
 		text = _("Nothing to bring")
 	else:
@@ -234,11 +273,16 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 def check_books(onboarding) -> dict:
 	temporary = get_temporary_opening_balance(onboarding.company)
 	posted = all_opening_balances_posted(onboarding) or has_opening_invoices(onboarding.company)
-	if onboarding.no_opening_data and not posted:
+	waiting = get_waiting(onboarding)
+	if waiting:
+		summary = _("{0} still to post").format(frappe.utils.comma_and(waiting, add_quotes=False))
+	elif onboarding.no_opening_data and not posted:
 		summary = _("Nothing to bring")
 	elif posted and temporary:
 		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
 		summary = _("{0} left in Temporary Opening").format(fmt_money(abs(temporary), currency=currency))
+	elif posted:
+		summary = _("Your books add up")
 	else:
 		summary = None
 	return {
@@ -247,8 +291,8 @@ def check_books(onboarding) -> dict:
 			"Compare with your old books. Done when everything is posted and Temporary Opening is zero."
 		),
 		"summary": summary,
-		"done": (bool(onboarding.no_opening_data) and not posted)
-		or (posted and not temporary and not has_drafts(onboarding)),
+		"done": not waiting
+		and ((bool(onboarding.no_opening_data) and not posted) or (posted and not temporary)),
 		"tab": "accounts_tab",
 	}
 
@@ -271,13 +315,19 @@ def go_live(onboarding) -> dict:
 	}
 
 
-def has_drafts(onboarding) -> bool:
-	"""Balances or invoices entered but not posted yet."""
-	return any(
-		row.status not in ("Posted", "Created")
-		for table in ("opening_balances", "opening_sales_invoices", "opening_purchase_invoices")
-		for row in onboarding.get(table)
-	)
+def get_waiting(onboarding) -> list[str]:
+	"""What is entered but not posted yet, as "141 balances", "625 invoices" and "40 bills"."""
+	labels = {
+		"opening_balances": (_("1 balance"), _("{0} balances")),
+		"opening_sales_invoices": (_("1 invoice"), _("{0} invoices")),
+		"opening_purchase_invoices": (_("1 bill"), _("{0} bills")),
+	}
+	waiting = []
+	for table, (one, many) in labels.items():
+		count = sum(1 for row in onboarding.get(table) if row.status not in ("Posted", "Created"))
+		if count:
+			waiting.append(one if count == 1 else many.format(number(count)))
+	return waiting
 
 
 def has_opening_invoices(company: str) -> bool:
@@ -307,3 +357,8 @@ def get_temporary_opening_balance(company: str) -> float:
 		.where(gle.account.isin(accounts) & (gle.is_cancelled == 0))
 	).run()[0][0]
 	return flt(balance, frappe.get_precision("GL Entry", "debit"))
+
+
+def number(value: int) -> str:
+	"""A count with the site's thousands separators, like 1,400."""
+	return fmt_money(value, precision=0)

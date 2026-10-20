@@ -18,15 +18,18 @@
   "onboarding_html",
   "steps",
   "accounts_tab",
+  "accounts_section",
   "chart_of_accounts_source",
   "accounts_html",
   "opening_balances_section",
   "opening_balances",
   "selling_tab",
+  "selling_section",
   "selling_html",
   "opening_sales_invoices_section",
   "opening_sales_invoices",
   "buying_tab",
+  "buying_section",
   "buying_html",
   "opening_purchase_invoices_section",
   "opening_purchase_invoices"
@@ -169,11 +172,27 @@
    "fieldtype": "Table",
    "label": "Opening Purchase Invoices",
    "options": "Company Setup Opening Invoice"
+  },
+  {
+   "fieldname": "selling_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "buying_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "accounts_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
   }
  ],
  "grid_page_length": 50,
+ "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-13 16:22:41.861842",
+ "modified": "2026-10-19 22:07:17.379566",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",

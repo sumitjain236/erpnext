@@ -14,6 +14,8 @@ class CompanySetupOpeningInvoice(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
+		account: DF.Link | None
+		create_party: DF.Check
 		due_date: DF.Date | None
 		error: DF.SmallText | None
 		invoice: DF.Data | None
