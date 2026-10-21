@@ -26,8 +26,10 @@ class CompanySetupOpeningInvoice(Document):
 		parentfield: DF.Data
 		parenttype: DF.Data
 		party: DF.DynamicLink | None
+		party_group: DF.Data | None
 		party_name: DF.Data
 		party_type: DF.Literal["Customer", "Supplier"]
+		source: DF.Data | None
 		status: DF.Literal["Draft", "Created", "Failed"]
 	# end: auto-generated types
 

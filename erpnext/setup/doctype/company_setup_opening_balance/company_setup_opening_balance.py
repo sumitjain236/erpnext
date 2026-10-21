@@ -24,6 +24,7 @@ class CompanySetupOpeningBalance(Document):
 		parentfield: DF.Data
 		parenttype: DF.Data
 		root_type: DF.Data | None
+		source: DF.Data | None
 		status: DF.Literal["Draft", "Posted"]
 	# end: auto-generated types
 

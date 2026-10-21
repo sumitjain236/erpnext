@@ -13,26 +13,34 @@
   "column_break_header",
   "status",
   "migration_date",
-  "no_opening_data",
+  "accounts_source",
   "steps_section",
+  "receivables_source",
   "onboarding_html",
+  "payables_source",
   "steps",
   "accounts_tab",
   "accounts_section",
+  "sheet_receivables",
   "chart_of_accounts_source",
+  "sheet_payables",
   "accounts_html",
+  "sheet_stock",
   "opening_balances_section",
+  "sheet_accounts",
   "opening_balances",
   "selling_tab",
   "selling_section",
   "selling_html",
   "opening_sales_invoices_section",
   "opening_sales_invoices",
+  "undone_sales_invoices",
   "buying_tab",
   "buying_section",
   "buying_html",
   "opening_purchase_invoices_section",
-  "opening_purchase_invoices"
+  "opening_purchase_invoices",
+  "undone_purchase_invoices"
  ],
  "fields": [
   {
@@ -74,6 +82,7 @@
    "options": "Company Setup Step"
   },
   {
+   "depends_on": "eval:!doc.__islocal",
    "fieldname": "accounts_tab",
    "fieldtype": "Tab Break",
    "label": "Accounts"
@@ -92,6 +101,7 @@
    "options": "Company Setup Opening Balance"
   },
   {
+   "depends_on": "eval:!doc.__islocal",
    "fieldname": "onboarding_html",
    "fieldtype": "HTML",
    "label": "Onboarding"
@@ -117,19 +127,12 @@
    "label": "Migration Date"
   },
   {
-   "default": "0",
-   "description": "A new business with no old books, so there are no opening balances or invoices.",
-   "fieldname": "no_opening_data",
-   "fieldtype": "Check",
-   "hidden": 1,
-   "label": "Nothing to Bring"
-  },
-  {
    "fieldname": "accounts_html",
    "fieldtype": "HTML",
    "label": "Accounts"
   },
   {
+   "depends_on": "eval:!doc.__islocal",
    "fieldname": "selling_tab",
    "fieldtype": "Tab Break",
    "label": "Selling"
@@ -140,6 +143,7 @@
    "label": "Selling"
   },
   {
+   "depends_on": "eval:!doc.__islocal",
    "fieldname": "buying_tab",
    "fieldtype": "Tab Break",
    "label": "Buying"
@@ -187,12 +191,82 @@
    "fieldname": "accounts_section",
    "fieldtype": "Section Break",
    "hide_border": 1
+  },
+  {
+   "description": "The software the chart and trial balance come from.",
+   "fieldname": "accounts_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Accounts From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the unpaid customer invoices come from.",
+   "fieldname": "receivables_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Receivables From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the unpaid supplier bills come from.",
+   "fieldname": "payables_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Payables From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+  },
+  {
+   "description": "What customers owe as per the uploaded trial balance.",
+   "fieldname": "sheet_receivables",
+   "fieldtype": "Currency",
+   "hidden": 1,
+   "label": "Receivables in Sheet",
+   "read_only": 1
+  },
+  {
+   "description": "What is owed to suppliers as per the uploaded trial balance.",
+   "fieldname": "sheet_payables",
+   "fieldtype": "Currency",
+   "hidden": 1,
+   "label": "Payables in Sheet",
+   "read_only": 1
+  },
+  {
+   "description": "Stock value as per the uploaded trial balance.",
+   "fieldname": "sheet_stock",
+   "fieldtype": "Currency",
+   "hidden": 1,
+   "label": "Stock in Sheet",
+   "read_only": 1
+  },
+  {
+   "description": "The trial balance's customer and supplier amounts by account, to match the invoices and bills against.",
+   "fieldname": "sheet_accounts",
+   "fieldtype": "JSON",
+   "hidden": 1,
+   "label": "Accounts in Sheet",
+   "read_only": 1
+  },
+  {
+   "fieldname": "undone_sales_invoices",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Sales Invoices",
+   "options": "Company Setup Opening Invoice"
+  },
+  {
+   "fieldname": "undone_purchase_invoices",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Purchase Invoices",
+   "options": "Company Setup Opening Invoice"
   }
  ],
  "grid_page_length": 50,
  "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-19 22:07:17.379566",
+ "modified": "2026-10-21 18:58:19.381173",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",

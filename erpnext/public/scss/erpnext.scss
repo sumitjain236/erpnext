@@ -699,11 +699,6 @@ body[data-route="pos"] {
 	display: none;
 }
 
-// Company Setup: invoice rows aren't picked for anything, so the table has no tick column
-.company-setup-invoices .row-check {
-	display: none;
-}
-
 // Company Setup: a software name beside where its report is
 .company-setup-where {
 	display: grid;

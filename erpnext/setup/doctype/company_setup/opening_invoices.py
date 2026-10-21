@@ -32,6 +32,8 @@ from erpnext.setup.doctype.company_setup.chart_sheet import (
 )
 
 TABLES = {"Customer": "opening_sales_invoices", "Supplier": "opening_purchase_invoices"}
+# the posted rows undone one by one, kept to download and upload again
+UNDONE_TABLES = {"Customer": "undone_sales_invoices", "Supplier": "undone_purchase_invoices"}
 INVOICE_TYPES = {"Customer": "Sales", "Supplier": "Purchase"}
 PARTY_NAME_FIELDS = {"Customer": "customer_name", "Supplier": "supplier_name"}
 PARTY_ACCOUNT_FIELDS = {"Customer": "debit_to", "Supplier": "credit_to"}
@@ -88,6 +90,8 @@ COLUMN_NAMES = {
 	),
 	# which side an amount is on, when a report puts it in a column of its own (Busy)
 	"side": ("dr_cr", "cr_dr"),
+	# the receivable or payable account a bill is on, when the report says (an Excel tracker, Zoho)
+	"ledger": ("ledger", "ledger_name", "account", "account_name", "a_c"),
 }
 # the words that mark a column when none of its usual headings is there, the likeliest first
 COLUMN_WORDS = {
@@ -280,6 +284,7 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 				"invoice_date": get_sheet_date(get_cell(row, sheet.columns["invoice_date"])),
 				"due_date": get_sheet_date(get_cell(row, sheet.columns["due_date"])),
 				"outstanding_amount": amount,
+				"ledger": cstr(get_cell(row, sheet.columns["ledger"])).strip(),
 			}
 		)
 	unused = [
@@ -371,12 +376,34 @@ def get_sheet_date(value) -> str | None:
 
 
 @frappe.whitelist()
-def download_opening_invoices(company: str, party_type: str):
-	"""A sheet to fill with unpaid invoices, with the drafts already entered."""
+def download_opening_invoices(company: str, party_type: str, undone_from: str | None = None):
+	"""A sheet to fill with unpaid invoices, with the drafts already entered. With undone_from, the
+	invoices undone from that source instead, with their account, to fix and upload again."""
 	onboarding = frappe.get_doc("Company Setup", company)
 	onboarding.check_permission("read")
+	table = get_table(party_type)
+	if undone_from is not None:
+		rows = [[*SHEET_COLUMNS, "Ledger"]]
+		for row in onboarding.get(UNDONE_TABLES[party_type]):
+			if (row.source or "") == undone_from:
+				rows.append(
+					[
+						row.party_name or row.party,
+						row.invoice_number,
+						row.invoice_date,
+						row.due_date,
+						row.outstanding_amount,
+						row.account,
+					]
+				)
+		frappe.response[
+			"filename"
+		] = f"{frappe.scrub(company)}_undone_{frappe.scrub(party_type)}_invoices.xlsx"
+		frappe.response["filecontent"] = make_xlsx(rows, _("Opening Invoices")).getvalue()
+		frappe.response["type"] = "binary"
+		return
 	rows = [list(SHEET_COLUMNS)]
-	for row in onboarding.get(get_table(party_type)):
+	for row in onboarding.get(table):
 		if row.status != "Created":
 			rows.append(
 				[row.party_name, row.invoice_number, row.invoice_date, row.due_date, row.outstanding_amount]
@@ -387,18 +414,18 @@ def download_opening_invoices(company: str, party_type: str):
 	frappe.response["type"] = "binary"
 
 
-def create_invoices(company: str, party_type: str):
+def create_invoices(company: str, party_type: str, keep_old_dates: bool = False):
 	"""Post every draft row as an opening invoice, one posting at a time."""
 	# a second posting waits here, then finds the rows posted
 	frappe.db.get_value("Company Setup", company, "name", for_update=True)
-	post_invoices(frappe.get_doc("Company Setup", company), party_type)
+	post_invoices(frappe.get_doc("Company Setup", company), party_type, keep_old_dates)
 
 
-def create_invoices_in_background(company: str, party_type: str):
+def create_invoices_in_background(company: str, party_type: str, keep_old_dates: bool = False):
 	"""create_invoices as a background job, telling the open form when done or why not."""
 	event = {"company": company, "party_type": party_type}
 	try:
-		create_invoices(company, party_type)
+		create_invoices(company, party_type, keep_old_dates)
 	except Exception as e:
 		frappe.db.rollback()
 		# shown by the form, which may be waiting for a background job
@@ -414,13 +441,24 @@ def create_invoices_in_background(company: str, party_type: str):
 	)
 
 
-def post_invoices(onboarding, party_type: str):
+def post_invoices(onboarding, party_type: str, keep_old_dates: bool = False):
 	"""Each draft row whose customer or supplier exists and is enabled becomes an opening invoice in
 	its own savepoint, so a failed row is undone alone and noted on the row. The names confirmed as new
 	are added first."""
 	company = onboarding.company
 	day_before = add_days(onboarding.migration_date, -1)
 	ensure_fiscal_year(day_before, company)
+	if keep_old_dates:
+		# the years the old invoices fall in, added once and outside the rows' savepoints, so each one
+		# is posted on its own date with its own due date
+		for row in onboarding.get(get_table(party_type)):
+			if (
+				row.status != "Created"
+				and row.invoice_date
+				and getdate(row.invoice_date) <= getdate(day_before)
+				and not has_fiscal_year(row.invoice_date, company)
+			):
+				ensure_fiscal_year(row.invoice_date, company)
 	temporary = get_temporary_account(company, create=True)
 	currency = frappe.get_cached_value("Company", company, "default_currency")
 	parties = get_parties(party_type)
@@ -505,6 +543,9 @@ def post_invoices(onboarding, party_type: str):
 			doc.flags.ignore_mandatory = True
 			doc.flags.dont_auto_add_taxes = True
 			number = invoice.get("invoice_number")
+			if number and frappe.db.get_value(doc.doctype, number, "company") not in (None, company):
+				# another company's invoice on this site has the number: told apart by this one's abbreviation
+				number = f"{number}-{frappe.get_cached_value('Company', company, 'abbr')}"
 			if number and frappe.db.get_value(doc.doctype, number, "docstatus") == 2:
 				# posted again after a cancel: ERPNext's amended name, like "INV-1-1"
 				doc.amended_from = number
@@ -518,8 +559,304 @@ def post_invoices(onboarding, party_type: str):
 			frappe.clear_messages()
 			row.update({"status": "Failed", "error": strip_html(cstr(e)) or e.__class__.__name__})
 
+	# an undone invoice posted again leaves the undone ones
+	posted = {
+		(row.party, row.invoice_number or "")
+		for row in onboarding.get(get_table(party_type))
+		if row.status == "Created"
+	}
+	onboarding.set(
+		UNDONE_TABLES[party_type],
+		[
+			row
+			for row in onboarding.get(UNDONE_TABLES[party_type])
+			if (row.party, row.invoice_number or "") not in posted
+		],
+	)
 	onboarding.flags.posting = True
 	onboarding.save()
+
+
+def get_sheet_match(onboarding, party_type: str) -> dict | None:
+	"""What the trial balance says customers owe or suppliers are owed, by account when it says so,
+	set against the invoices or bills entered so far, posted or not. None without a trial balance."""
+	account_type = "Receivable" if party_type == "Customer" else "Payable"
+	sheet = (frappe.parse_json(onboarding.sheet_accounts or "{}") or {}).get(account_type)
+	if not sheet:
+		return None
+	# the sheet keeps the ledger's side: a supplier's balance is a credit
+	sign = 1 if party_type == "Customer" else -1
+	default = frappe.get_cached_value(
+		"Company",
+		onboarding.company,
+		"default_receivable_account" if party_type == "Customer" else "default_payable_account",
+	)
+	rows = onboarding.get(get_table(party_type))
+	posted_accounts = get_posted_accounts(party_type, rows)
+	party_accounts = get_party_accounts(party_type, [row.party for row in rows], onboarding.company)[0]
+	entered = {}
+	for row in rows:
+		account = posted_accounts.get(row.invoice) or row.account or party_accounts.get(row.party) or default
+		line = entered.setdefault(account, {"amount": 0, "count": 0, "draft": 0})
+		line["amount"] += flt(row.outstanding_amount)
+		line["count"] += 1
+		if row.status != "Created":
+			line["draft"] += flt(row.outstanding_amount)
+	# a line no account stands for, like customers listed by name, can only be matched in total
+	by_account = "" not in sheet
+	accounts = sorted(set(sheet) | set(entered)) if by_account else [None]
+	return {
+		"by_account": by_account,
+		"sheet": sign * sum(flt(amount) for amount in sheet.values()),
+		"entered": sum(line["amount"] for line in entered.values()),
+		"lines": [
+			{
+				"account": account,
+				"sheet": sign * flt(sheet[account]) if account in sheet else None,
+				"entered": entered.get(account, {}).get("amount", 0),
+				"count": entered.get(account, {}).get("count", 0),
+				"draft": entered.get(account, {}).get("draft", 0),
+			}
+			for account in accounts
+		]
+		if by_account
+		else [],
+	}
+
+
+def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, dict]:
+	"""get_party_account for many parties in a few queries: the account each one's invoices go to,
+	and the account saved on the party itself (not its group's or the company's default)."""
+	parties = list(set(filter(None, parties)))
+	if not parties:
+		return {}, {}
+	group_field = "customer_group" if party_type == "Customer" else "supplier_group"
+	saved = dict(
+		frappe.get_all(
+			"Party Account",
+			filters={"parenttype": party_type, "parent": ("in", parties), "company": company},
+			fields=["parent", "account"],
+			as_list=True,
+		)
+	)
+	groups = dict(
+		frappe.get_all(
+			party_type, filters={"name": ("in", parties)}, fields=["name", group_field], as_list=True
+		)
+	)
+	group_accounts = dict(
+		frappe.get_all(
+			"Party Account",
+			filters={
+				"parenttype": f"{party_type} Group",
+				"parent": ("in", list(set(filter(None, groups.values()))) or [""]),
+				"company": company,
+			},
+			fields=["parent", "account"],
+			as_list=True,
+		)
+	)
+	default = frappe.get_cached_value(
+		"Company",
+		company,
+		"default_receivable_account" if party_type == "Customer" else "default_payable_account",
+	)
+	return {
+		party: saved.get(party) or group_accounts.get(groups.get(party)) or default for party in parties
+	}, saved
+
+
+def get_posted_accounts(party_type: str, rows) -> dict[str, str]:
+	"""The receivable or payable account each posted row's invoice or advance is on, by its name."""
+	posted = [row for row in rows if row.status == "Created" and row.invoice]
+	invoices = [row.invoice for row in posted if flt(row.outstanding_amount) >= 0]
+	advances = [row.invoice for row in posted if flt(row.outstanding_amount) < 0]
+	accounts = {}
+	if invoices:
+		accounts |= dict(
+			frappe.get_all(
+				"Sales Invoice" if party_type == "Customer" else "Purchase Invoice",
+				filters={"name": ("in", invoices)},
+				fields=["name", PARTY_ACCOUNT_FIELDS[party_type]],
+				as_list=True,
+			)
+		)
+	if advances:
+		accounts |= dict(
+			frappe.get_all(
+				"Journal Entry Account",
+				filters={"parent": ("in", advances), "party_type": party_type},
+				fields=["parent", "account"],
+				as_list=True,
+			)
+		)
+	return accounts
+
+
+def get_account_clashes(onboarding, party_type: str) -> list[dict]:
+	"""Customers or suppliers whose invoices about to be posted and whose earlier ones, or the account
+	saved on them, are on different accounts, where something the user said picks one (a sheet's or a
+	typed account, or the saved account) and the trial balance is short on that one and over on the
+	other. "posted" when the earlier invoices are the odd ones, "draft" when these are."""
+	match = get_sheet_match(onboarding, party_type)
+	if not match or not match["by_account"]:
+		return []
+	gap = {line["account"]: flt(line["sheet"]) - flt(line["entered"]) for line in match["lines"]}
+	in_sheet = {line["account"] for line in match["lines"] if line["sheet"] is not None}
+
+	def is_short(account):
+		return gap.get(account, 0) > 0.005
+
+	def is_over(account):
+		return gap.get(account, 0) < -0.005 or account not in in_sheet
+
+	rows = onboarding.get(get_table(party_type))
+	posted_accounts = get_posted_accounts(party_type, rows)
+	party_accounts, saved_accounts = get_party_accounts(
+		party_type, [row.party for row in rows], onboarding.company
+	)
+	by_party = {}
+	for row in rows:
+		if row.party:
+			by_party.setdefault(row.party, []).append(row)
+	clashes = {}
+	for party, party_rows in by_party.items():
+		drafts = [row for row in party_rows if row.status != "Created"]
+		if not drafts:
+			continue
+		saved = saved_accounts.get(party)
+		posted = {}
+		for row in party_rows:
+			if row.status == "Created" and posted_accounts.get(row.invoice):
+				posted.setdefault(posted_accounts[row.invoice], []).append(row)
+		going = {}
+		for row in drafts:
+			going.setdefault(row.account or party_accounts[party], []).append(row)
+		for account, these in going.items():
+			said = any(row.account for row in these)
+			for other in (set(posted) | {saved}) - {account, None}:
+				if not (said or other == saved or any(row.account for row in posted.get(other, []))):
+					continue
+				if is_short(account) and is_over(other) and posted.get(other):
+					kind, target, moving = "posted", account, posted[other]
+				elif is_short(other) and is_over(account):
+					kind, target, moving = "draft", other, these
+				else:
+					continue
+				clash = clashes.setdefault(
+					(kind, target, other if kind == "posted" else account),
+					{
+						"kind": kind,
+						"account": target,
+						"from_account": other if kind == "posted" else account,
+						"short": gap[target],
+						"said": False,
+						"saved": False,
+						"earlier": False,
+						"parties": [],
+					},
+				)
+				# for the wording: whether this sheet says its account, the saved account is the one
+				# to use, and earlier invoices are on the other account
+				clash["said"] = clash["said"] or said
+				clash["saved"] = clash["saved"] or saved == target
+				clash["earlier"] = clash["earlier"] or bool(posted.get(other))
+				clash["parties"].append(
+					{
+						"party": party,
+						"sources": sorted({row.source or "" for row in moving}),
+						"count": len(moving),
+						"amount": sum(flt(row.outstanding_amount) for row in moving),
+					}
+				)
+	for clash in clashes.values():
+		for key in ("account", "from_account"):
+			clash[f"{key}_name"] = frappe.get_cached_value("Account", clash[key], "account_name")
+	return list(clashes.values())
+
+
+def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
+	"""Do what the user ticked on the clashes found now, and nothing else: put these drafts on the
+	other account, or cancel the earlier invoices and add them back as drafts on this sheet's account."""
+	from erpnext.setup.doctype.company_setup.posted_entries import check_undo, undo_invoices
+
+	wanted = {(fix.get("kind"), fix.get("account"), fix.get("from_account")) for fix in fixes}
+	rows = onboarding.get(get_table(party_type))
+	posted_accounts = get_posted_accounts(party_type, rows)
+	party_accounts = get_party_accounts(party_type, [row.party for row in rows], onboarding.company)[0]
+	for clash in get_account_clashes(onboarding, party_type):
+		if (clash["kind"], clash["account"], clash["from_account"]) not in wanted:
+			continue
+		parties = {party["party"] for party in clash["parties"]}
+		if clash["kind"] == "draft":
+			for row in rows:
+				if (
+					row.party in parties
+					and row.status != "Created"
+					and (row.account or party_accounts[row.party]) == clash["from_account"]
+				):
+					row.account = clash["account"]
+			continue
+		check_undo(onboarding)
+		by_source = {}
+		for row in rows:
+			if (
+				row.party in parties
+				and row.status == "Created"
+				and posted_accounts.get(row.invoice) == clash["from_account"]
+			):
+				by_source.setdefault(row.source or "", []).append(row.invoice)
+		for source, invoices in by_source.items():
+			undo_invoices(onboarding, party_type, source, invoices)
+			for undone in onboarding.get(UNDONE_TABLES[party_type]):
+				if undone.invoice in invoices:
+					onboarding.append(
+						get_table(party_type),
+						{
+							field: undone.get(field)
+							for field in (
+								"party_type",
+								"party",
+								"party_name",
+								"invoice_number",
+								"invoice_date",
+								"due_date",
+								"outstanding_amount",
+								"source",
+							)
+						}
+						| {"account": clash["account"], "status": "Draft"},
+					)
+			rows = onboarding.get(get_table(party_type))
+	onboarding.flags.posting = True
+	onboarding.save()
+
+
+def set_ledger_accounts(company: str, party_type: str, invoices: list[dict]) -> list[str]:
+	"""Put each invoice on the account its sheet's ledger column names, when that is one of the
+	company's receivable or payable accounts, by name with or without the company's abbreviation.
+	Returns the ledger names that are not."""
+	accounts = get_invoice_accounts(company, party_type)
+	by_name = {account.lower(): account for account in accounts}
+	by_name |= {
+		name.lower(): account
+		for account, name in frappe.get_all(
+			"Account",
+			filters={"name": ("in", accounts or [""])},
+			fields=["name", "account_name"],
+			as_list=True,
+		)
+	}
+	unknown = set()
+	for invoice in invoices:
+		ledger = invoice.pop("ledger", None)
+		if not ledger:
+			continue
+		if ledger.lower() in by_name:
+			invoice["account"] = by_name[ledger.lower()]
+		else:
+			unknown.add(ledger)
+	return sorted(unknown)
 
 
 def get_invoice_accounts(company: str, party_type: str) -> list[str]:
@@ -573,15 +910,33 @@ def get_new_names(onboarding, party_type: str, parties: frappe._dict, confirmed:
 	)
 
 
-def make_party(party_type: str, name: str):
-	"""A new, unsaved customer or supplier with this name and the defaults a new one gets."""
+def make_party(party_type: str, name: str, company: str | None = None, group: str | None = None):
+	"""A new, unsaved customer or supplier with this name and the defaults a new one gets. Where the
+	settings have none, as after a setup wizard that skipped them, the company's country as the
+	territory, and the only group there is; else none, as a group can't be picked."""
 	party = frappe.new_doc(party_type)
 	party.set(PARTY_NAME_FIELDS[party_type], name)
+	# the group picked when the name was confirmed as new
+	party.set(PARTY_DEFAULTS[party_type][0], group or None)
 	settings = "Selling Settings" if party_type == "Customer" else "Buying Settings"
 	for field in PARTY_DEFAULTS[party_type]:
 		if not party.get(field):
-			party.set(field, frappe.db.get_single_value(settings, field) or None)
+			party.set(field, frappe.db.get_single_value(settings, field) or get_default_node(field, company))
 	return party
+
+
+def get_default_node(field: str, company: str | None) -> str | None:
+	doctype = {
+		"customer_group": "Customer Group",
+		"territory": "Territory",
+		"supplier_group": "Supplier Group",
+	}[field]
+	if field == "territory" and company:
+		country = frappe.get_cached_value("Company", company, "country")
+		if country and frappe.db.get_value("Territory", country, "is_group") == 0:
+			return country
+	leaves = frappe.get_all(doctype, filters={"is_group": 0}, pluck="name", limit=2)
+	return leaves[0] if len(leaves) == 1 else None
 
 
 def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str, str] | None:
@@ -589,6 +944,11 @@ def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str,
 	save so mandatory fields apply. Returns why each one that could not be added was not, or None when
 	none was confirmed."""
 	names = get_new_names(onboarding, party_type, parties, confirmed=True)
+	groups = {
+		row.party_name: row.party_group
+		for row in onboarding.get(get_table(party_type))
+		if row.create_party and row.party_group
+	}
 	if not names:
 		return None
 	not_added = {}
@@ -596,7 +956,7 @@ def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str,
 		frappe.db.savepoint("opening_party")
 		shown_before = len(frappe.local.message_log)
 		try:
-			make_party(party_type, name).insert()
+			make_party(party_type, name, onboarding.company, groups.get(name)).insert()
 		except Exception as e:
 			frappe.db.rollback(save_point="opening_party")
 			# what the save showed, like which mandatory field is empty; the error only names fields
@@ -627,7 +987,7 @@ def download_new_parties(company: str, party_type: str):
 	)
 	rows = exporter.get_csv_array()
 	for name in get_new_names(onboarding, party_type, parties):
-		party = make_party(party_type, name)
+		party = make_party(party_type, name, onboarding.company)
 		rows.append([None if df.is_child_table_field else party.get(df.fieldname) for df in exporter.fields])
 	build_xlsx_response(rows, _("New customers") if party_type == "Customer" else _("New suppliers"))
 
@@ -671,6 +1031,47 @@ def post_advance(company: str, party_type: str, party: str, row, posting_date, t
 	je.insert()
 	je.submit()
 	return je.name
+
+
+def get_posting_dates(onboarding, party_type: str) -> dict:
+	"""The dates the drafts go on, for the posting confirmation: their own invoice dates where ERPNext
+	has the year, else the day before migration (with how many, and the years missing)."""
+	day_before = getdate(add_days(onboarding.migration_date, -1))
+	known, kept, no_year, undated, missing = {}, [], [], 0, set()
+	for row in onboarding.get(get_table(party_type)):
+		if row.status == "Created":
+			continue
+		date = row.invoice_date and getdate(row.invoice_date)
+		if date and date not in known:
+			known[date] = has_fiscal_year(date, onboarding.company)
+		if date and known[date]:
+			kept.append(date)
+			continue
+		if not date:
+			undated += 1
+			continue
+		no_year.append(row)
+		missing.add(get_missing_fiscal_year(date, onboarding.company).year)
+	return {
+		"kept": len(kept),
+		"first": min(kept, default=None),
+		"last": max(kept, default=None),
+		"no_year": len(no_year),
+		"no_year_amount": sum(flt(row.outstanding_amount) for row in no_year),
+		# the oldest few by name; the confirmation counts the rest
+		"no_year_rows": [
+			{
+				"party": row.party or row.party_name,
+				"invoice_number": row.invoice_number,
+				"invoice_date": row.invoice_date,
+				"amount": flt(row.outstanding_amount),
+			}
+			for row in sorted(no_year, key=lambda row: getdate(row.invoice_date))
+		],
+		"undated": undated,
+		"missing_years": sorted(missing),
+		"day_before": day_before,
+	}
 
 
 def has_fiscal_year(date, company: str) -> bool:

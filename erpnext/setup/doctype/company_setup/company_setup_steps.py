@@ -24,6 +24,8 @@ from frappe import _
 from frappe.query_builder.functions import Sum
 from frappe.utils import add_days, flt, fmt_money, formatdate
 
+from erpnext.setup.doctype.company_setup.opening_invoices import get_sheet_match
+
 HOOK_NAME = "company_setup_steps"
 # Go Live always comes last, whatever the hooks say
 LAST_STEP = "erpnext.setup.doctype.company_setup.company_setup_steps.go_live"
@@ -140,15 +142,14 @@ def chart_of_accounts(onboarding) -> dict:
 		"summary": summary,
 		"done": done,
 		"tab": "accounts_tab",
+		"required": True,
 	}
 
 
 def opening_balances(onboarding) -> dict:
 	rows = onboarding.opening_balances
 	posted = all_opening_balances_posted(onboarding)
-	if onboarding.no_opening_data and not rows:
-		summary = _("Nothing to bring")
-	elif posted:
+	if posted:
 		summary = (
 			_("1 account posted") if len(rows) == 1 else _("{0} accounts posted").format(number(len(rows)))
 		)
@@ -168,9 +169,10 @@ def opening_balances(onboarding) -> dict:
 		"title": _("Opening balances"),
 		"description": _("Bank, cash, loans, capital, tax and other balances from your old books."),
 		"summary": summary,
-		"done": posted or (bool(onboarding.no_opening_data) and not rows),
+		"done": posted,
 		"started": bool(rows) and not posted,
 		"tab": "accounts_tab",
+		"required": True,
 	}
 
 
@@ -191,7 +193,7 @@ def opening_sales_invoices(onboarding) -> dict:
 		"Sales Invoice",
 		_("Opening sales invoices"),
 		_("Customer invoices still unpaid on the day before migration."),
-		_("All {0} posted · {1}"),
+		_("All {0} invoices posted · {1}"),
 		"selling_tab",
 	)
 
@@ -213,7 +215,7 @@ def opening_purchase_invoices(onboarding) -> dict:
 		"Purchase Invoice",
 		_("Opening purchase invoices"),
 		_("Supplier bills still unpaid on the day before migration."),
-		_("All {0} posted · {1}"),
+		_("All {0} bills posted · {1}"),
 		"buying_tab",
 	)
 
@@ -244,7 +246,17 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 			number(len(drafts)), failed
 		)
 	elif totals.count:
-		text = summary.format(
+		undone = onboarding.get(
+			"undone_sales_invoices" if doctype == "Sales Invoice" else "undone_purchase_invoices"
+		)
+		is_sales = doctype == "Sales Invoice"
+		if posted_count == "1":
+			text = _("1 invoice posted · {1}") if is_sales else _("1 bill posted · {1}")
+		elif undone:
+			text = _("{0} invoices posted · {1}") if is_sales else _("{0} bills posted · {1}")
+		else:
+			text = summary
+		text = text.format(
 			posted_count,
 			fmt_money(sum(flt(row.outstanding_amount) for row in posted), currency=currency),
 		)
@@ -256,16 +268,21 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 			text += " · " + (
 				_("1 name to review") if to_review == 1 else _("{0} names to review").format(to_review)
 			)
-	elif onboarding.no_opening_data:
-		text = _("Nothing to bring")
 	else:
 		text = None
+	# done once all is posted and adds up to what the trial balance says, when there is one
+	match = get_sheet_match(onboarding, "Customer" if doctype == "Sales Invoice" else "Supplier")
+	matches = not match or all(
+		abs(flt(line["sheet"]) - flt(line["entered"])) < 1
+		for line in match["lines"] or [{"sheet": match["sheet"], "entered": match["entered"]}]
+	)
+	done = bool(totals.count) and not drafts and matches
 	return {
 		"title": title,
 		"description": description,
 		"summary": text,
-		"done": bool(totals.count) or (bool(onboarding.no_opening_data) and not drafts),
-		"started": bool(drafts) and not totals.count,
+		"done": done,
+		"started": bool(drafts or totals.count) and not done,
 		"tab": tab,
 	}
 
@@ -276,8 +293,6 @@ def check_books(onboarding) -> dict:
 	waiting = get_waiting(onboarding)
 	if waiting:
 		summary = _("{0} still to post").format(frappe.utils.comma_and(waiting, add_quotes=False))
-	elif onboarding.no_opening_data and not posted:
-		summary = _("Nothing to bring")
 	elif posted and temporary:
 		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
 		summary = _("{0} left in Temporary Opening").format(fmt_money(abs(temporary), currency=currency))
@@ -291,9 +306,9 @@ def check_books(onboarding) -> dict:
 			"Compare with your old books. Done when everything is posted and Temporary Opening is zero."
 		),
 		"summary": summary,
-		"done": not waiting
-		and ((bool(onboarding.no_opening_data) and not posted) or (posted and not temporary)),
+		"done": not waiting and posted and not temporary,
 		"tab": "accounts_tab",
+		"required": True,
 	}
 
 
