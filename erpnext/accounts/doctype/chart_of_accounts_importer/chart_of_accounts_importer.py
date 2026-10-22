@@ -111,11 +111,13 @@ def replace_chart(data: list, company: str, refill_defaults: bool = False):
 
 	validate_company(company)
 
+	old_accounts = set(frappe.get_all("Account", {"company": company}, pluck="name"))
 	unset_existing_data(company)
 
 	frappe.local.flags.ignore_root_company_validation = True
 	forest = build_forest(data)
 	create_charts(company, custom_chart=forest, from_coa_importer=True)
+	clear_removed_accounts(old_accounts - set(frappe.get_all("Account", {"company": company}, pluck="name")))
 
 	# trigger on_update for company to reset default accounts
 	set_default_accounts(company, refill_defaults)
@@ -499,6 +501,47 @@ def unset_existing_data(company):
 		"Tax Withholding Account",
 	]:
 		frappe.get_query(doctype, delete=True, filters={"company": company}).run()
+
+
+def clear_removed_accounts(accounts: set):
+	"""Empty every link to these accounts. A child row that needs the account is removed."""
+	if not accounts:
+		return
+
+	accounts = list(accounts)
+	links = frappe.get_all(
+		"DocField", {"fieldtype": "Link", "options": "Account"}, ["parent", "fieldname", "reqd"]
+	) + frappe.get_all(
+		"Custom Field", {"fieldtype": "Link", "options": "Account"}, ["dt as parent", "fieldname", "reqd"]
+	)
+	for link in links:
+		meta = frappe.get_meta(link.parent)
+		if link.parent in ("Account", "Company") or meta.is_virtual:
+			continue
+		if meta.issingle:
+			frappe.db.delete(
+				"Singles", {"doctype": link.parent, "field": link.fieldname, "value": ("in", accounts)}
+			)
+			frappe.clear_document_cache(link.parent, link.parent)
+			continue
+
+		table = frappe.qb.DocType(link.parent)
+		field = table[link.fieldname]
+		changed = (
+			frappe.qb.from_(table)
+			.select(table.parenttype if meta.istable else table.name)
+			.where(field.isin(accounts))
+			.distinct()
+			.run(pluck=True)
+		)
+		if not changed:
+			continue
+		if meta.istable and link.reqd:
+			frappe.qb.from_(table).delete().where(field.isin(accounts)).run()
+		else:
+			frappe.qb.update(table).set(field, None).where(field.isin(accounts)).run()
+		for doctype in changed if meta.istable else [link.parent]:
+			frappe.clear_document_cache(doctype)
 
 
 def validate_user_perms(company):
