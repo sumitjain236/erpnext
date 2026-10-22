@@ -1621,11 +1621,18 @@ function make_fiscal_year_note(frm) {
 
 // by name: the form reloads itself after a save, and a call sent mid-reload has no doc to send
 function call_method(frm, method, args, opts = {}) {
-	return frappe.call({
-		method: "run_doc_method",
-		args: { dt: frm.doctype, dn: frm.docname, method: method, args: args },
-		...opts,
-	});
+	const onload = frm.doc.__onload;
+	return frappe
+		.call({
+			method: "run_doc_method",
+			args: { dt: frm.doctype, dn: frm.docname, method: method, args: args },
+			...opts,
+		})
+		.then((r) => {
+			// the doc comes back without __onload and the sync drops it from the form
+			frm.doc.__onload ??= onload;
+			return r;
+		});
 }
 
 // The books on the day before the migration date; with can_post, as they will be after posting
