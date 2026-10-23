@@ -7,6 +7,19 @@ frappe.ui.form.on("Company Setup", {
 			frm.posting = { ...frm.posting, [data.party_type]: { done: data.done, total: data.total } };
 			update_posting(frm, data.party_type);
 		});
+		listen_for_postings(frm);
+		frappe.realtime.off("company_setup_cheques");
+		frappe.realtime.on("company_setup_cheques", (data) => {
+			if (data.company !== frm.doc.company) return;
+			if (data.error) {
+				frappe.msgprint({
+					title: cheque_words(__("Cheques not posted")),
+					message: data.error,
+					indicator: "red",
+				});
+			}
+			reload_fresh(frm).then(() => !data.error && show_cheques_posted(frm));
+		});
 		frappe.realtime.off("company_setup_invoices");
 		frappe.realtime.on("company_setup_invoices", (data) => {
 			if (data.company !== frm.doc.company) return;
@@ -20,7 +33,7 @@ frappe.ui.form.on("Company Setup", {
 					indicator: "red",
 				});
 			}
-			frm.reload_doc().then(() => !data.error && show_posting_result(frm, data.party_type));
+			reload_fresh(frm).then(() => !data.error && show_posting_result(frm, data.party_type));
 		});
 	},
 
@@ -32,7 +45,7 @@ frappe.ui.form.on("Company Setup", {
 			if (data.error) {
 				frappe.msgprint({ title: __("Not undone"), message: data.error, indicator: "red" });
 			}
-			frm.reload_doc().then(
+			reload_fresh(frm).then(
 				() => data.result && show_undo_result(frm, data.party_type, data.result, data.source)
 			);
 		});
@@ -49,6 +62,7 @@ frappe.ui.form.on("Company Setup", {
 			return;
 		}
 
+		says_check = CHECK_COUNTRIES.includes(frm.doc.__onload?.company_details?.country);
 		// every step saves from its own window
 		frm.disable_save();
 		// one setup per company: nothing to page through
@@ -60,6 +74,7 @@ frappe.ui.form.on("Company Setup", {
 			])
 		);
 		frm.events.render(frm);
+		watch_stock_posting(frm);
 		// a step done or undone since the last save, from the company's data, is saved now
 		// once at a time: two reloads close together would save the steps twice over each other
 		if (frm.doc.__onload?.steps_changed && !frm.checking_steps) {
@@ -78,7 +93,7 @@ frappe.ui.form.on("Company Setup", {
 			make_overview_stats(frm),
 			make_checklist(frm, steps)
 		);
-		for (const tab of ["accounts_tab", "selling_tab", "buying_tab"]) {
+		for (const tab of TABS) {
 			const field = tab.replace("_tab", "_html");
 			make_page(frm, field).append(
 				steps.filter((step) => step.tab === tab).map((step) => make_task_card(frm, step))
@@ -105,6 +120,7 @@ function get_steps(frm) {
 		tab: details[row.step_key]?.tab,
 		is_started: details[row.step_key]?.started,
 		is_required: details[row.step_key]?.required,
+		is_needed: details[row.step_key]?.needed ?? true,
 		is_complete: row.status === "Done",
 		is_skipped: row.status === "Skipped",
 	}));
@@ -121,30 +137,72 @@ function make_overview_stats(frm) {
 		(frm.doc.opening_balances || []).some((row) => row.status === "Posted") ||
 		[...sales, ...purchases].some((row) => row.status === "Created");
 	// advances are negative rows: they lower the total but aren't invoices
-	const owed = (rows, label, count_label) => {
-		const total = rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
-		const invoices = rows.filter((row) => flt(row.outstanding_amount) > 0).length;
+	const owed = (rows, label, count_label, party_type) => {
+		// with the opening invoices made by hand, counted in the company's currency
+		const match = frm.doc.__onload?.sheet_match?.[party_type] || {};
+		const outside = match.outside || {};
+		// a draft row an invoice made by hand stands for counts once, as that invoice
+		const hand = match.hand_posted || {};
+		const total =
+			rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0) +
+			flt(outside.amount) -
+			flt(hand.amount);
+		const invoices =
+			rows.filter((row) => flt(row.outstanding_amount) > 0).length +
+			(outside.count || 0) -
+			(hand.count || 0);
 		return frappe.ui.stat_card({
 			label: label,
-			value: rows.length ? format_currency(total, currency) : null,
-			caption: rows.length && count_label(format_number(invoices, null, 0)),
+			value: rows.length || outside.count ? format_currency(total, currency) : null,
+			caption: (rows.length || outside.count) && count_label(format_number(invoices, null, 0)),
 		});
 	};
-	return $(`<div class="es-stat-card-grid"></div>`).append(
+	const waiting = frm.doc.__onload?.temporary_parts || [];
+	const $cards = $(`<div class="es-stat-card-grid"></div>`).append(
 		frappe.ui.stat_card({
 			label: __("Temporary Opening"),
-			value: posted ? format_currency(Math.abs(temporary), currency) : __("Not posted yet"),
+			value: format_currency(posted ? Math.abs(temporary) : 0, currency),
 			caption: !posted
-				? __("Shows what doesn't balance once you post.")
-				: temporary
-				? __("Not explained yet. Goes to zero once everything is in.")
-				: __("Your books add up."),
+				? __("Not posted yet")
+				: !temporary
+				? __("Zero · your books match your trial balance")
+				: waiting.length
+				? get_waiting_text(waiting, currency)
+				: __("Not explained yet. Goes to zero once everything is in."),
 			onclick: frm.doc.migration_date ? () => show_posting_preview(frm, false) : undefined,
 		}),
-		owed(sales, __("Customers owe you"), (count) => count_invoices(count, "Customer")),
-		owed(purchases, __("You owe suppliers"), (count) => count_invoices(count, "Supplier"))
+		owed(sales, __("Customers owe you"), (count) => count_invoices(count, "Customer"), "Customer"),
+		owed(purchases, __("You owe suppliers"), (count) => count_invoices(count, "Supplier"), "Supplier")
 	);
+	if (!posted || !temporary) return $cards;
+	return [
+		$cards,
+		$(`<div class="text-p-sm text-ink-gray-5"></div>`).text(
+			__("Temporary Opening holds the difference until everything is posted. It must reach zero.")
+		),
+	];
 }
+
+// "Waiting for stock ₹ 18,40,000 and sales invoices ₹ 4,12,000"; past two parts, only their names
+function get_waiting_text(parts, currency) {
+	const named =
+		parts.length > 2
+			? parts.map((part) => part.label)
+			: parts.map((part) =>
+					__("{0} {1}", [part.label, format_currency(Math.abs(part.amount), currency, 0)])
+			  );
+	return __("Waiting for {0}", [frappe.utils.comma_and(named)]);
+}
+
+const TABS = [
+	"accounts_tab",
+	"selling_tab",
+	"buying_tab",
+	"stock_tab",
+	"assets_tab",
+	"manufacturing_tab",
+	"subcontracting_tab",
+];
 
 const PARTY = {
 	Customer: {
@@ -165,20 +223,22 @@ const PARTY = {
 
 // Every task with its status, in any order. Each row opens its task; rows are grouped by tab.
 function make_checklist(frm, steps) {
-	const done = steps.filter((step) => step.is_complete).length;
-	const skipped = steps.filter((step) => step.is_skipped).length;
+	// every step counts except the ones skipped by hand
+	const counted = steps.filter((step) => !step.is_skipped);
+	const skipped = steps.length - counted.length;
+	const done = counted.filter((step) => step.is_complete).length;
 	const $card = $(`<div class="contact-box flex flex-col gap-1 mb-0"></div>`);
 	$card.append(
 		frappe.ui.progress({
 			label: __("Set up {0}", [frm.doc.company]),
 			hint: () =>
 				skipped
-					? __("{0} of {1} done, {2} skipped", [done, steps.length, skipped])
-					: __("{0} of {1} done", [done, steps.length]),
+					? __("{0} of {1} done, {2} skipped", [done, counted.length, skipped])
+					: __("{0} of {1} done", [done, counted.length]),
 			intervals: true,
-			interval_count: steps.length,
+			interval_count: counted.length,
 			size: "md",
-			value: steps.length ? (done / steps.length) * 100 : 0,
+			value: counted.length ? (done / counted.length) * 100 : 0,
 		})
 	);
 	const first_tab = steps.findIndex((step) => step.tab);
@@ -196,9 +256,17 @@ function make_checklist(frm, steps) {
 			$(`<div class="text-sm-medium text-ink-gray-5 pt-3"></div>`).text(label).appendTo($card);
 		}
 		$(
-			`<div class="company-setup-step flex items-center rounded-md mx-n2 p-2 gap-3" role="button" tabindex="0"></div>`
+			`<div class="company-setup-step cursor-pointer flex items-center rounded-md mx-n2 p-2 gap-3" role="button" tabindex="0"></div>`
 		)
-			.append(make_task(frm, step, []).addClass("grow min-w-0"))
+			.append(
+				make_task(
+					frm,
+					step.is_needed || step.summary
+						? step
+						: { ...step, summary: __("Optional · not started") },
+					[]
+				).addClass("grow min-w-0")
+			)
 			.append(
 				$(`<span class="shrink-0 text-ink-gray-5"></span>`).html(
 					frappe.utils.icon("chevron-right", "sm")
@@ -228,6 +296,7 @@ const STEP_OPENERS = {
 	opening_balances: (frm) => show_opening_balances(frm),
 	opening_sales_invoices: (frm) => show_opening_invoices(frm, "Customer"),
 	opening_purchase_invoices: (frm) => show_opening_invoices(frm, "Supplier"),
+	bank_accounts: (frm) => show_bank_accounts(frm),
 	customers: (frm, step) => !step.is_complete && open_party_import(frm, "Customer"),
 	suppliers: (frm, step) => !step.is_complete && open_party_import(frm, "Supplier"),
 	check_books: (frm) =>
@@ -242,17 +311,16 @@ const STEP_OPENERS = {
 function make_task_card(frm, step) {
 	const buttons = (STEP_ACTIONS[step.name]?.(frm, step) || []).filter(Boolean);
 	const more = [...(STEP_MORE[step.name]?.(frm, step) || []), ...skip_items(frm, step)];
-	if (more.length) {
-		buttons.push(
-			frappe.ui.dropdown({
-				button: { icon: "ellipsis", variant: "ghost", attrs: { "aria-label": __("More") } },
-				options: more,
-				align: "end",
-			})
-		);
-	}
+	if (more.length) buttons.push(make_more_menu(more));
 	if (step.name === "chart_of_accounts" && !step.is_complete && frm.doc.__onload?.chart_import_blocked) {
 		step = { ...step, description: frm.doc.__onload.chart_import_blocked };
+	}
+	if (step.name === "bank_accounts" && frm.doc.__onload?.bank?.posting) {
+		step = {
+			...step,
+			is_posting: true,
+			summary: cheque_words(__("Posting uncleared cheques in the background")),
+		};
 	}
 	const posting_party = { opening_sales_invoices: "Customer", opening_purchase_invoices: "Supplier" }[
 		step.name
@@ -286,6 +354,13 @@ function make_task_card(frm, step) {
 				.removeClass("text-ink-gray-8")
 				.addClass("text-ink-gray-5");
 		}
+		const reminders = get_books_reminders(frm);
+		if (reminders.length) {
+			$card.append($(`<div class="ps-8 pt-3"></div>`).append(make_alerts(reminders)));
+		}
+	}
+	if (step.name === "fixed_assets" && get_hand_after_alerts(frm).length) {
+		$card.append($(`<div class="ps-8 pt-3"></div>`).append(make_alerts(get_hand_after_alerts(frm))));
 	}
 	if (posting_party) {
 		add_sheet_match(frm, posting_party, $card);
@@ -316,13 +391,31 @@ function add_sheet_match(frm, party_type, $card) {
 		2
 	);
 	const more = flt(-gaps.filter((gap) => gap < 0).reduce((sum, gap) => sum + gap, 0), 2);
+	// money on the wrong ledger: one over its line, another short
+	const names_of = (sign) =>
+		off
+			.filter((line, index) => Math.sign(gaps[index]) === sign)
+			.map((line) => short_name(line.account))
+			.join(", ");
 	const [label, theme] =
-		missing >= 1
+		match.by_account && missing >= 1 && more >= 1
+			? [
+					__("{0} over on {1} · {2} short on {3}", [
+						money(more),
+						names_of(-1),
+						money(missing),
+						names_of(1),
+					]),
+					"red",
+			  ]
+			: missing >= 1
 			? [__("{0} short of trial balance", [money(missing)]), "orange"]
 			: more >= 1
 			? [__("{0} more than trial balance", [money(more)]), "red"]
 			: off.length
 			? [__("Accounts don't match trial balance"), "orange"]
+			: (frm.doc[PARTY[party_type].table] || []).some((row) => row.status !== "Created")
+			? [__("Matches trial balance once all are posted"), "blue"]
 			: [__("Matches trial balance"), "green"];
 	$card
 		.find(".text-base-medium")
@@ -373,14 +466,15 @@ function add_undone_line(frm, party_type, $card) {
 	$card.append(
 		$(`<div class="flex items-center justify-between gap-3 ps-8 pt-3 mt-3 border-t"></div>`).append(
 			$(`<span class="text-p-sm text-ink-gray-5"></span>`).text(
-				__("{0} undone, not posted again yet", [count_invoices(undone.length, party_type)])
+				__("{0} undone, not posted again yet", [
+					count_entries(
+						undone.length,
+						undone.filter((row) => flt(row.outstanding_amount) < 0).length,
+						party_type
+					),
+				])
 			),
-			frappe.ui.button({
-				label: __("View"),
-				variant: "ghost",
-				size: "sm",
-				onclick: () => show_posted(frm, party_type, "undone"),
-			})
+			make_view_button(() => show_posted(frm, party_type, "undone"))
 		)
 	);
 }
@@ -427,40 +521,64 @@ function skip_items(frm, step) {
 // Where each report or list is in the software people move from
 const WHERE_TO_FIND = {
 	chart_of_accounts: [
-		["Tally", __("Display More Reports › List of Accounts, then Alt+E to export")],
+		[
+			"Tally",
+			__(
+				"Display More Reports › List of Accounts, then Alt+E to export (Tally ERP 9: Display › List of Accounts)"
+			),
+		],
 		["Busy", __("Administration › Masters › Account › List, choose All Accounts, then Alt+E")],
 		["Zoho Books", __("Accountant › Chart of Accounts › Export")],
-		["QuickBooks", __("Settings › Chart of Accounts › Run Report › Export")],
+		["QuickBooks", __("Reports › Account List, then Export to Excel")],
+		["Xero", __("Accounting › Chart of accounts › Export")],
 		["Marg", __("Books › All Ledgers, then the Excel icon and Format-2")],
 		["Excel / other", __("Download the sample chart and fill it in.")],
 	],
 	opening_balances: [
-		["Tally", __("Display More Reports › Trial Balance, Alt+F5 for every ledger, then Alt+E")],
+		[
+			"Tally",
+			__(
+				"Display More Reports › Trial Balance, Alt+F5 for every ledger, then Alt+E (Tally ERP 9: Display › Trial Balance)"
+			),
+		],
 		["Busy", __("Display › Trial Balance › Closing Trial - Alphabetical, Balance Only, then Alt+E")],
 		["Zoho Books", __("Reports › Trial Balance")],
 		["QuickBooks", __("Reports › Trial Balance")],
+		["Xero", __("Accounting › Reports › Trial Balance, then Export to Excel")],
 		["Marg", __("Final Reports › Trial Balance, Alt+P, A/C Group Wise: No, then Excel")],
 		["Excel / other", __("One row per account with its debit or credit.")],
 	],
 	opening_sales_invoices: [
-		["Tally", __("Display More Reports › Statements of Accounts › Outstandings › Receivables")],
+		[
+			"Tally",
+			__(
+				"Display More Reports › Statements of Accounts › Outstandings › Receivables (Tally ERP 9: Display › Statements of Accounts › Outstandings)"
+			),
+		],
 		[
 			"Busy",
 			__("Display › Outstanding Analysis › Bills Receivable, Sundry Debtors, Bill-wise, then Alt+E"),
 		],
 		["Zoho Books", __("Reports › AR Aging Details")],
-		["QuickBooks", __("Reports › Open Invoices")],
+		["QuickBooks", __("Reports › A/R Aging Detail, then Export to Excel")],
+		["Xero", __("Accounting › Reports › Aged Receivables Detail, then Export to Excel")],
 		["Marg", __("Books › Outstanding › Whole, Alt+P › Outstanding List Party Wise, then the Excel icon")],
 		["Excel / other", __("One row per unpaid invoice: customer, invoice number, date, amount.")],
 	],
 	opening_purchase_invoices: [
-		["Tally", __("Display More Reports › Statements of Accounts › Outstandings › Payables")],
+		[
+			"Tally",
+			__(
+				"Display More Reports › Statements of Accounts › Outstandings › Payables (Tally ERP 9: Display › Statements of Accounts › Outstandings)"
+			),
+		],
 		[
 			"Busy",
 			__("Display › Outstanding Analysis › Bills Payable, Sundry Creditors, Bill-wise, then Alt+E"),
 		],
 		["Zoho Books", __("Reports › AP Aging Details")],
-		["QuickBooks", __("Reports › Unpaid Bills")],
+		["QuickBooks", __("Reports › A/P Aging Detail, then Export to Excel")],
+		["Xero", __("Accounting › Reports › Aged Payables Detail, then Export to Excel")],
 		[
 			"Marg",
 			__(
@@ -469,9 +587,81 @@ const WHERE_TO_FIND = {
 		],
 		["Excel / other", __("One row per unpaid bill: supplier, bill number, date, amount.")],
 	],
+	opening_stock: [
+		[
+			"Tally",
+			__(
+				"Display More Reports › Inventory Books › Godown Summary, then Alt+E for each godown (Tally ERP 9: Display › Inventory Books › Godown Summary)"
+			),
+		],
+		[
+			"Zoho Books",
+			__("Reports › Inventory › Inventory Valuation Summary, one warehouse at a time, then Export"),
+		],
+		["QuickBooks", __("Reports › Inventory Valuation Summary, then Export to Excel")],
+		[
+			"Excel / other",
+			__(
+				"One row per item per warehouse: item, warehouse, qty, unit, value. Job worker rows add the challan."
+			),
+		],
+	],
+	fixed_assets: [
+		["QuickBooks", __("Reports › Fixed Asset List, then Export to Excel")],
+		[
+			"Excel / other",
+			__("One row per asset: name, asset account, purchase date, cost, depreciation till date."),
+		],
+	],
+	open_orders: [
+		[
+			"Tally",
+			__(
+				"Display More Reports › Statements of Inventory › Sales Order Outstandings, and Purchase Order Outstandings, then Alt+E"
+			),
+		],
+		["Excel / other", __("One row per order line: order number, party, item, qty left, rate, date.")],
+	],
+	boms: [
+		["Tally", __("Tally keeps the BOM on each stock item: fill the BOM import sheet from them.")],
+		["Excel / other", __("Import them from the BOMs step with the BOM import sheet.")],
+	],
+	job_work_orders: [
+		[
+			"Tally",
+			__(
+				"Display More Reports › Statements of Inventory › Job Work Out Order Outstandings, then Alt+E"
+			),
+		],
+		[
+			"Excel / other",
+			__("One row per order line: order number, job worker, item, qty left, rate, date."),
+		],
+	],
+	uncleared_cheques: [
+		[
+			"Tally",
+			__("Banking › Bank Reconciliation, pick the bank, then Alt+E to export what is not cleared"),
+		],
+		["Busy", __("Display › Bank Reconciliation, pick the bank, show unreconciled entries, then Alt+E")],
+		[
+			"QuickBooks",
+			__("Accounting › Reconcile › History by account, open the last report, then Export to Excel"),
+		],
+		[
+			"Excel / other",
+			__(
+				"One row per cheque or deposit: bank account, issued or deposited, number, date, party, amount."
+			),
+		],
+	],
 };
 
-const SOFTWARE = ["Tally", "Busy", "Zoho Books", "QuickBooks", "Marg", "Excel / other"];
+// in the order people in the country use them
+const SOFTWARE =
+	frappe.sys_defaults?.country === "India"
+		? ["Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"]
+		: ["QuickBooks", "Xero", "Zoho Books", "Tally", "Busy", "Marg", "Excel / other"];
 
 // Each task's report comes from the software picked for it; the chart from where the trial balance is
 const SOURCES = {
@@ -479,10 +669,22 @@ const SOURCES = {
 	opening_balances: ["accounts_source", __("Your trial balance comes from")],
 	opening_sales_invoices: ["receivables_source", __("Your unpaid invoices come from")],
 	opening_purchase_invoices: ["payables_source", __("Your unpaid bills come from")],
+	uncleared_cheques: ["accounts_source", __("Your bank book comes from")],
+	opening_stock: ["accounts_source", __("Your stock summary comes from")],
+	fixed_assets: ["accounts_source", __("Your asset register comes from")],
+	open_orders: ["accounts_source", __("Your open orders come from")],
+	boms: ["accounts_source", __("Your BOMs come from")],
+	job_work_orders: ["accounts_source", __("Your job work orders come from")],
 };
 
+// a software without its own steps for this report gets the sheet's columns
 function get_places(task_name, source) {
-	return WHERE_TO_FIND[task_name].filter(([software]) => !source || software === source);
+	const places = WHERE_TO_FIND[task_name]
+		.filter(([software]) => !source || software === source)
+		.sort(([a], [b]) => SOFTWARE.indexOf(a) - SOFTWARE.indexOf(b));
+	return places.length
+		? places
+		: WHERE_TO_FIND[task_name].filter(([software]) => software === "Excel / other");
 }
 
 function make_source_select(value, onchange) {
@@ -546,7 +748,7 @@ function make_where_table(frm, places) {
 	const $box =
 		places.length === 1
 			? $(`<div class="border rounded-lg px-3 py-2 text-p-sm text-ink-gray-8"></div>`).text(
-					places[0][1]
+					cheque_words(places[0][1])
 			  )
 			: make_where_box(places);
 	const $table = $(`<div class="flex flex-col gap-2"></div>`).append($box);
@@ -573,7 +775,7 @@ function make_where_box(places, title) {
 				`<div class="company-setup-where gap-4 px-3 py-2 ${title || index ? "border-t" : ""}"></div>`
 			).append(
 				$(`<div class="text-p-sm text-ink-gray-5"></div>`).text(software),
-				$(`<div class="text-p-sm text-ink-gray-8"></div>`).text(where)
+				$(`<div class="text-p-sm text-ink-gray-8"></div>`).text(cheque_words(where))
 			)
 		)
 	);
@@ -592,20 +794,17 @@ function make_task(frm, step, buttons) {
 		: ["circle-dashed", "text-ink-gray-5"];
 	const note = step.is_skipped ? __("Skipped for now.") : step.summary || step.description;
 
-	// more than two buttons go on a row of their own, so the text keeps its width; a menu doesn't count
-	const stacked = buttons.filter((opts) => !(opts.jquery || opts instanceof Element)).length > 2;
-	const $task = $(`<div class="flex items-center gap-3 ${stacked ? "flex-wrap" : ""}"></div>`);
-	$(`<span class="shrink-0 ${color}"></span>`).html(frappe.utils.icon(icon, "md")).appendTo($task);
-	const $text = $(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).appendTo($task);
+	// the buttons sit at the right end, and wrap below the text only when the card is too narrow
+	const $task = $(`<div class="flex flex-wrap items-center gap-3"></div>`);
+	// the icon and the text stay together on the first line
+	const $lead = $(`<div class="flex items-center gap-3 grow min-w-0"></div>`).appendTo($task);
+	$(`<span class="shrink-0 ${color}"></span>`).html(frappe.utils.icon(icon, "md")).appendTo($lead);
+	const $text = $(`<div class="flex flex-col gap-0.5 min-w-0"></div>`).appendTo($lead);
 	$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(step.title).appendTo($text);
 	if (note) $(`<div class="text-p-sm text-ink-gray-5"></div>`).text(note).appendTo($text);
 
 	if (buttons.length) {
-		const $actions = $(
-			`<div class="flex flex-wrap items-center gap-2 ${
-				stacked ? "w-full ps-8" : "justify-end shrink-0"
-			}"></div>`
-		);
+		const $actions = $(`<div class="flex flex-wrap items-center justify-end gap-2 ms-auto"></div>`);
 		buttons.forEach((opts) =>
 			$actions.append(opts.jquery || opts instanceof Element ? opts : frappe.ui.button(opts))
 		);
@@ -620,7 +819,7 @@ function show_tab(frm, fieldname) {
 }
 
 function skip_step(frm, step, skip) {
-	return call_method(frm, "skip_step", { step_key: step.key, skip: skip }).then(() => frm.reload_doc());
+	return call_method(frm, "skip_step", { step_key: step.key, skip: skip }).then(() => reload_fresh(frm));
 }
 
 function show_migration_date(frm) {
@@ -652,6 +851,28 @@ function show_migration_date(frm) {
 		[__("Trial balance"), __("Every account with its balance"), "opening_balances"],
 		[__("Unpaid customer invoices"), __("Who owes you, invoice by invoice"), "opening_sales_invoices"],
 		[__("Unpaid supplier bills"), __("Whom you owe, bill by bill"), "opening_purchase_invoices"],
+		// from where the trial balance comes: no picker of their own
+		[
+			__("Stock summary"),
+			__("If you keep stock: item by item, in each warehouse"),
+			"opening_stock",
+			true,
+		],
+		[__("Fixed asset register"), __("If you have fixed assets: asset by asset"), "fixed_assets", true],
+		[__("Bank reconciliation"), __("Cheques the bank had not cleared"), "uncleared_cheques", true],
+		[
+			__("Open orders"),
+			__("Sales and purchase orders not yet delivered or received"),
+			"open_orders",
+			true,
+		],
+		[__("BOMs"), __("If you make goods: the materials of each item you make"), "boms", true],
+		[
+			__("Job work orders"),
+			__("If you send work out: orders with goods still at job workers"),
+			"job_work_orders",
+			true,
+		],
 	];
 	const sources = Object.fromEntries(
 		reports.map(([, , task_name]) => [SOURCES[task_name][0], frm.doc[SOURCES[task_name][0]] || ""])
@@ -674,7 +895,7 @@ function show_migration_date(frm) {
 		values.every((value) => value === values[0]) ? values[0] : "",
 		(value) => {
 			if (!value) return;
-			for (const control of controls) control.set_value(value);
+			for (const control of controls) control?.set_value(value);
 		}
 	);
 	$(`<div class="flex items-center justify-between gap-3"></div>`)
@@ -689,12 +910,14 @@ function show_migration_date(frm) {
 		)
 		.appendTo($reports);
 	const $list = $(`<div class="flex flex-col border rounded-lg"></div>`).appendTo($reports);
-	controls = reports.map(([title, note, task_name], index) => {
+	controls = reports.map(([title, note, task_name, follows], index) => {
 		const source_field = SOURCES[task_name][0];
-		const [$select, control] = make_source_select(sources[source_field], (value) => {
-			sources[source_field] = value || "";
-			show_where();
-		});
+		const [$select, control] = follows
+			? [$(`<span class="text-p-sm text-ink-gray-5 shrink-0"></span>`).text(__("As the trial balance"))]
+			: make_source_select(sources[source_field], (value) => {
+					sources[source_field] = value || "";
+					show_where();
+			  });
 		$(`<div class="flex items-center gap-3 px-3 py-2.5 ${index ? "border-t" : ""}"></div>`)
 			.append(
 				$(`<span class="flex shrink-0 text-ink-gray-5"></span>`).html(
@@ -789,93 +1012,496 @@ function see_books_button(frm) {
 	};
 }
 
-// What is done and what is left; money left in Temporary Opening needs a tick, nothing else stops going live
-function show_go_live(frm) {
-	// only what is left is listed: a done step has nothing to say here
-	const stats = frm.doc.__onload?.stats || {};
-	// the box below says what Check your books would: the amount left in Temporary Opening
-	const steps = get_steps(frm).filter(
-		(step) =>
-			step.name !== "go_live" &&
-			!step.is_complete &&
-			!step.is_skipped &&
-			!(step.name === "check_books" && stats.temporary_opening)
-	);
+// What the books need beyond the steps: last year's profit closed, and the Company's default
+// accounts set; for Check your books and Go live
+function get_books_reminders(frm) {
+	const reminders = frm.doc.__onload?.books_reminders || {};
 	const currency = erpnext.get_currency(frm.doc.company);
-	const temporary = format_currency(Math.abs(stats.temporary_opening || 0), currency);
+	// ERPNext closes a year only after the one before it: the years with a profit each get a line,
+	// and the button on the oldest closes the years before it with entries but no profit too
+	const years = reminders.unclosed_years || [];
+	const first = years.findIndex((year) => flt(year.profit, 2));
+	const alerts = years
+		.filter((year) => flt(year.profit, 2))
+		.map((year, index) => {
+			const before = index ? [] : years.slice(0, first).map((other) => other.fiscal_year);
+			const stock =
+				(index
+					? year.stock
+					: years.slice(0, first + 1).find((y) => y.stock?.needed && !y.stock.done)?.stock) || {};
+			const year_end = frappe.datetime.str_to_user(year.year_end_date);
+			const closing_stock = stock.needed && ["Queued", "In Progress"].includes(stock.status);
+			if (closing_stock) {
+				// the closing builds in the background: look again until it is done
+				watch_stock_job(
+					frm,
+					"closing_stock_timer",
+					20000,
+					{ year_end: year.year_end_date },
+					(status) => ["Queued", "In Progress"].includes(status.closing)
+				);
+			}
+			return {
+				theme: "yellow",
+				title: __("Last year's profit is not closed"),
+				description: [
+					__(
+						"{0} of {1} is still in income and expenses, so the Balance Sheet shows the year as not closed. Close it once every opening entry is posted: entries on or before {2} can't be posted or undone after.",
+						[format_currency(year.profit, currency), year.fiscal_year, year_end]
+					),
+					before.length
+						? __("{0} is closed first: it has entries, like old invoices, but no profit.", [
+								before.join(", "),
+						  ])
+						: null,
+					stock.needed && !stock.done
+						? stock.blocker ||
+						  (closing_stock
+								? __("Closing stock… This updates by itself when done.")
+								: __("Your stock is closed first; then the year."))
+						: null,
+				]
+					.filter(Boolean)
+					.join(" "),
+				buttons:
+					index || stock.blocker || closing_stock
+						? []
+						: [
+								{
+									label: __("Close {0}", [year.fiscal_year]),
+									onclick: () => close_year(frm, year, before, stock),
+								},
+						  ],
+			};
+		});
+	const gaps = reminders.default_account_gaps || [];
+	if (gaps.length) {
+		alerts.push({
+			theme: "yellow",
+			title: plural(
+				gaps.length,
+				__("1 default account of the company needs a look"),
+				__("{0} default accounts of the company need a look", [gaps.length])
+			),
+			description: gaps.map((gap) => __("{0}: {1}", [gap.label, gap.reason])).join(" · "),
+			buttons: [
+				// a receivable or payable default other than the biggest line: one click to change it
+				...gaps
+					.filter((gap) => gap.account)
+					.map((gap) => ({
+						label: __("Use {0}", [short_account(frm, gap.account)]),
+						onclick: () =>
+							call_method(frm, "set_default_party_account", {
+								fieldname: gap.fieldname,
+								account: gap.account,
+							}).then(() => reload_fresh(frm)),
+					})),
+				{
+					label: __("Open company"),
+					onclick: () => frappe.set_route("Form", "Company", frm.doc.company),
+				},
+			],
+		});
+	}
+	return alerts;
+}
+
+// Close a year from Check your books: its stock first when the company keeps stock, then the
+// profit into the account picked
+function close_year(frm, year, before = [], stock = year.stock) {
+	const stock_first = stock?.needed && !stock.done;
+	const year_end = frappe.datetime.str_to_user(year.year_end_date);
 	const dialog = new frappe.ui.Dialog({
-		title: __("Go live"),
+		title: __("Close {0}", [year.fiscal_year]),
 		fields: [
-			{ fieldname: "summary", fieldtype: "HTML" },
+			{ fieldname: "note", fieldtype: "HTML" },
 			{
-				fieldname: "accept_temporary_opening",
-				fieldtype: "Check",
-				label: __("I understand {0} in Temporary Opening isn't explained yet", [temporary]),
-				hidden: !stats.temporary_opening,
-				onchange: () => set_primary_enabled(),
+				fieldname: "closing_account",
+				fieldtype: "Link",
+				options: "Account",
+				label: __("Profit goes to"),
+				// asked only on the step that closes the year
+				reqd: !stock_first,
+				hidden: stock_first,
+				only_select: 1,
+				get_query: () => ({
+					filters: {
+						company: frm.doc.company,
+						is_group: 0,
+						disabled: 0,
+						root_type: ["in", ["Equity", "Liability"]],
+					},
+				}),
 			},
 		],
-		primary_action_label: __("Go live"),
+		primary_action_label: stock_first ? __("Close stock") : __("Close {0}", [year.fiscal_year]),
 		primary_action: (values) =>
-			call_method(frm, "go_live", { accept_temporary_opening: values.accept_temporary_opening }).then(
-				() => {
-					dialog.hide();
-					frappe.show_alert({ message: __("{0} is live", [frm.doc.company]), indicator: "green" });
-					frm.reload_doc();
-				}
+			call_method(
+				frm,
+				"close_year",
+				{ fiscal_year: year.fiscal_year, closing_account: values.closing_account },
+				{ freeze: true }
+			).then((r) => {
+				dialog.hide();
+				reload_fresh(frm);
+				frappe.ui.toast({
+					type: "success",
+					message:
+						r.message === "stock"
+							? __(
+									"Stock is being closed to {0}. Come back in a few minutes to close the year.",
+									[year_end]
+							  )
+							: __("{0} is closed. The Balance Sheet shows it in a few minutes.", [
+									year.fiscal_year,
+							  ]),
+					duration: 10000,
+				});
+			}),
+	});
+	dialog
+		.get_field("note")
+		.$wrapper.append(
+			grey_line(
+				stock_first
+					? __(
+							"ERPNext closes the stock to {0} first, in the background. Then come back and close the year.",
+							[year_end]
+					  )
+					: __(
+							"Moves {0} of income and expenses to the account below, dated {1}. Opening entries on or before {1} can't be posted or undone after.",
+							[format_currency(year.profit, erpnext.get_currency(frm.doc.company)), year_end]
+					  )
+			).addClass("mb-3"),
+			before.length
+				? grey_line(
+						__("{0} is closed first, as ERPNext closes years in order.", [before.join(", ")])
+				  ).addClass("mb-3")
+				: []
+		);
+	dialog.show();
+	dialog.set_value("closing_account", year.closing_account || "");
+}
+
+// What is left, as reminders only: nothing here stops going live
+function show_go_live(frm) {
+	const reminders = frm.doc.__onload?.go_live_reminders || {};
+	const currency = erpnext.get_currency(frm.doc.company);
+	const temporary = flt(reminders.temporary_opening);
+	const steps = get_steps(frm);
+	const by_key = (key) => steps.find((step) => step.key === key);
+	// money left in Temporary Opening already says Check your books is not done
+	const open_steps = (reminders.steps || [])
+		.map(by_key)
+		.filter((step) => step && !(step.name === "check_books" && temporary));
+	// a step left while the trial balance has money for it, like fixed assets, is a gap; other
+	// skipped steps only get a grey line
+	const gaps = (reminders.gaps || []).map(by_key).filter((step) => step && !open_steps.includes(step));
+	const skipped = (reminders.skipped || []).map(by_key).filter((step) => step && !gaps.includes(step));
+	const open = (step) => () => {
+		dialog.hide();
+		open_step(frm, step);
+	};
+	const alerts = [
+		temporary && {
+			title: __("Temporary Opening is {0}, so it is not zero.", [
+				format_currency(Math.abs(temporary), currency),
+			]),
+			buttons: [
+				{
+					label: __("See your books"),
+					onclick: () => {
+						dialog.hide();
+						show_posting_preview(frm, false);
+					},
+				},
+			],
+		},
+		...open_steps.map((step) => ({
+			title: __("{0} is not done.", [step.title]),
+			buttons: [{ label: __("Open"), onclick: open(step) }],
+		})),
+		...gaps.map((step) => ({
+			title: step.is_skipped
+				? __("{0} is skipped, but your trial balance has lines for it.", [step.title])
+				: __("{0} is not done, and your trial balance has lines for it.", [step.title]),
+			description: step.summary || undefined,
+			buttons: [{ label: __("Open"), onclick: open(step) }],
+		})),
+		...get_books_reminders(frm),
+		reminders.stock_reposts?.running && {
+			title: plural(
+				reminders.stock_reposts.running,
+				__("1 stock cost update is still running."),
+				__("{0} stock cost updates are still running.", [reminders.stock_reposts.running])
 			),
-		secondary_action_label: __("Not yet"),
+			description: __(
+				"They usually finish within the hour. Stock values and closing the year wait for them."
+			),
+		},
+		reminders.stock_reposts?.failed && {
+			title: plural(
+				reminders.stock_reposts.failed,
+				__("1 stock cost update failed."),
+				__("{0} stock cost updates failed.", [reminders.stock_reposts.failed])
+			),
+			description: __("Stock values after the opening may be off until it runs again."),
+			buttons: [
+				{
+					label: __("Open"),
+					onclick: () => frappe.set_route("List", "Repost Item Valuation", { status: "Failed" }),
+				},
+			],
+		},
+		reminders.bank_accounts_without_number && {
+			title:
+				reminders.bank_accounts_without_number === 1
+					? __("1 bank account has no account number.")
+					: __("{0} bank accounts have no account number.", [
+							reminders.bank_accounts_without_number,
+					  ]),
+			description: __("Add it before your first bank payment."),
+			buttons: [
+				{
+					label: __("Add bank details"),
+					onclick: () => {
+						dialog.hide();
+						show_tab(frm, "accounts_tab");
+						show_bank_accounts(frm);
+					},
+				},
+			],
+		},
+	]
+		.filter(Boolean)
+		.map((alert) => ({ theme: "yellow", ...alert }));
+	const left = Boolean(temporary || open_steps.length || gaps.length);
+	const notes = [
+		skipped.length &&
+			grey_line(
+				__("Skipped: {0}. Your trial balance has nothing waiting for them.", [
+					skipped.map((step) => step.title).join(", "),
+				])
+			),
+		reminders.missing_years?.length &&
+			frappe.ui.alert({
+				theme: "blue",
+				title: __("Going live adds the financial year {0}", [reminders.missing_years.join(", ")]),
+				description: __("Your entries from the migration date on go in it."),
+			}),
+	].filter(Boolean);
+
+	const dialog = new frappe.ui.Dialog({
+		title: __("Go live"),
+		fields: [{ fieldname: "body", fieldtype: "HTML" }],
+		primary_action_label: __("Go live"),
+		primary_action: () => show_confirm(),
+		secondary_action_label: __("Close"),
 		secondary_action: () => dialog.hide(),
 	});
+	const $body = dialog.get_field("body").$wrapper;
 
-	const $body = $(`<div class="flex flex-col gap-3"></div>`);
-	$(`<div class="text-p-sm text-ink-gray-6"></div>`)
-		.text(
-			[
-				frm.doc.migration_date &&
-					__("{0} moves to ERPNext on {1}.", [
-						frm.doc.company,
-						frappe.datetime.str_to_user(frm.doc.migration_date),
-					]),
-				stats.temporary_opening
-					? null
-					: steps.length
-					? __("These steps are open. Nothing here stops you.")
-					: __("Everything is in and your books add up."),
-			]
-				.filter(Boolean)
-				.join(" ")
-		)
-		.appendTo($body);
-	const set_primary_enabled = () =>
-		dialog
-			.get_primary_btn()
-			.prop(
-				"disabled",
-				Boolean(stats.temporary_opening) && !dialog.get_value("accept_temporary_opening")
+	const show_checks = () => {
+		dialog.set_title(__("Go live"));
+		$body
+			.empty()
+			.append(
+				$(`<div class="flex flex-col gap-3"></div>`).append(
+					grey_line(__("Start using ERPNext. We point out anything left, but nothing stops you.")),
+					make_alerts(alerts),
+					notes
+				)
 			);
-	if (steps.length) {
-		const $list = $(`<div class="flex flex-col"></div>`).appendTo($body);
-		for (const step of steps) {
-			$list.append($(`<div class="border-t py-2"></div>`).append(make_task(frm, step, [])));
-		}
-	}
-	if (stats.temporary_opening) {
-		$body.append(
-			frappe.ui.alert({
-				theme: "yellow",
-				title: __("{0} is left in Temporary Opening", [temporary]),
-				description: __(
-					"Something from your old books isn't in yet, such as stock, an advance or a balance left out of your sheet. You can go live and add it later."
+		dialog.set_primary_action(__("Go live"), () => show_confirm());
+		dialog.set_secondary_action_label(__("Close"));
+		dialog.set_secondary_action(() => dialog.hide());
+	};
+	const show_confirm = () => {
+		dialog.set_title(__("Go live?"));
+		$body.empty().append(
+			$(`<div class="flex flex-col gap-3"></div>`).append(
+				make_back_line(__("Back to the Go live checks. Nothing changes until you confirm."), () =>
+					show_checks()
 				),
-				footer: () =>
-					$(`<div class="flex gap-2"></div>`).append(frappe.ui.button(see_books_button(frm))),
+				grey_line(
+					temporary
+						? __("Temporary Opening is {0}. Check your books keeps showing it.", [
+								format_currency(Math.abs(temporary), currency),
+						  ])
+						: open_steps.length
+						? __("Some steps are not done. The Overview keeps showing them.")
+						: gaps.length
+						? __(
+								"Some skipped steps have lines in your trial balance. The Overview keeps showing them."
+						  )
+						: alerts.length
+						? __("A few things above are left to do.")
+						: __("Your books match your trial balance.")
+				)
+			)
+		);
+		dialog.set_primary_action(left ? __("Go live anyway") : __("Go live"), () =>
+			call_method(frm, "go_live", { accept_temporary_opening: temporary ? 1 : 0 }).then(() => {
+				dialog.hide();
+				frappe.ui.toast({
+					type: "success",
+					message: __("{0} is live. Your team can work in ERPNext now.", [frm.doc.company]),
+				});
+				reload_fresh(frm);
 			})
 		);
-	}
-	dialog.get_field("summary").$wrapper.append($body);
+		dialog.set_secondary_action_label(__("Back"));
+		dialog.set_secondary_action(() => show_checks());
+	};
+	show_checks();
 	dialog.show();
-	set_primary_enabled();
+}
+
+// A grey line of text, as under a window's cards or in a confirm
+function grey_line(text) {
+	return $(`<div class="text-p-sm text-ink-gray-5"></div>`).text(text);
+}
+
+function make_text(value, classes = "text-ink-gray-8") {
+	return $(`<span class="text-base"></span>`).addClass(classes).text(value);
+}
+
+// Rows of cells in one bordered box, a line between rows
+function make_box(rows) {
+	return $(`<div class="flex flex-col border rounded-lg"></div>`).append(
+		rows.map((cells, index) =>
+			$(`<div class="flex items-center gap-4 px-3 py-2.5"></div>`)
+				.toggleClass("border-t", index > 0)
+				.append(cells)
+		)
+	);
+}
+
+// A box row's left side: the title, and a grey line under it
+function make_title_cell(title, line, title_classes = "text-ink-gray-8 truncate") {
+	return $(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).append(
+		make_text(title, title_classes),
+		grey_line(line)
+	);
+}
+
+function make_view_button(onclick) {
+	return frappe.ui.button({ label: __("View"), variant: "ghost", size: "sm", onclick });
+}
+
+// The ⋯ menu of a card or window, when it has options
+function make_more_menu(options) {
+	return options.length
+		? frappe.ui.dropdown({
+				button: { icon: "ellipsis", variant: "ghost", attrs: { "aria-label": __("More") } },
+				options: options,
+				align: "end",
+		  })
+		: [];
+}
+
+function make_sheet_buttons(upload, menu = []) {
+	return $(`<div class="flex gap-1 shrink-0"></div>`).append(
+		upload ? frappe.ui.button({ label: __("Upload sheet"), icon: "upload", onclick: upload }) : [],
+		make_more_menu(menu)
+	);
+}
+
+// A window's head line: what goes in it, with Upload sheet and the ⋯ menu
+function make_sheet_head(intro, upload, menu) {
+	return $(`<div class="flex items-center justify-between gap-3 mb-3"></div>`).append(
+		$(`<div class="text-p-base text-ink-gray-7"></div>`).text(intro),
+		make_sheet_buttons(upload, menu)
+	);
+}
+
+// where rows came from: the sheet's name, or typed in
+function source_name(source) {
+	return source || __("Typed in");
+}
+
+// The first line of a confirm that replaced a window's body: a back arrow and what confirming does
+function make_back_line(text, onclick) {
+	return $(`<div class="flex items-center gap-2"></div>`).append(
+		frappe.ui.button({ icon: "arrow-left", variant: "ghost", size: "sm", tooltip: __("Back"), onclick }),
+		$(`<div class="text-p-base text-ink-gray-7"></div>`).text(text)
+	);
+}
+
+// A sub-view's head: back arrow, title and line, and its buttons on the right
+function make_back_header(title, line, onclick, actions) {
+	return $(`<div class="flex items-center justify-between gap-3"></div>`).append(
+		$(`<div class="flex items-center gap-2 min-w-0"></div>`).append(
+			frappe.ui.button({
+				icon: "arrow-left",
+				variant: "ghost",
+				size: "sm",
+				tooltip: __("Back"),
+				onclick,
+			}),
+			$(`<div class="flex flex-col min-w-0"></div>`).append(
+				$(`<span class="text-base-medium text-ink-gray-8 truncate"></span>`).text(title),
+				line ? $(`<span class="text-p-sm text-ink-gray-5"></span>`).text(line) : []
+			)
+		),
+		$(`<div class="flex items-center gap-2 shrink-0"></div>`).append(actions || [])
+	);
+}
+
+// Red and yellow messages, each with its buttons; past three, the rest wait behind "Show N more"
+function make_alerts(alerts) {
+	const make = (alert) =>
+		frappe.ui.alert({
+			theme: alert.theme,
+			title: alert.title,
+			description: alert.description,
+			footer: alert.buttons?.length
+				? () =>
+						$(`<div class="flex gap-2"></div>`).append(
+							alert.buttons.map((button) => frappe.ui.button(button))
+						)
+				: undefined,
+		});
+	const $alerts = $(`<div class="flex flex-col gap-3"></div>`).append(alerts.slice(0, 3).map(make));
+	if (alerts.length > 3) {
+		const $more = $(`<div></div>`)
+			.append(
+				frappe.ui.button({
+					label: __("Show {0} more", [alerts.length - 3]),
+					variant: "ghost",
+					onclick: () => {
+						$more.remove();
+						$alerts.append(alerts.slice(3).map(make));
+					},
+				})
+			)
+			.appendTo($alerts);
+	}
+	return $alerts.toggleClass("hide", !alerts.length);
+}
+
+// Why a window's primary button can't be used yet: grey, beside it, and the button disabled
+function set_footer_reason(dialog, reason) {
+	let $reason = dialog.standard_actions.find(".company-setup-reason");
+	if (!$reason.length) {
+		$reason = $(`<span class="company-setup-reason text-p-sm text-ink-gray-5 me-2"></span>`).insertBefore(
+			dialog.get_primary_btn()
+		);
+	}
+	$reason.text(reason || "").toggleClass("hide", !reason);
+	reason ? dialog.disable_primary_action() : dialog.enable_primary_action();
+}
+
+// Label and value lines, as in a confirm
+function make_kv_lines(lines) {
+	return $(`<div class="flex flex-col"></div>`).append(
+		lines.map(([label, value]) =>
+			$(`<div class="flex justify-between gap-4 py-2 border-b text-base"></div>`).append(
+				$(`<span class="text-ink-gray-6"></span>`).text(label),
+				$(`<span class="text-base-medium text-ink-gray-8 text-right"></span>`).text(value)
+			)
+		)
+	);
 }
 
 // Buttons of each task on its own tab, by the last part of its hook path
@@ -885,7 +1511,10 @@ const STEP_ACTIONS = {
 			return [{ label: __("Edit chart"), icon: "pencil", onclick: () => show_chart(frm) }];
 		}
 		return [
-			{ label: __("View chart"), icon: "eye", onclick: () => show_chart(frm) },
+			{
+				label: __("Keep this chart"),
+				onclick: () => call_method(frm, "use_existing_chart").then(() => reload_fresh(frm)),
+			},
 			!frm.doc.__onload?.chart_import_blocked && {
 				label: __("Import my chart"),
 				icon: "import",
@@ -913,6 +1542,13 @@ const STEP_ACTIONS = {
 	},
 	opening_sales_invoices: (frm) => invoice_buttons(frm, "Customer"),
 	opening_purchase_invoices: (frm) => invoice_buttons(frm, "Supplier"),
+	bank_accounts: (frm, step) => [
+		{
+			label: step.is_complete ? __("Edit bank details") : __("Add bank details"),
+			icon: step.is_complete ? "pencil" : undefined,
+			onclick: () => show_bank_accounts(frm),
+		},
+	],
 	customers: (frm, step) => import_buttons(frm, "Customer", step),
 	suppliers: (frm, step) => import_buttons(frm, "Supplier", step),
 	// nothing to check before anything is posted: the balances step has the preview
@@ -935,13 +1571,14 @@ const STEP_MORE = {
 						onclick: () => download_chart_sheet(frm.doc.company, "Current Chart"),
 					},
 			  ].filter(Boolean)
-			: [],
+			: [{ label: __("View chart"), icon: "eye", onclick: () => show_chart(frm) }],
 	opening_balances: (frm) =>
 		(frm.doc.opening_balances || []).some((row) => row.status === "Posted")
 			? [{ label: __("Posted balances"), icon: "list", onclick: () => show_posted(frm, "balances") }]
 			: [],
 	opening_sales_invoices: (frm) => invoice_menu(frm, "Customer"),
 	opening_purchase_invoices: (frm) => invoice_menu(frm, "Supplier"),
+	bank_accounts: (frm) => bank_menu(frm),
 	customers: () => [party_list_item("Customer")],
 	suppliers: () => [party_list_item("Supplier")],
 };
@@ -1066,7 +1703,7 @@ function show_opening_balances(frm, result) {
 	const save = () =>
 		call_method(frm, "save_opening_balances", { rows: dialog.get_values().balances || [] }).then(() => {
 			dialog.hide();
-			return frm.reload_doc();
+			return reload_fresh(frm);
 		});
 
 	const $intro = dialog.get_field("intro").$wrapper;
@@ -1075,51 +1712,39 @@ function show_opening_balances(frm, result) {
 			$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
 				__(
 					"Bank, cash, loans, capital, tax and the rest, as on {0}. Customers, suppliers and stock come in their own way.",
-					[
-						frm.doc.migration_date
-							? frappe.datetime.str_to_user(
-									frappe.datetime.add_days(frm.doc.migration_date, -1)
-							  )
-							: __("the day before migration"),
-					]
+					[day_before_text(frm)]
 				)
 			),
-			$(`<div class="flex gap-1 shrink-0"></div>`).append(
-				frappe.ui.button({
-					label: __("Upload sheet"),
-					icon: "upload",
-					onclick: () => upload_opening_balances(frm, dialog),
-				}),
-				frappe.ui.dropdown({
-					button: { icon: "ellipsis", variant: "ghost", attrs: { "aria-label": __("More") } },
-					align: "end",
-					options: [
-						{
-							label: __("Download sheet"),
-							icon: "download",
-							onclick: () =>
-								open_url_post(
-									"/api/method/erpnext.setup.doctype.company_setup.chart_sheet.download_opening_balances",
-									{ company: company }
-								),
-						},
-						{
-							label: __("Add account"),
-							icon: "plus",
-							onclick: () =>
-								frappe.model.with_doctype("Account", () => add_balance_account(frm, dialog)),
-						},
-					],
-				})
+			make_sheet_buttons(
+				() => upload_opening_balances(frm, dialog),
+				[
+					{
+						label: __("Download sheet"),
+						icon: "download",
+						onclick: () =>
+							open_url_post(
+								"/api/method/erpnext.setup.doctype.company_setup.chart_sheet.download_opening_balances",
+								{ company: company }
+							),
+					},
+					{
+						label: __("Add account"),
+						icon: "plus",
+						onclick: () =>
+							frappe.model.with_doctype("Account", () => add_balance_account(frm, dialog)),
+					},
+				]
 			)
 		)
 		.appendTo($intro);
+	$intro.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances));
 	const $cards = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
 	if (result) $intro.append(make_upload_result(frm, result));
 	// drawn from the rows as they change: see update_totals
 	$intro.append($(`<div data-unmatched></div>`));
 	// accounts suggested for rows without one, applied only when the user says so
 	let suggested = result?.suggestions || null;
+	$intro.append(make_balance_yellows(frm, dialog));
 	if (posted.length) {
 		$(`<div class="text-p-sm text-ink-gray-5 mb-3"></div>`)
 			.text(
@@ -1141,6 +1766,15 @@ function show_opening_balances(frm, result) {
 				.call("erpnext.setup.doctype.company_setup.company_setup.suggest_balance_accounts", {
 					company: company,
 					labels: waiting.map((row) => row.original_account),
+					root_types: Object.fromEntries(
+						waiting.map((row) => [row.original_account, row.root_type])
+					),
+					sides: Object.fromEntries(
+						waiting.map((row) => [
+							row.original_account,
+							flt(row.debit) >= flt(row.credit) ? "debit" : "credit",
+						])
+					),
 				})
 				.then((r) => {
 					suggested = r.message || {};
@@ -1194,9 +1828,9 @@ function show_opening_balances(frm, result) {
 					: []
 			);
 		const sum = (field) => rows.reduce((total, row) => total + flt(row[field]), 0);
-		// what the rows of these categories add up to, on the side they usually sit
+		// what the rows of these categories add up to, on the side they usually sit; posted ones too
 		const net = (root_types, sign) =>
-			rows
+			[...rows, ...posted]
 				.filter((row) => root_types.includes(row.root_type))
 				.reduce((total, row) => total + sign * (flt(row.debit) - flt(row.credit)), 0);
 		const debit = sum("debit");
@@ -1211,14 +1845,21 @@ function show_opening_balances(frm, result) {
 				],
 				get_difference_caption(frm, debit - credit)
 			),
+			// what customers owe, stock and what suppliers are owed are in, so the sides add up
 			make_lines_card(
 				__("Your books"),
 				[
-					[__("Assets"), money(net(["Asset"], 1))],
-					[__("Liabilities and capital"), money(net(["Liability", "Equity"], -1))],
-					[__("Profit so far"), money(net(["Income"], -1) - net(["Expense"], 1)), true],
+					[
+						__("Assets"),
+						money(net(["Asset"], 1) + flt(frm.doc.sheet_receivables) + flt(frm.doc.sheet_stock)),
+					],
+					[
+						__("Liabilities and capital"),
+						money(net(["Liability", "Equity"], -1) + flt(frm.doc.sheet_payables)),
+					],
+					[__("Profit"), money(net(["Income"], -1) - net(["Expense"], 1)), true],
 				],
-				__("Income minus expenses this year is the profit so far.")
+				get_profit_caption(frm)
 			),
 			make_lines_card(
 				__("For other steps"),
@@ -1255,24 +1896,23 @@ function show_opening_balances(frm, result) {
 				}
 				dialog.fields_dict.balances.grid.refresh();
 				update_totals();
-				frappe.show_alert(
-					{
-						message:
-							suggestions.length === 1
-								? __("1 row filled: {0}", [
-										`${suggestions[0].original_account} → ${short_name(
-											suggestions[0].account
-										)}`,
-								  ])
-								: __("{0} rows filled.", [suggestions.length]),
-						indicator: "green",
-					},
-					8
-				);
+				frappe.ui.toast({
+					type: "success",
+					message:
+						suggestions.length === 1
+							? __("1 row filled: {0}", [
+									`${suggestions[0].original_account} → ${short_name(
+										suggestions[0].account
+									)}`,
+							  ])
+							: __("{0} rows filled.", [suggestions.length]),
+					duration: 8000,
+				});
 			});
 	// the next row without an account, on its page, with its account field open
 	const go_to_empty_row = () => {
 		const grid = dialog.fields_dict.balances.grid;
+		fix_delete_all_rows(grid);
 		const index = (grid.df.data || []).findIndex((row) => !row.account && row.original_account);
 		if (index < 0) return;
 		const pagination = grid.grid_pagination;
@@ -1293,6 +1933,42 @@ function show_opening_balances(frm, result) {
 	dialog.update_totals = update_totals;
 	dialog.show();
 	update_totals();
+	// an account's type or category may have changed in the chart since the rows were saved
+	const picked = (dialog.fields_dict.balances.df.data || []).filter((row) => row.account);
+	if (picked.length) {
+		frappe.db
+			.get_list("Account", {
+				filters: { name: ["in", [...new Set(picked.map((row) => row.account))]] },
+				fields: ["name", "account_type", "root_type"],
+				limit: 0,
+			})
+			.then((accounts) => {
+				const by_name = Object.fromEntries(accounts.map((account) => [account.name, account]));
+				for (const row of picked) {
+					const account = by_name[row.account];
+					if (account) {
+						row.account_type = account.account_type;
+						row.root_type = account.root_type;
+					}
+				}
+				dialog.fields_dict.balances.grid.refresh();
+				update_totals();
+			});
+	}
+}
+
+// What the profit in the balances is: of the year so far, or of a whole year that then needs closing
+function get_profit_caption(frm) {
+	const period = frm.doc.__onload?.report_period;
+	if (!period) return __("Income minus expenses this year. Assets include customers and stock.");
+	const from = frappe.datetime.str_to_user(period.from_date);
+	const to = frappe.datetime.str_to_user(period.to_date);
+	return period.to_date === period.year_end
+		? __(
+				"Income minus expenses for the year {0} to {1}. Close that year once everything is posted. Assets include customers and stock.",
+				[from, to]
+		  )
+		: __("Income minus expenses from {0} to {1}. Assets include customers and stock.", [from, to]);
 }
 
 // A stat card with a few amounts that belong together, the one to read first in bold
@@ -1341,13 +2017,18 @@ function add_balance_account(frm, balances_dialog) {
 		.options.split("\n")
 		.filter((type) => !OPENING_EXCLUDED_TYPES.includes(type));
 	const grid = balances_dialog.fields_dict.balances.grid;
-	// the row being edited when it has no account, else the first row without one
+	fix_delete_all_rows(grid);
+	// the rows that can get the new account; the one being edited is picked first
+	const waiting = grid.df.data.filter((row) => !row.account && row.original_account);
 	const editing = frappe.ui.form.editable_row?.doc;
-	const row =
-		(editing && grid.df.data.includes(editing) && !editing.account && editing) ||
-		grid.df.data.find((row) => !row.account && row.original_account);
-	// the sheet's label may carry the account number: "1001 - Rent Deposit"
-	const name_of = (label) => cstr(label).split(" - ").pop();
+	let row = (waiting.includes(editing) && editing) || waiting[0];
+	// the sheet's label may carry the account number, "1001 - Rent Deposit", but "Security
+	// Deposit - Office Rent" is all name; "Payroll:Taxes" is a QuickBooks sub-account
+	const name_of = (label) => {
+		const [number, ...rest] = cstr(label).split(" - ");
+		const name = rest.length && /^[\w.]*\d[\w.]*$/.test(number) ? rest.join(" - ") : cstr(label);
+		return name.split(":").pop().trim();
+	};
 	const $layout = balances_dialog.$body.children().first();
 	const $view = $(`<div class="flex flex-col gap-3"></div>`).insertBefore($layout);
 	const close = () => {
@@ -1367,26 +2048,36 @@ function add_balance_account(frm, balances_dialog) {
 			}),
 			$(`<div class="flex flex-col min-w-0"></div>`).append(
 				$(`<span class="text-base-medium text-ink-gray-8 truncate"></span>`).text(
-					row ? __("Add an account for {0}", [row.original_account]) : __("Add an account")
+					__("Add an account")
 				),
-				row
+				waiting.length
 					? $(`<span class="text-p-sm text-ink-gray-5"></span>`).text(
-							flt(row.debit)
-								? __("{0} debit on your sheet. It gets the new account.", [
-										format_currency(row.debit, currency),
-								  ])
-								: __("{0} credit on your sheet. It gets the new account.", [
-										format_currency(row.credit, currency),
-								  ])
+							__("The row you pick gets the new account.")
 					  )
 					: []
 			)
 		)
 	);
+	const no_row = __("No row, only add the account");
+	const label_of = (row) =>
+		`${row.original_account} · ${format_currency(flt(row.debit) || flt(row.credit), currency)}`;
 	const form = new frappe.ui.FieldGroup({
 		body: $(`<div></div>`).appendTo($view),
 		fields: [
 			{ fieldname: "group_note", fieldtype: "HTML" },
+			{
+				fieldname: "for_row",
+				fieldtype: "Select",
+				label: __("For row"),
+				options: [...waiting.map(label_of), no_row],
+				default: row ? label_of(row) : no_row,
+				hidden: !waiting.length,
+				change: () => {
+					row = waiting.find((option) => label_of(option) === form.get_value("for_row"));
+					form.set_value("account_name", row ? name_of(row.original_account) : "");
+					suggest_parent();
+				},
+			},
 			{
 				fieldname: "account_name",
 				fieldtype: "Data",
@@ -1398,8 +2089,13 @@ function add_balance_account(frm, balances_dialog) {
 				fieldname: "account_type",
 				fieldtype: "Select",
 				label: __("Account Type"),
-				options: types,
-				description: __("Bank or Cash for money accounts; leave empty for most others."),
+				reqd: 1,
+				// "Other" is an account of no type, like a deposit or a provision
+				options: [
+					...types.filter(Boolean).map((type) => ({ value: type, label: __(type) })),
+					{ value: "Other", label: __("Other") },
+				],
+				description: __("Bank or Cash for money accounts; Other for most others."),
 				change: () => suggest_parent(),
 			},
 			{
@@ -1414,19 +2110,49 @@ function add_balance_account(frm, balances_dialog) {
 		],
 	});
 	form.make();
-	// money accounts go under the group of their kind, like Bank Accounts
+	// the group the account goes under is suggested from the row's kind and the type picked, never
+	// over what the user typed or picked there
+	let picked_parent = false;
+	const $parent = form.get_field("parent_account").$input;
+	$parent.on("input", () => (picked_parent = true));
+	// typing replaces the suggested group instead of adding to it
+	$parent.on("focus", () => setTimeout(() => $parent.select()));
+	// the group of the type picked, on the row's side, like Bank Accounts or Duties and Taxes
 	const suggest_parent = () => {
 		const account_type = form.get_value("account_type");
-		if (!account_type) return;
-		frappe.db
-			.get_value("Account", { company: company, is_group: 1, account_type: account_type }, "name")
-			.then((r) => r.message?.name && form.set_value("parent_account", r.message.name));
+		const side = !row ? null : flt(row.debit) >= flt(row.credit) ? "Asset" : "Liability";
+		frappe
+			.call("erpnext.setup.doctype.company_setup.company_setup.get_account_parent", {
+				company: company,
+				account_type: account_type === "Other" ? null : account_type,
+				root_type: row?.root_type || side,
+			})
+			.then((r) => {
+				if (r.message && !picked_parent) form.set_value("parent_account", r.message);
+			});
 	};
+	suggest_parent();
 	balances_dialog.set_secondary_action_label(__("Back"));
 	balances_dialog.set_secondary_action(close);
-	balances_dialog.set_primary_action(__("Add"), () => {
+	balances_dialog.set_primary_action(__("Add"), async () => {
 		const values = form.get_values();
 		if (!values) return;
+		// an asset line can't go under liabilities, nor the other way
+		const parent_root = (await frappe.db.get_value("Account", values.parent_account, "root_type")).message
+			?.root_type;
+		if (row?.root_type && parent_root && parent_root !== row.root_type) {
+			frappe.msgprint({
+				title: __("Wrong group"),
+				message: __("{0} is on the {1} side, but {2} is under {3}. Pick a group under {1}.", [
+					frappe.utils.escape_html(row.original_account),
+					__(row.root_type),
+					frappe.utils.escape_html(values.parent_account),
+					__(parent_root),
+				]),
+				indicator: "red",
+			});
+			return;
+		}
 		frappe
 			.call({
 				method: "erpnext.accounts.utils.add_ac",
@@ -1434,7 +2160,7 @@ function add_balance_account(frm, balances_dialog) {
 					doctype: "Account",
 					company: company,
 					account_name: values.account_name,
-					account_type: values.account_type,
+					account_type: values.account_type === "Other" ? "" : values.account_type,
 					parent: values.parent_account,
 					is_group: 0,
 					is_root: 0,
@@ -1448,15 +2174,13 @@ function add_balance_account(frm, balances_dialog) {
 					close();
 					grid.refresh();
 					balances_dialog.update_totals?.();
-					frappe.show_alert(
-						{
-							message: row
-								? __("{0} now uses {1}.", [row.original_account, values.account_name])
-								: __("{0} added.", [values.account_name]),
-							indicator: "green",
-						},
-						8
-					);
+					frappe.ui.toast({
+						type: "success",
+						message: row
+							? __("{0} now uses {1}.", [row.original_account, values.account_name])
+							: __("{0} added.", [values.account_name]),
+						duration: 8000,
+					});
 				})
 			);
 	});
@@ -1500,25 +2224,37 @@ function upload_opening_balances(frm, dialog) {
 	const drafts = (dialog.fields_dict.balances.df.data || []).filter(
 		(row) => row.account || flt(row.debit) || flt(row.credit)
 	).length;
-	if (!drafts) return choose_balance_sheet(frm, dialog);
-	frappe.confirm(
-		__(
-			"The sheet replaces the {0} balances in this table, unsaved changes included. Posted balances stay as they are. Continue?",
-			[drafts]
-		),
-		() => choose_balance_sheet(frm, dialog)
+	upload_sheet(
+		frm,
+		"import_opening_balances",
+		{},
+		{
+			replaces:
+				drafts &&
+				__(
+					"The sheet replaces the {0} balances in this table, unsaved changes included. Posted balances stay as they are. Continue?",
+					[drafts]
+				),
+			dialog: dialog,
+			after: (result) => show_opening_balances(frm, result),
+		}
 	);
 }
 
-function choose_balance_sheet(frm, dialog) {
-	new frappe.ui.FileUploader({
-		restrictions: { allowed_file_types: [".xlsx", ".csv"] },
-		on_success: (file) =>
-			call_method(frm, "import_opening_balances", { file_url: file.file_url }).then((r) => {
-				dialog.hide();
-				frm.reload_doc().then(() => show_opening_balances(frm, r.message));
-			}),
-	});
+// Pick a sheet and read it with method, then open the window again on what it read. replaces: the
+// confirm to ask first, as the sheet replaces drafts.
+function upload_sheet(frm, method, args, { replaces, dialog, after }) {
+	const choose = () =>
+		new frappe.ui.FileUploader({
+			restrictions: { allowed_file_types: [".xlsx", ".csv"] },
+			on_success: (file) =>
+				call_method(frm, method, { ...args, file_url: file.file_url }).then((r) => {
+					dialog?.hide();
+					reload_fresh(frm).then(() => after(r.message));
+				}),
+		});
+	if (!replaces) return choose();
+	frappe.confirm(replaces, choose);
 }
 
 // What the upload did, and where what it left out goes
@@ -1565,6 +2301,16 @@ function get_difference_caption(frm, difference) {
 			.filter((row) => row.status === "Created")
 			.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
 	const invoices = posted("opening_sales_invoices") - posted("opening_purchase_invoices");
+	if (flt(frm.doc.sheet_stock)) {
+		const stock = frm.doc.__onload?.stock_match;
+		const covered = invoices + flt(stock?.books) + flt(stock?.difference_posted);
+		if (!covered) return __("Waiting for your customer invoices, supplier bills and stock to be posted.");
+		const left = flt(difference + covered, 2);
+		if (Math.abs(left) < 1) return __("Covered by the invoices, bills and stock posted.");
+		return __("{0} not covered yet by the invoices, bills and stock posted.", [
+			format_currency(Math.abs(left), erpnext.get_currency(frm.doc.company)),
+		]);
+	}
 	if (!invoices) return __("Waiting for your customer invoices and supplier bills to be posted.");
 	const left = flt(difference + invoices, 2);
 	if (Math.abs(left) < 1) return __("Covered by the customer invoices and supplier bills posted.");
@@ -1619,6 +2365,89 @@ function make_fiscal_year_note(frm) {
 	});
 }
 
+// A button that opens where a red is fixed: a closing entry, the company, a dimension
+function fix_button(fix, frm) {
+	if (fix.doctype === "Accounting Dimension" && fix.document_type) {
+		return {
+			label: fix.label,
+			onclick: () =>
+				frappe.prompt(
+					[
+						{
+							fieldname: "value",
+							fieldtype: "Link",
+							options: fix.document_type,
+							label: __(fix.document_type),
+							reqd: 1,
+						},
+					],
+					(values) =>
+						call_method(frm, "set_dimension_default", {
+							dimension: fix.name,
+							value: values.value,
+						}).then(() => {
+							window.cur_dialog?.hide();
+							reload_fresh(frm);
+						}),
+					fix.label,
+					__("Set")
+				),
+		};
+	}
+	return {
+		label: fix.label,
+		onclick: () => {
+			// the window would stay over the form it opens
+			window.cur_dialog?.hide();
+			frappe.set_route("Form", fix.doctype, fix.name);
+		},
+	};
+}
+
+// What stops posting or undoing, as the server's get_posting_reds gives it, shown as a window opens
+function make_posting_reds(frm, reds) {
+	if (!reds?.length) return [];
+	return $(`<div class="mb-3"></div>`).append(
+		make_alerts(
+			reds.map((red) => ({
+				theme: "red",
+				title: red.text,
+				buttons: red.fix ? [fix_button(red.fix, frm)] : [],
+			}))
+		)
+	);
+}
+
+// After a post or undo: the cards are drawn again from the server before anything else shows,
+// so none reads as before the post meanwhile
+function reload_fresh(frm) {
+	frappe.dom.freeze(__("Updating…"));
+	return frm.reload_doc().then(
+		() => frappe.dom.unfreeze(),
+		() => frappe.dom.unfreeze()
+	);
+}
+
+const UNDOING_TEXT = () => __("Undoing in the background. This page updates when it's done.");
+
+// After a post or undo: a job queued says so, and the page updates again when it ends
+function after_run(frm, result, queued_text, done) {
+	if (result === "queued") {
+		frappe.ui.toast({ type: "info", message: queued_text });
+		return reload_fresh(frm);
+	}
+	return reload_fresh(frm).then(() => done?.(result));
+}
+
+// Read-only data for a window: unlike call_method, the document does not come back with it
+function get_data(frm, method, args = {}, opts = {}) {
+	return frappe.call({
+		method: "erpnext.setup.doctype.company_setup.company_setup_api." + method,
+		args: { company: frm.doc.company, ...args },
+		...opts,
+	});
+}
+
 // by name: the form reloads itself after a save, and a call sent mid-reload has no doc to send
 function call_method(frm, method, args, opts = {}) {
 	const onload = frm.doc.__onload;
@@ -1635,9 +2464,15 @@ function call_method(frm, method, args, opts = {}) {
 		});
 }
 
+// When something was posted, as the user reads dates and times, to the minute
+function format_time_posted(datetime) {
+	if (!datetime) return "";
+	return frappe.datetime.str_to_user(datetime).replace(/(\d{1,2}:\d{2}):\d{2}.*$/, "$1");
+}
+
 // The books on the day before the migration date; with can_post, as they will be after posting
 function show_posting_preview(frm, can_post = true) {
-	call_method(frm, "preview_opening_balances").then((r) => {
+	get_data(frm, "preview_opening_balances").then((r) => {
 		const preview = r.message;
 		const currency = erpnext.get_currency(frm.doc.company);
 		const dialog = new frappe.ui.Dialog({
@@ -1647,17 +2482,22 @@ function show_posting_preview(frm, can_post = true) {
 			primary_action_label: can_post ? __("Post") : __("Done"),
 			primary_action: () =>
 				can_post
-					? call_method(frm, "post_opening_balances", null, { freeze: true }).then(() => {
-							dialog.hide();
-							frm.reload_doc();
-					  })
+					? call_method(frm, "post_opening_balances", null, { freeze: true }).then(() =>
+							reload_fresh(frm).then(() => dialog.hide())
+					  )
 					: dialog.hide(),
 			secondary_action_label: can_post ? __("Back") : undefined,
 			secondary_action: can_post ? () => dialog.hide() : undefined,
 		});
+		if (can_post) {
+			dialog
+				.get_field("preview")
+				.$wrapper.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances));
+		}
 		const year_note = can_post && make_fiscal_year_note(frm);
 		if (year_note)
 			dialog.get_field("preview").$wrapper.append($(`<div class="mb-3"></div>`).append(year_note));
+		if (!can_post) dialog.get_field("preview").$wrapper.append(make_books_checks(frm, dialog));
 		dialog.get_field("preview").$wrapper.append(make_posting_preview(preview, currency, frm));
 		dialog.show();
 	});
@@ -1681,16 +2521,22 @@ function make_posting_preview(preview, currency, frm) {
 	$(`<div class="text-p-sm text-ink-gray-6"></div>`)
 		.text(
 			preview.drafts && preview.draft_invoices
-				? __(
-						"{0} balances and {1} invoices and bills aren't posted yet. This is how your books will look once they are.",
-						[preview.drafts, preview.draft_invoices]
-				  )
+				? __("{0} and {1} aren't posted yet. This is how your books will look once they are.", [
+						plural(preview.drafts, __("1 balance"), __("{0} balances", [preview.drafts])),
+						plural(
+							preview.draft_invoices,
+							__("1 invoice or bill"),
+							__("{0} invoices and bills", [preview.draft_invoices])
+						),
+				  ])
 				: preview.drafts
 				? preview.drafts === 1
 					? __("1 balance isn't posted yet. This is how your books will look once it is.")
 					: __("{0} balances aren't posted yet. This is how your books will look once they are.", [
 							preview.drafts,
 					  ])
+				: preview.draft_invoices === 1
+				? __("1 invoice or bill isn't posted yet. This is how your books will look once it is.")
 				: preview.draft_invoices
 				? __(
 						"{0} invoices and bills aren't posted yet. This is how your books will look once they are.",
@@ -1719,7 +2565,7 @@ function make_posting_preview(preview, currency, frm) {
 				theme: "yellow",
 				title: __("{0} doesn't balance yet", [money(Math.abs(temporary.balance))]),
 				description: __(
-					"It waits in Temporary Opening until your customer invoices and supplier bills, or a balance missing from your sheet, are in. Then it goes to zero. Nothing stops you meanwhile."
+					"It waits in Temporary Opening until your customer invoices, supplier bills and opening stock, or a balance missing from your sheet, are in. Then it goes to zero. Nothing stops you meanwhile."
 				),
 			})
 		);
@@ -1794,7 +2640,7 @@ function make_posting_preview(preview, currency, frm) {
 
 // One side of a statement: accounts under their parent group, extra lines, then the total
 function make_statement_side(title, rows, sign, money, extra_lines = []) {
-	const $side = $(`<div class="flex flex-col min-w-0" style="flex: 1 1 0"></div>`);
+	const $side = $(`<div class="flex flex-col min-w-0 flex-1"></div>`);
 	$(`<div class="text-sm-medium text-ink-gray-8 pb-2 border-b"></div>`).text(title).appendTo($side);
 	// a group's accounts together, even when the chart puts a subgroup between them
 	const groups = new Map();
@@ -1855,8 +2701,8 @@ function make_trial_balance(rows, money) {
 function make_trial_balance_line(account, debit, credit) {
 	return $(`<div class="flex gap-3 py-1.5 text-p-sm text-ink-gray-8"></div>`).append(
 		$(`<span class="grow truncate"></span>`).text(account),
-		$(`<span class="shrink-0 text-right" style="width: 140px"></span>`).text(debit),
-		$(`<span class="shrink-0 text-right" style="width: 140px"></span>`).text(credit)
+		$(`<span class="company-setup-amount"></span>`).text(debit),
+		$(`<span class="company-setup-amount"></span>`).text(credit)
 	);
 }
 
@@ -2003,6 +2849,7 @@ function show_posted(frm, kind, open_undone) {
 	});
 	const $body = dialog.get_field("body").$wrapper;
 	const grid = dialog.fields_dict.invoices?.grid;
+	if (grid) fix_delete_all_rows(grid);
 	// the grid takes a cell's click to edit the row, so a link in it would not open
 	grid?.wrapper[0].addEventListener(
 		"click",
@@ -2035,28 +2882,19 @@ function show_posted(frm, kind, open_undone) {
 			dialog.set_secondary_action(back);
 		}
 	};
-	const text = (value, classes = "text-ink-gray-8") =>
-		$(`<span class="text-base"></span>`).addClass(classes).text(value);
-	const sub = (value) => $(`<span class="text-p-sm text-ink-gray-5"></span>`).text(value);
-	const box = (rows) =>
-		$(`<div class="flex flex-col border rounded-lg"></div>`).append(
-			rows.map((cells, index) =>
-				$(`<div class="flex items-center gap-4 px-3 py-2.5"></div>`)
-					.toggleClass("border-t", index > 0)
-					.append(cells)
-			)
-		);
-	const source_of = (group) => group.source || __("Typed in");
-	const when_of = (datetime) =>
-		frappe.datetime.str_to_user(datetime).split(" ")[0] + " " + datetime.slice(11, 16);
+	const count_undone = (group) =>
+		is_balances
+			? count_of(group.count)
+			: count_entries(
+					group.count,
+					(frm.doc[UNDONE_TABLES[kind]] || []).filter(
+						(row) => (row.source || "") === group.source && flt(row.outstanding_amount) < 0
+					).length,
+					kind
+			  );
 	const line_of = (group) =>
 		[
-			group.posted_on &&
-				__("Posted {0}", [
-					frappe.datetime.str_to_user(group.posted_on).split(" ")[0] +
-						" " +
-						group.posted_on.slice(11, 16),
-				]),
+			group.posted_on && __("Posted {0}", [format_time_posted(group.posted_on)]),
 			is_balances
 				? [
 						count_of(group.count),
@@ -2076,62 +2914,41 @@ function show_posted(frm, kind, open_undone) {
 		set_footer(__("Done"), () => dialog.hide());
 		show_grid(null);
 		const rows = posted.groups.map((group) => [
-			$(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).append(
-				text(source_of(group), "text-ink-gray-8 truncate"),
-				sub(line_of(group))
-			),
-			!is_balances && text(group.count ? money(group.amount) : "—", "text-ink-gray-8 shrink-0"),
-			frappe.ui.button({
-				label: __("View"),
-				variant: "ghost",
-				size: "sm",
-				onclick: () => show_group(group),
-			}),
+			make_title_cell(source_name(group.source), line_of(group)),
+			!is_balances && make_text(group.count ? money(group.amount) : "—", "text-ink-gray-8 shrink-0"),
+			make_view_button(() => show_group(group)),
 		]);
 		if (posted.outside.count) {
 			rows.push([
-				$(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).append(
-					text(__("Made outside Company Setup"), "text-ink-gray-7"),
-					sub(
-						is_balances
-							? __(
-									"{0} opening journal entries from Data Import or by hand · counted in your totals",
-									[posted.outside.count]
-							  )
-							: __("{0} opening entries from Data Import or by hand · counted in your totals", [
-									posted.outside.count,
-							  ])
-					)
+				make_title_cell(
+					__("Made outside Company Setup"),
+					is_balances
+						? __(
+								"{0} opening journal entries from Data Import or by hand · counted in your totals",
+								[posted.outside.count]
+						  )
+						: __("{0} opening entries from Data Import or by hand · counted in your totals", [
+								posted.outside.count,
+						  ]),
+					"text-ink-gray-7"
 				),
-				!is_balances && text(money(posted.outside.amount), "text-ink-gray-8 shrink-0"),
-				frappe.ui.button({
-					label: __("View"),
-					variant: "ghost",
-					size: "sm",
-					onclick: () => show_outside(),
-				}),
+				!is_balances && make_text(money(posted.outside.amount), "text-ink-gray-8 shrink-0"),
+				make_view_button(() => show_outside()),
 			]);
 		}
 		const undone_rows = (posted.undone || []).map((group) => [
-			$(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).append(
-				text(source_of(group), "text-ink-gray-8 truncate"),
-				sub(
-					[
-						group.more_than_once
-							? __("Last undone {0}", [when_of(group.undone_on)])
-							: __("Undone {0}", [when_of(group.undone_on)]),
-						count_of(group.count),
-						__("cancelled in ERPNext"),
-					].join(" · ")
-				)
+			make_title_cell(
+				source_name(group.source),
+				[
+					group.more_than_once
+						? __("Last undone {0}", [format_time_posted(group.undone_on)])
+						: __("Undone {0}", [format_time_posted(group.undone_on)]),
+					count_undone(group),
+					__("removed from ERPNext"),
+				].join(" · ")
 			),
-			text(money(group.amount), "text-ink-gray-8 shrink-0"),
-			frappe.ui.button({
-				label: __("View"),
-				variant: "ghost",
-				size: "sm",
-				onclick: () => show_undone(group),
-			}),
+			make_text(money(group.amount), "text-ink-gray-8 shrink-0"),
+			make_view_button(() => show_undone(group)),
 		]);
 		$body
 			.empty()
@@ -2145,98 +2962,21 @@ function show_posted(frm, kind, open_undone) {
 						? __("You can undo these until you go live. Paid bills can't be undone.")
 						: __("You can undo these until you go live. Paid invoices can't be undone.")
 				),
-				box(rows.map((cells) => cells.filter(Boolean))),
+				live ? [] : make_posting_reds(frm, frm.doc.__onload?.posting_reds?.undo?.[kind]),
+				make_box(rows.map((cells) => cells.filter(Boolean))),
 				undone_rows.length
 					? [
 							$(`<div class="text-base-medium text-ink-gray-8 mt-5 mb-2"></div>`).text(
 								__("Undone")
 							),
-							box(undone_rows),
+							make_box(undone_rows),
 					  ]
 					: []
 			);
 	};
 
-	// a table of rows, narrowed by a search box, the first 100 shown
-	const make_table = (columns, rows, to_cells) => {
-		const $table = $(`<div class="flex flex-col gap-2"></div>`);
-		const $count = $(`<div class="text-p-sm text-ink-gray-5"></div>`);
-		const $tbody = $(`<tbody></tbody>`);
-		const render = (query) => {
-			const shown = rows.filter(
-				(row) => !query || JSON.stringify(row).toLowerCase().includes(query.toLowerCase())
-			);
-			$tbody
-				.empty()
-				.append(
-					shown
-						.slice(0, 100)
-						.map((row) =>
-							$(`<tr></tr>`).append(
-								to_cells(row).map((cell, index) =>
-									$(`<td class="text-base text-ink-gray-8"></td>`)
-										.toggleClass("text-right", !!columns[index][1])
-										.append(cell)
-								)
-							)
-						)
-				);
-			$count.text(
-				shown.length > 100 ? __("Showing 100 of {0}. Search to find others.", [shown.length]) : ""
-			);
-		};
-		const $search = $(`<div class="w-64"></div>`);
-		const search = frappe.ui.form.make_control({
-			df: {
-				fieldtype: "Data",
-				fieldname: "search",
-				placeholder: __("Search"),
-				change: () => render(search.get_value()),
-			},
-			parent: $search,
-			only_input: true,
-			render_input: true,
-		});
-		search.$input.on("input", () => render(search.get_value()));
-		$table.append(
-			$search,
-			$(`<div class="border rounded-lg overflow-hidden"></div>`).append(
-				$(`<table class="table mt-0 mb-0"></table>`).append(
-					$(`<thead><tr class="bg-surface-gray-1"></tr></thead>`)
-						.find("tr")
-						.append(
-							columns.map(([label, right]) =>
-								$(`<th class="text-sm-medium text-ink-gray-6 border-0"></th>`)
-									.toggleClass("text-right", !!right)
-									.text(label)
-							)
-						)
-						.end(),
-					$tbody
-				)
-			),
-			$count
-		);
-		render("");
-		return $table;
-	};
-	const header = (title, line, action) =>
-		$(`<div class="flex items-center justify-between gap-3 mb-3"></div>`).append(
-			$(`<div class="flex items-center gap-2 min-w-0"></div>`).append(
-				frappe.ui.button({
-					icon: "arrow-left",
-					variant: "ghost",
-					size: "sm",
-					tooltip: __("Back"),
-					onclick: () => show_list(),
-				}),
-				$(`<div class="flex flex-col min-w-0"></div>`).append(
-					text(title, "text-base-medium text-ink-gray-8 truncate"),
-					sub(line)
-				)
-			),
-			action || []
-		);
+	const header = (title, line, actions) =>
+		make_back_header(title, line, () => show_list(), actions).addClass("mb-3");
 	const link = (doctype, name) => $(frappe.utils.get_form_link(doctype, name, true));
 
 	const show_group = (group) => {
@@ -2278,7 +3018,7 @@ function show_posted(frm, kind, open_undone) {
 				.empty()
 				.append(
 					header(
-						source_of(group),
+						source_name(group.source),
 						line_of(group),
 						$(`<div class="flex items-center gap-2"></div>`).append($selected, $whole)
 					)
@@ -2287,8 +3027,13 @@ function show_posted(frm, kind, open_undone) {
 				rows.map((row) => ({
 					party: row.party || row.party_name,
 					account: row.account || posted.accounts[row.invoice] || "",
-					// ERPNext's name, which can differ from the sheet's after a re-post
-					invoice_number: (row.status === info.posted && row.invoice) || row.invoice_number,
+					// ERPNext's name, which can differ from the sheet's after a re-post; an advance's
+					// entry keeps the sheet's number, like a credit memo's
+					invoice_number:
+						(row.status === info.posted &&
+							!(flt(row.outstanding_amount) < 0 && row.invoice_number) &&
+							row.invoice) ||
+						row.invoice_number,
 					invoice_date: row.invoice_date,
 					outstanding_amount: row.outstanding_amount,
 					currency: erpnext.get_currency(frm.doc.company),
@@ -2307,7 +3052,7 @@ function show_posted(frm, kind, open_undone) {
 		const cancelled = new Set(posted.cancelled);
 		$body.empty().append(
 			header(
-				source_of(group),
+				source_name(group.source),
 				line_of(group),
 				!live &&
 					frappe.ui.button({
@@ -2317,7 +3062,7 @@ function show_posted(frm, kind, open_undone) {
 						onclick: () => show_confirm(group),
 					})
 			),
-			make_table(
+			make_search_table(
 				[
 					[__("From sheet")],
 					[__("Account")],
@@ -2332,7 +3077,7 @@ function show_posted(frm, kind, open_undone) {
 					flt(row.debit) ? money(row.debit) : "",
 					flt(row.credit) ? money(row.credit) : "",
 					cancelled.has(row.journal_entry)
-						? text(__("Cancelled in ERPNext"), "text-ink-red-5")
+						? make_text(__("Cancelled in ERPNext"), "text-ink-red-5")
 						: link("Journal Entry", row.journal_entry),
 				]
 			)
@@ -2343,8 +3088,8 @@ function show_posted(frm, kind, open_undone) {
 		set_footer(__("Done"), () => dialog.hide());
 		$body.empty().append(
 			header(
-				__("Undone from {0}", [source_of(group)]),
-				__("{0} · cancelled in ERPNext. Fix them and upload again.", [count_of(group.count)]),
+				__("Undone from {0}", [source_name(group.source)]),
+				__("{0} · removed from ERPNext. Fix them and upload again.", [count_undone(group)]),
 				frappe.ui.button({
 					label: __("Download"),
 					icon: "download",
@@ -2386,7 +3131,7 @@ function show_posted(frm, kind, open_undone) {
 					__("undo these where they were made"),
 				].join(" · ")
 			),
-			make_table(
+			make_search_table(
 				[
 					[__("Entry")],
 					[is_balances ? __("Type") : kind === "Supplier" ? __("Supplier") : __("Customer")],
@@ -2416,29 +3161,33 @@ function show_posted(frm, kind, open_undone) {
 					$(`<div class="text-p-base text-ink-gray-7"></div>`).text(
 						is_balances
 							? __(
-									"These entries are cancelled. Their balances go back to drafts, so you can fix them or upload the right sheet, then post again."
+									"These entries are cancelled and deleted. Their balances go back to drafts, so you can fix them or upload the right sheet, then post again."
 							  )
 							: __(
-									"Its entries are cancelled and its rows move to Undone, so you can download them, fix them and upload again. Other uploads stay as they are, and so do the customers or suppliers made from it."
+									"These {0} and their ledger entries will be deleted. Posting again keeps their numbers. The rows move to Undone, so you can download them, fix them and upload again. Other uploads stay as they are, and so do the customers or suppliers made from it.",
+									[count_entries(group.count, group.advances || 0, kind)]
 							  )
 					),
 					is_balances
-						? box(
+						? make_box(
 								group.entries.map((entry) => [
 									link("Journal Entry", entry.name).addClass("shrink-0"),
-									text(__(entry.voucher_type || ""), "text-ink-gray-6 grow"),
-									text(money(entry.total), "text-ink-gray-8 shrink-0"),
+									make_text(__(entry.voucher_type || ""), "text-ink-gray-6 grow"),
+									make_text(money(entry.total), "text-ink-gray-8 shrink-0"),
 								])
 						  )
-						: box(
+						: make_box(
 								[
 									[
-										text(source_of(group), "text-ink-gray-8 grow truncate"),
-										text(count_of(group.count), "text-ink-gray-6 shrink-0"),
-										text(money(group.amount), "text-ink-gray-8 shrink-0"),
+										make_text(source_name(group.source), "text-ink-gray-8 grow truncate"),
+										make_text(
+											count_entries(group.count, group.advances || 0, kind),
+											"text-ink-gray-6 shrink-0"
+										),
+										make_text(money(group.amount), "text-ink-gray-8 shrink-0"),
 									],
 									group.unposted && [
-										text(
+										make_text(
 											group.unposted === 1
 												? __("1 row not posted is removed too")
 												: __("{0} rows not posted are removed too", [group.unposted]),
@@ -2446,7 +3195,7 @@ function show_posted(frm, kind, open_undone) {
 										),
 									],
 									group.paid && [
-										text(
+										make_text(
 											__("{0} have a payment against them, so they stay posted", [
 												group.paid,
 											]),
@@ -2468,14 +3217,9 @@ function show_posted(frm, kind, open_undone) {
 			() =>
 				call_method(frm, "undo_posting", { kind: kind, source: group.source }).then((r) => {
 					dialog.hide();
-					if (r.message === "queued") {
-						frappe.show_alert({
-							message: __("Undoing in the background. This page updates when it's done."),
-							indicator: "blue",
-						});
-						return;
-					}
-					frm.reload_doc().then(() => show_undo_result(frm, kind, r.message, group.source));
+					after_run(frm, r.message, UNDOING_TEXT(), (result) =>
+						show_undo_result(frm, kind, result, group.source)
+					);
 				}),
 			() => show_list()
 		);
@@ -2484,27 +3228,38 @@ function show_posted(frm, kind, open_undone) {
 
 	const show_confirm_selected = (group, selected) => {
 		show_grid(null);
-		const title = count_of(selected.length);
+		const title = count_entries(
+			selected.length,
+			selected.filter((row) => flt(row.outstanding_amount) < 0).length,
+			kind
+		);
 		dialog.set_title(__("Undo {0}?", [title]));
 		$body
 			.empty()
 			.append(
 				$(`<div class="flex flex-col gap-3"></div>`).append(
 					$(`<div class="text-p-base text-ink-gray-7"></div>`).text(
-						__(
-							"These {0} will be cancelled in ERPNext. You can download them, fix them and upload again.",
-							[title]
+						plural(
+							selected.length,
+							__(
+								"This {0} and its ledger entries will be deleted. Posting again keeps its number.",
+								[title]
+							),
+							__(
+								"These {0} and their ledger entries will be deleted. Posting again keeps their numbers.",
+								[title]
+							)
 						)
 					),
-					box([
+					make_box([
 						...selected.map((row) => [
-							text(row.invoice_number || row.invoice, "text-ink-gray-8 shrink-0"),
-							text(row.party, "text-ink-gray-6 grow truncate"),
-							text(money(row.outstanding_amount), "text-ink-gray-8 shrink-0"),
+							make_text(row.invoice_number || row.invoice, "text-ink-gray-8 shrink-0"),
+							make_text(row.party, "text-ink-gray-6 grow truncate"),
+							make_text(money(row.outstanding_amount), "text-ink-gray-8 shrink-0"),
 						]),
 						[
-							text(__("Total"), "text-ink-gray-6 grow"),
-							text(
+							make_text(__("Total"), "text-ink-gray-6 grow"),
+							make_text(
 								money(selected.reduce((sum, row) => sum + flt(row.outstanding_amount), 0)),
 								"text-base-medium text-ink-gray-8 shrink-0"
 							),
@@ -2521,14 +3276,9 @@ function show_posted(frm, kind, open_undone) {
 					invoices: selected.map((row) => row.invoice),
 				}).then((r) => {
 					dialog.hide();
-					if (r.message === "queued") {
-						frappe.show_alert({
-							message: __("Undoing in the background. This page updates when it's done."),
-							indicator: "blue",
-						});
-						return;
-					}
-					frm.reload_doc().then(() => show_undo_result(frm, kind, r.message, group.source));
+					after_run(frm, r.message, UNDOING_TEXT(), (result) =>
+						show_undo_result(frm, kind, result, group.source)
+					);
 				}),
 			() => {
 				dialog.set_title(info.title);
@@ -2538,7 +3288,7 @@ function show_posted(frm, kind, open_undone) {
 		dialog.get_primary_btn().attr("data-theme", "red");
 	};
 
-	call_method(frm, "get_posted_entries", { kind: kind }).then((r) => {
+	get_data(frm, "get_posted_entries", { kind: kind }).then((r) => {
 		posted = r.message;
 		const undone = (open_undone && posted.undone) || [];
 		undone.length === 1 ? show_undone(undone[0]) : show_list();
@@ -2556,18 +3306,69 @@ function download_undone(frm, party_type, source) {
 }
 
 // What an undo did, and what it couldn't
+// Entries an undo had to keep cancelled, and why: one line
+function kept_cancelled_line(result) {
+	const kept = result?.kept_cancelled || [];
+	if (!kept.length) return "";
+	return kept.length === 1 ? kept[0] : __("{0} entries are kept cancelled. {1}", [kept.length, kept[0]]);
+}
+
 function show_undo_result(frm, kind, result, source) {
+	const kept = kept_cancelled_line(result);
+	if (kept) {
+		frappe.ui.toast({ type: "info", message: kept, duration: 15000 });
+	}
+	if (kind === "assets") {
+		frappe.ui.toast({
+			type: "success",
+			message: __("{0} undone", [
+				plural(result.removed, __("1 asset"), __("{0} assets", [result.removed])),
+			]),
+			description: __(
+				"They're cancelled and deleted in ERPNext. Download them from Posted assets to fix and upload again."
+			),
+			action: { label: __("Download"), onclick: () => download_assets(frm, source || "") },
+			duration: 10000,
+		});
+		return;
+	}
+	if (kind === "stock") {
+		frappe.ui.toast({
+			type: "success",
+			message: __("{0} undone", [
+				plural(result.removed, __("1 row"), __("{0} rows", [result.removed])),
+			]),
+			description: __(
+				"They're cancelled and deleted in ERPNext and kept under Undone in Posted stock."
+			),
+			action: { label: __("Download"), onclick: () => download_stock(frm, source || "") },
+			duration: 10000,
+		});
+		return;
+	}
+	if (kind === "cheques") {
+		frappe.ui.toast({
+			type: "success",
+			message: __("{0} undone", [count_rows(result.removed)]),
+			description: cheque_words(
+				__("They're cancelled and deleted in ERPNext and kept under Undone in Posted cheques.")
+			),
+			action: { label: __("Download"), onclick: () => download_cheques(frm, source || "") },
+			duration: 10000,
+		});
+		return;
+	}
 	if (kind === "balances") {
-		frappe.show_alert({
+		frappe.ui.toast({
+			type: "success",
 			message: [
 				result.entries === 1
-					? __("1 entry cancelled.")
-					: __("{0} entries cancelled.", [result.entries]),
+					? __("1 entry cancelled and deleted.")
+					: __("{0} entries cancelled and deleted.", [result.entries]),
 				result.drafts === 1
 					? __("1 balance is a draft again.")
 					: __("{0} balances are drafts again.", [result.drafts]),
 			].join(" "),
-			indicator: "green",
 		});
 		return;
 	}
@@ -2577,8 +3378,10 @@ function show_undo_result(frm, kind, result, source) {
 		description: [
 			result.removed &&
 				(kind === "Supplier"
-					? __("They're cancelled in ERPNext and kept under Undone in Posted bills.")
-					: __("They're cancelled in ERPNext and kept under Undone in Posted invoices.")),
+					? __("They're cancelled and deleted in ERPNext and kept under Undone in Posted bills.")
+					: __(
+							"They're cancelled and deleted in ERPNext and kept under Undone in Posted invoices."
+					  )),
 			result.unposted &&
 				(result.unposted === 1
 					? __("1 row not posted removed.")
@@ -2602,7 +3405,7 @@ function show_undo_result(frm, kind, result, source) {
 }
 
 function show_opening_invoices(frm, party_type, result) {
-	call_method(frm, "get_invoice_names", { party_type: party_type }).then((r) =>
+	get_data(frm, "get_invoice_names", { party_type: party_type }).then((r) =>
 		make_opening_invoices_dialog(frm, party_type, r.message, result)
 	);
 }
@@ -2683,11 +3486,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const rows = frm.doc[party.table] || [];
 	const created = rows.filter((row) => row.status === "Created").length;
 	const disabled = new Set(names.disabled || []);
+	// disabled customers or suppliers the user chose to post anyway
+	const post_disabled = new Set();
 	const other_currency = names.other_currency || {};
-	const kind_of = (row) => get_name_kind(row, names, disabled);
+	// a row an invoice made by hand stands for has its own alert, not the names' ones
+	const is_hand_posted = make_hand_posted_test(names);
+	const kind_of = (row) => (is_hand_posted(row) ? "hand_posted" : get_name_kind(row, names, disabled));
 	// several receivable or payable accounts: each invoice shows the one it goes to, and can change
 	const accounts = names.accounts || [];
 	const party_accounts = { ...names.party_accounts };
+	// a customer's or supplier's own ledger wins over the sheet's "Post to"
+	const own_accounts = names.own_accounts || {};
 	const data = get_draft_rows(frm, party_type, names).map((row) => ({
 		...row,
 		name: undefined,
@@ -2744,7 +3553,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 							const row = this.doc;
 							if (row && row.party && !row.party_name) row.party_name = row.party;
 							if (row) {
-								row.account = null;
+								row.account = own_accounts[row.party] || sheet_account;
+								row.account_by_hand = 0;
 								row.create_party = 0;
 							}
 							this.grid_row?.refresh_field("party_name");
@@ -2762,9 +3572,10 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 						hidden: !accounts.length,
 						only_select: 1,
 						get_query: () => ({ filters: { name: ["in", accounts] } }),
+						filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
 						onchange: function () {
-							const row = this.doc;
-							if (row?.party && row.account) set_party_account(row);
+							// picked on this row only: the sheet's Post to and the customer's own ledger no longer change it
+							if (this.doc) this.doc.account_by_hand = this.doc.account ? 1 : 0;
 							refresh_state();
 						},
 					},
@@ -2813,12 +3624,15 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		call_method(frm, "save_opening_invoices", {
 			party_type: party_type,
 			rows: dialog.get_value("invoices") || [],
-		}).then(() => frm.reload_doc());
+			post_to: sheet_account,
+		}).then(() => reload_fresh(frm));
 	const grid = dialog.fields_dict.invoices.grid;
+	fix_delete_all_rows(grid);
 	const currency = erpnext.get_currency(frm.doc.company);
 
 	// one line and the sheet's buttons; the cards under them
 	const $intro = dialog.get_field("intro").$wrapper;
+	$intro.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.[party_type]));
 	// each sheet's draft rows can go at once; saving keeps the change, closing without it undoes it
 	const draft_sources = {};
 	for (const row of frm.doc[PARTY[party_type].table] || []) {
@@ -2831,12 +3645,12 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		);
 		grid.refresh();
 		refresh_state();
-		frappe.show_alert({
+		frappe.ui.toast({
+			type: "info",
 			message:
 				(count === 1 ? __("1 row removed.") : __("{0} rows removed.", [count])) +
 				" " +
 				__("Save draft to keep this, or close without saving to undo it."),
-			indicator: "blue",
 		});
 	};
 	const menu = [
@@ -2856,35 +3670,81 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 				onclick: () => download_new_names(),
 			},
 	].filter(Boolean);
-	const $sheet_buttons = $(`<div class="flex gap-1 shrink-0"></div>`).append(
-		frappe.ui.button({
-			label: __("Upload sheet"),
-			icon: "upload",
-			onclick: () => upload_opening_invoices(frm, party_type, dialog),
-		}),
-		menu.length
-			? frappe.ui.dropdown({
-					button: { icon: "ellipsis", variant: "ghost", attrs: { "aria-label": __("More") } },
-					options: menu,
-					align: "end",
-			  })
-			: []
-	);
+	const $sheet_buttons = make_sheet_buttons(() => upload_opening_invoices(frm, party_type, dialog), menu);
 	$(`<div class="flex items-center justify-between gap-3 mb-3"></div>`)
 		.append(
 			$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
 				is_customer
+					? says_check
+						? __(
+								"Invoices still unpaid on {0}, one row each. Enter an advance or credit memo as a negative amount.",
+								[day_before]
+						  )
+						: __(
+								"Invoices still unpaid on {0}, one row each. Enter an advance or credit note as a negative amount.",
+								[day_before]
+						  )
+					: says_check
 					? __(
-							"Invoices still unpaid on {0}, one row each. Enter an advance as a negative amount.",
+							"Bills still unpaid on {0}, one row each. Enter an advance or vendor credit as a negative amount.",
 							[day_before]
 					  )
-					: __("Bills still unpaid on {0}, one row each. Enter an advance as a negative amount.", [
-							day_before,
-					  ])
+					: __(
+							"Bills still unpaid on {0}, one row each. Enter an advance or debit note as a negative amount.",
+							[day_before]
+					  )
 			),
 			$sheet_buttons
 		)
 		.appendTo($intro);
+	// several receivable or payable lines in the trial balance: the sheet's ledger, picked once
+	const ledger_lines = (frm.doc.__onload?.sheet_match?.[party_type]?.lines || []).filter(
+		(line) => line.sheet !== null
+	);
+	const $post_to = $(`<div class="max-w-sm"></div>`).appendTo($intro);
+	// the ledger picked for the whole sheet: every row goes there, names confirmed later too
+	let sheet_account = null;
+	if (accounts.length > 1 && ledger_lines.length > 1) {
+		const used = [...new Set(data.map((row) => row.account).filter(Boolean))];
+		const post_to = frappe.ui.form.make_control({
+			df: {
+				fieldtype: "Link",
+				fieldname: "post_to",
+				options: "Account",
+				label: __("Post to"),
+				only_select: 1,
+				placeholder: is_customer
+					? __("Each customer's own ledger")
+					: __("Each supplier's own ledger"),
+				description: is_customer
+					? __("Your trial balance has {0} receivable ledgers. Pick the one this sheet is for.", [
+							ledger_lines.length,
+					  ])
+					: __("Your trial balance has {0} payable ledgers. Pick the one this sheet is for.", [
+							ledger_lines.length,
+					  ]),
+				get_query: () => ({ filters: { name: ["in", accounts] } }),
+				filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
+				change: () => {
+					const value = post_to.get_value() || null;
+					sheet_account = value;
+					for (const row of dialog.get_value("invoices") || []) {
+						if (row.account_by_hand) continue;
+						row.account = own_accounts[row.party] || value || party_accounts[row.party];
+					}
+					grid.refresh();
+					refresh_state();
+				},
+			},
+			parent: $post_to,
+			render_input: true,
+		});
+		const picked = result?.post_to || (used.length === 1 ? used[0] : null);
+		if (picked) {
+			sheet_account = picked;
+			post_to.set_value(picked);
+		}
+	}
 	const $stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
 
 	// what was read and left out, under the table
@@ -2892,21 +3752,30 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		dialog.get_field("notes").$wrapper
 	);
 	const grey = (text) => $(`<div class="text-p-sm text-ink-gray-5"></div>`).text(text).appendTo($notes);
-	if (result?.advances) {
-		grey(
-			is_customer
-				? result.advances === 1
-					? __("1 negative row is an advance: money a customer paid before any invoice.")
-					: __("{0} negative rows are advances: money customers paid before any invoice.", [
-							result.advances,
-					  ])
-				: result.advances === 1
-				? __("1 negative row is an advance: money you paid a supplier before any bill.")
-				: __("{0} negative rows are advances: money you paid suppliers before any bill.", [
-						result.advances,
-				  ])
-		);
-	}
+	// said from the rows as they are now, so it follows rows removed or typed in
+	const $advances = grey("");
+	const show_advances = (count) =>
+		$advances
+			.toggle(!!count)
+			.text(
+				is_customer
+					? count === 1
+						? __(
+								"1 negative row is a credit: an advance, payment or credit note not yet set against an invoice."
+						  )
+						: __(
+								"{0} negative rows are credits: advances, payments or credit notes not yet set against an invoice.",
+								[count]
+						  )
+					: count === 1
+					? __(
+							"1 negative row is a debit: an advance, payment or debit note not yet set against a bill."
+					  )
+					: __(
+							"{0} negative rows are debits: advances, payments or debit notes not yet set against a bill.",
+							[count]
+					  )
+			);
 	if (result?.unused_columns?.length) {
 		grey(
 			is_customer
@@ -3067,13 +3936,42 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 								$(`<span class="text-p-sm text-ink-gray-7"></span>`).text(text)
 							)
 						)
-					)
+					),
+					count("new")
+						? $(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
+								is_customer
+									? __(
+											"Names not in ERPNext are added as spelt on the sheet. Import your customer list first to bring their addresses and tax IDs."
+									  )
+									: __(
+											"Names not in ERPNext are added as spelt on the sheet. Import your supplier list first to bring their addresses and tax IDs."
+									  )
+						  )
+						: []
 				),
-				frappe.ui.button({
-					label: __("Review names"),
-					icon: "user-check",
-					onclick: () => show_names(),
-				})
+				$(`<div class="flex flex-wrap gap-2"></div>`).append(
+					count("new") && frappe.model.can_create("Data Import")
+						? frappe.ui.button({
+								label: is_customer ? __("Import customers") : __("Import suppliers"),
+								icon: "import",
+								variant: "subtle",
+								onclick: () => {
+									if (!dialog.get_values()) return;
+									save().then(() => {
+										dialog.hide();
+										open_party_import(frm, party_type, () =>
+											show_opening_invoices(frm, party_type)
+										);
+									});
+								},
+						  })
+						: [],
+					frappe.ui.button({
+						label: __("Review names"),
+						icon: "user-check",
+						onclick: () => show_names(),
+					})
+				)
 			)
 			.appendTo($review);
 	};
@@ -3113,14 +4011,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		const state = get_name_state(all, kind_of);
 		$review.empty();
 		$sheet_buttons.toggle(!empty);
+		$post_to.toggle(!empty);
 		grid.wrapper.closest(".frappe-control").toggle(!empty);
 		dialog.get_primary_btn().prop("disabled", empty);
 		dialog.get_secondary_btn().toggle(!empty);
+		// shown with the table, rows or not, so the table doesn't move down on the first pick
 		$stats
 			.empty()
-			.toggle(!!state.names.length)
-			.append(state.names.length ? make_opening_invoice_stats(frm, party_type, state, currency) : []);
+			.toggle(!empty)
+			.append(empty ? [] : make_opening_invoice_stats(frm, party_type, state, currency));
 		$review.append(make_skipped_box());
+		show_advances(all.filter((row) => flt(row.outstanding_amount) < 0).length);
 		if (empty) return show_empty();
 		if (posting) return show_posting();
 		// rows posting turned down for a reason of their own, not their name
@@ -3151,7 +4052,122 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 					.addClass("mb-3")
 			);
 		}
+		$review.append(make_waiting_alerts(all));
 		if (state.review.length) make_review_box(state);
+	};
+	// rows that stay drafts whatever the names say: a disabled customer's, or in another currency
+	const make_waiting_alerts = (all) => {
+		const alerts = [];
+		const hand = all.filter(is_hand_posted);
+		if (hand.length) {
+			alerts.push({
+				theme: "yellow",
+				title: is_customer
+					? hand.length === 1
+						? __("1 draft row looks already posted by hand")
+						: __("{0} draft rows look already posted by hand", [hand.length])
+					: hand.length === 1
+					? __("1 draft bill looks already posted by hand")
+					: __("{0} draft bills look already posted by hand", [hand.length]),
+				description: [
+					hand
+						.map((row) =>
+							[row.party, row.invoice_number, format_currency(row.outstanding_amount, currency)]
+								.filter(Boolean)
+								.join(" · ")
+						)
+						.join("; "),
+					__(
+						"An opening invoice made outside Company Setup has the same party and number or amount. They are not posted again or counted twice."
+					),
+				].join(". "),
+				buttons: [
+					{
+						label: __("Remove them"),
+						onclick: () =>
+							frappe.confirm(
+								hand.length === 1
+									? __("Remove this draft row? The invoice made by hand stays as it is.")
+									: __(
+											"Remove these {0} draft rows? The invoices made by hand stay as they are.",
+											[hand.length]
+									  ),
+								() =>
+									save()
+										.then(() =>
+											call_method(frm, "remove_hand_posted", {
+												party_type: party_type,
+												rows: hand.map((row) => ({
+													party: row.party,
+													invoice_number: row.invoice_number,
+													amount: row.outstanding_amount,
+												})),
+											})
+										)
+										.then(() => reload_fresh(frm))
+										.then(() => {
+											dialog.hide();
+											show_opening_invoices(frm, party_type);
+										})
+							),
+					},
+				],
+			});
+		}
+		const by_currency = {};
+		for (const row of all.filter((row) => kind_of(row) === "other_currency")) {
+			(by_currency[other_currency[row.party]] ||= []).push(row);
+		}
+		for (const [code, list] of Object.entries(by_currency)) {
+			alerts.push({
+				theme: "red",
+				title: is_customer
+					? list.length === 1
+						? __("1 invoice is in {0}.", [code])
+						: __("{0} invoices are in {1}.", [list.length, code])
+					: list.length === 1
+					? __("1 bill is in {0}.", [code])
+					: __("{0} bills are in {1}.", [list.length, code]),
+				description: is_customer
+					? __(
+							"Foreign-currency invoices can't be posted yet; leave them out or post them by hand. They stay as drafts."
+					  )
+					: __(
+							"Foreign-currency bills can't be posted yet; leave them out or post them by hand. They stay as drafts."
+					  ),
+			});
+		}
+		const off = [...new Set(all.filter((row) => kind_of(row) === "disabled").map((row) => row.party))];
+		if (off.length) {
+			alerts.push({
+				theme: "red",
+				title: is_customer
+					? __("Disabled customers: {0}", [off.join(", ")])
+					: __("Disabled suppliers: {0}", [off.join(", ")]),
+				description: is_customer
+					? __(
+							"Their invoices stay as drafts. Post them anyway, or pick another customer in Review names."
+					  )
+					: __(
+							"Their bills stay as drafts. Post them anyway, or pick another supplier in Review names."
+					  ),
+				buttons: [
+					{
+						label: __("Post them anyway"),
+						onclick: () => {
+							// enabled only while posting, disabled again after
+							off.forEach((name) => {
+								disabled.delete(name);
+								post_disabled.add(name);
+							});
+							grid.refresh();
+							refresh_state();
+						},
+					},
+				],
+			});
+		}
+		return alerts.length ? make_alerts(alerts).addClass("mb-3") : [];
 	};
 	const set_rows_party = (name, values) => {
 		const rows = (dialog.get_value("invoices") || []).filter((row) => row.party_name === name);
@@ -3182,37 +4198,6 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			refresh_state();
 		});
 	};
-	// an account belongs to the customer or supplier: one row's change is all its rows', with Undo
-	const set_party_account = (row) => {
-		const all = (dialog.get_value("invoices") || []).filter((other) => other.party === row.party);
-		const previous = party_accounts[row.party];
-		if (all.every((other) => other.account === row.account)) return;
-		all.forEach((other) => (other.account = row.account));
-		party_accounts[row.party] = row.account;
-		grid.refresh();
-		frappe.show_alert(
-			{
-				message:
-					frappe.utils.escape_html(
-						all.length === 1
-							? __("{0} now uses {1}.", [row.party, row.account])
-							: is_customer
-							? __("All {0} invoices of {1} now use {2}.", [all.length, row.party, row.account])
-							: __("All {0} bills of {1} now use {2}.", [all.length, row.party, row.account])
-					) + ` <a class="underline" data-action="undo">${__("Undo")}</a>`,
-				indicator: "green",
-			},
-			10,
-			{
-				undo: () => {
-					all.forEach((other) => (other.account = previous));
-					party_accounts[row.party] = previous;
-					grid.refresh();
-				},
-			}
-		);
-	};
-
 	// The names on the sheet are a view of this window, with a way back to the invoices
 	const $names = dialog.get_field("names_view").$wrapper.addClass("company-setup-names");
 	let names_filter = "review";
@@ -3390,6 +4375,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		});
 		names_group.make();
 		const names_grid = names_group.fields_dict.names.grid;
+		fix_delete_all_rows(names_grid);
 		// without a default group in the settings, the ones created here get the group picked here
 		const default_group = frm.doc.__onload?.default_groups?.[party_type];
 		const $group = $(`<div class="mt-3 max-w-sm hide"></div>`).appendTo($names);
@@ -3459,12 +4445,18 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 				set_rows_party(
 					name.name_on_sheet,
 					action === "link"
-						? { party: name.party, create_party: 0, account: null }
+						? {
+								party: name.party,
+								create_party: 0,
+								account: own_accounts[name.party] || sheet_account,
+								account_by_hand: 0,
+						  }
 						: {
 								party: null,
 								create_party: 1,
 								party_group: group_control.get_value() || null,
-								account: null,
+								account: sheet_account,
+								account_by_hand: 0,
 						  }
 				);
 				confirmed.add(name.name_on_sheet);
@@ -3475,31 +4467,14 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			const open = (dialog.get_value("invoices") || []).some((row) =>
 				OPEN_KINDS.includes(kind_of(row))
 			);
-			frappe.show_alert(
-				{
-					message:
-						frappe.utils.escape_html(
-							done === 1 ? __("1 name confirmed.") : __("{0} names confirmed.", [done])
-						) + ` <a class="underline" data-action="undo">${__("Undo")}</a>`,
-					indicator: "green",
-				},
-				10,
-				{
-					undo: () => {
-						before.forEach((saved) =>
-							Object.assign(saved.row, {
-								party: saved.party,
-								create_party: saved.create_party,
-								party_group: saved.party_group,
-								account: saved.account,
-							})
-						);
-						confirmed.clear();
-						grid.refresh();
-						refresh_state();
-					},
-				}
-			);
+			frappe.ui.toast({
+				type: "success",
+				message:
+					frappe.utils.escape_html(
+						done === 1 ? __("1 name confirmed.") : __("{0} names confirmed.", [done])
+					) + ` <a class="underline" data-action="undo">${__("Undo")}</a>`,
+				duration: 10000,
+			});
 			if (open) {
 				render_names();
 				return;
@@ -3539,7 +4514,9 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		save().then(() =>
 			post_opening_invoices(frm, party_type, {
 				rows: values.invoices || [],
-				names: names,
+				names: { ...names, disabled: [...disabled] },
+				disabled_parties: [...post_disabled],
+				post_to: sheet_account,
 				before_post: () => dialog.hide(),
 			})
 		);
@@ -3559,6 +4536,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 }
 
 function make_opening_invoice_stats(frm, party_type, state, currency) {
+	const hand = state.names.filter((name) => name.kind === "hand_posted").length;
 	const is_customer = party_type === "Customer";
 	const total = state.invoices.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
 	const day_before =
@@ -3571,30 +4549,39 @@ function make_opening_invoice_stats(frm, party_type, state, currency) {
 			value: format_currency(total, currency),
 			caption: state.advance
 				? is_customer
-					? __("Less {0} customers paid in advance", [format_currency(state.advance, currency)])
-					: __("Less {0} paid to suppliers in advance", [format_currency(state.advance, currency)])
+					? __("Less {0} in credits", [format_currency(state.advance, currency)])
+					: __("Less {0} in debits", [format_currency(state.advance, currency)])
 				: day_before && __("On {0}", [day_before]),
 		}),
 		frappe.ui.stat_card({
 			label: is_customer ? __("Invoices") : __("Bills"),
 			value: format_number(state.invoices.length, null, 0),
-			caption:
-				count === 1
-					? __("From {0}", [state.names[0].name_on_sheet])
-					: is_customer
-					? count === 1
-						? __("From 1 customer")
-						: __("From {0} customers", [format_number(count, null, 0)])
-					: count === 1
-					? __("From 1 supplier")
-					: __("From {0} suppliers", [format_number(count, null, 0)]),
+			caption: !count
+				? null
+				: count === 1
+				? __("From {0}", [state.names[0].name_on_sheet])
+				: is_customer
+				? count === 1
+					? __("From 1 customer")
+					: __("From {0} customers", [format_number(count, null, 0)])
+				: count === 1
+				? __("From 1 supplier")
+				: __("From {0} suppliers", [format_number(count, null, 0)]),
 		}),
 		frappe.ui.stat_card({
 			label: is_customer ? __("Customers") : __("Suppliers"),
-			value: state.review.length
+			value: !count
+				? format_number(0, null, 0)
+				: state.ready.length < count
 				? __("{0} of {1} ready", [state.ready.length, count])
 				: __("All {0} ready", [count]),
-			caption: state.review.length ? __("{0} to review", [state.review.length]) : __("Ready to post"),
+			caption: !count
+				? null
+				: state.review.length
+				? __("{0} to review", [state.review.length])
+				: hand
+				? __("{0} posted by hand", [hand])
+				: __("Ready to post"),
 		}),
 	];
 }
@@ -3603,30 +4590,34 @@ function upload_opening_invoices(frm, party_type, dialog) {
 	const drafts = (dialog.fields_dict.invoices.df.data || []).filter(
 		(row) => row.party_name || flt(row.outstanding_amount)
 	).length;
-	const choose = () =>
-		new frappe.ui.FileUploader({
-			restrictions: { allowed_file_types: [".xlsx", ".csv"] },
-			on_success: (file) =>
-				call_method(frm, "import_opening_invoices", {
-					party_type: party_type,
-					file_url: file.file_url,
-				}).then((r) => {
-					dialog.hide();
-					frm.reload_doc().then(() => show_opening_invoices(frm, party_type, r.message));
-				}),
-		});
-	if (!drafts) return choose();
-	frappe.confirm(
-		__(
-			"The sheet replaces the {0} invoices in this table, unsaved changes included. Posted invoices stay as they are. Continue?",
-			[drafts]
-		),
-		choose
+	upload_sheet(
+		frm,
+		"import_opening_invoices",
+		{ party_type: party_type },
+		{
+			replaces:
+				drafts &&
+				(party_type === "Customer"
+					? __(
+							"The sheet replaces the {0} in this table, unsaved changes included. Posted invoices stay as they are. Continue?",
+							[count_invoices(drafts, party_type)]
+					  )
+					: __(
+							"The sheet replaces the {0} in this table, unsaved changes included. Posted bills stay as they are. Continue?",
+							[count_invoices(drafts, party_type)]
+					  )),
+			dialog: dialog,
+			after: (result) => show_opening_invoices(frm, party_type, result),
+		}
 	);
 }
 
 // Ask before posting, saying what is posted and what stays a draft, then post and say how it went
-function post_opening_invoices(frm, party_type, { rows, names = {}, before_post }) {
+function post_opening_invoices(
+	frm,
+	party_type,
+	{ rows, names = {}, disabled_parties = [], post_to = null, before_post }
+) {
 	const is_customer = party_type === "Customer";
 	const currency = erpnext.get_currency(frm.doc.company);
 	const disabled = new Set(names.disabled || []);
@@ -3637,8 +4628,11 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 			currency
 		);
 	const named = rows.filter((row) => row.status !== "Created" && (row.party_name || row.party));
+	const is_hand_posted = make_hand_posted_test(names);
 	const why_waiting = (row) =>
-		!row.party && !row.create_party
+		is_hand_posted(row)
+			? "hand_posted"
+			: !row.party && !row.create_party
 			? "unconfirmed"
 			: disabled.has(row.party)
 			? "disabled"
@@ -3654,7 +4648,15 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 	);
 	if (!posting.length) {
 		frappe.msgprint(
-			is_customer
+			named.every((row) => why_waiting(row) === "hand_posted")
+				? is_customer
+					? __(
+							"These invoices look already posted by hand. Remove them from the window, or add the ones still to post."
+					  )
+					: __(
+							"These bills look already posted by hand. Remove them from the window, or add the ones still to post."
+					  )
+				: is_customer
 				? __("None of these invoices can be posted yet: their customers need a look first.")
 				: __("None of these bills can be posted yet: their suppliers need a look first.")
 		);
@@ -3667,6 +4669,7 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 			? __("{0} and {1} more", [items.slice(0, 3).join(", "), items.length - 3])
 			: items.join(", ");
 	const reasons = [
+		["hand_posted", (parties) => __("{0} posted by hand", [list(parties)])],
 		["disabled", (parties) => __("{0} disabled", [list(parties)])],
 		["other_currency", (parties) => __("{0} in another currency", [list(parties)])],
 		[
@@ -3687,12 +4690,13 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 	const lines = [
 		invoices.length && [
 			__("To post"),
-			is_customer
-				? __("{0} invoices · {1}", [invoices.length, money(invoices)])
-				: __("{0} bills · {1}", [invoices.length, money(invoices)]),
+			__("{0} · {1}", [
+				count_invoices(invoices.length, is_customer ? "Customer" : "Supplier"),
+				money(invoices),
+			]),
 		],
 		advances.length && [
-			__("Advances"),
+			credit_rows_label(is_customer),
 			__("{0} · {1}", [
 				advances.length,
 				format_currency(
@@ -3716,7 +4720,7 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 			dates.kept && [
 				__("Dated as in your old books"),
 				__("{0} · {1}", [
-					dates.kept,
+					__("{0} of {1} rows", [dates.kept, dates.kept + dates.no_year + dates.undated]),
 					dates.first === dates.last
 						? user(dates.first)
 						: __("{0} to {1}", [user(dates.first), user(dates.last)]),
@@ -3748,8 +4752,11 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 		primary_action: () => {
 			confirm.hide();
 			before_post?.();
+			const use_post_to = fixes
+				.filter(({ check, clash }) => clash.kind === "own" && check.get_value())
+				.flatMap(({ clash }) => clash.rows);
 			const account_fixes = fixes
-				.filter(({ check }) => check.get_value())
+				.filter(({ check, clash }) => clash.kind !== "own" && check.get_value())
 				.map(({ clash }) => ({
 					kind: clash.kind,
 					account: clash.account,
@@ -3762,26 +4769,23 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 					party_type: party_type,
 					account_fixes: account_fixes,
 					keep_old_dates: keep_old_dates ? 1 : 0,
+					disabled_parties: disabled_parties,
+					use_post_to: use_post_to,
+					post_to: post_to,
 				},
-				{ freeze: true }
+				{ freeze: true, freeze_message: __("Posting…") }
 			).then((r) => {
 				if (r.message === "queued") {
 					frm.posting = { ...frm.posting, [party_type]: { done: 0, total: posting.length } };
-					// the reply carries the document without what the page is drawn from
-					frm.reload_doc();
-					frappe.show_alert({
-						message: is_customer
-							? __(
-									"Posting the invoices in the background. This page updates when they are done."
-							  )
-							: __(
-									"Posting the bills in the background. This page updates when they are done."
-							  ),
-						indicator: "blue",
-					});
-				} else {
-					frm.reload_doc().then(() => show_posting_result(frm, party_type, new_names));
 				}
+				after_run(
+					frm,
+					r.message,
+					is_customer
+						? __("Posting the invoices in the background. This page updates when they are done.")
+						: __("Posting the bills in the background. This page updates when they are done."),
+					() => show_posting_result(frm, party_type, new_names)
+				);
 			});
 		},
 		secondary_action_label: __("Cancel"),
@@ -3796,12 +4800,45 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 			)
 			.appendTo($summary);
 	}
+	const $ledgers = $(`<div></div>`).prependTo($summary);
 	const $clashes = $(`<div class="flex flex-col gap-3"></div>`).appendTo($summary);
 	const $note = $(`<div></div>`).appendTo($summary);
+	// a ledger these would put above its trial balance line while another is short: not posted
+	const check_ledgers = () => {
+		const overs = get_ledger_overs(
+			frm,
+			party_type,
+			fixes.filter(({ check }) => check.get_value()).map(({ clash }) => clash)
+		);
+		$ledgers.empty().append(
+			overs.length
+				? make_alerts(
+						overs.map((over) => ({
+							theme: "red",
+							title: __("{0} would be {1} over its trial balance line", [
+								short_account(frm, over.account),
+								format_currency(over.entered - flt(over.sheet), currency),
+							]),
+							description: [
+								__("{0} is {1} short.", [
+									over.short.map((line) => short_account(frm, line.account)).join(", "),
+									format_currency(
+										over.short.reduce((sum, line) => sum + line.sheet - line.entered, 0),
+										currency
+									),
+								]),
+								ledger_over_hint(frm, party_type, over.account, fixes),
+							].join(" "),
+						}))
+				  ).addClass("mb-3")
+				: []
+		);
+		confirm.get_primary_btn().prop("disabled", !!overs.length);
+	};
 	confirm.get_field("summary").$wrapper.append($summary);
 	Promise.all([
-		call_method(frm, "get_account_clashes", { party_type: party_type }),
-		call_method(frm, "get_posting_dates", { party_type: party_type }),
+		get_data(frm, "get_account_clashes", { party_type: party_type }),
+		get_data(frm, "get_posting_dates", { party_type: party_type }),
 	]).then(([r, dates]) => {
 		$note.append(dated(dates.message));
 		if (dates.message.no_year) {
@@ -3837,10 +4874,40 @@ function post_opening_invoices(frm, party_type, { rows, names = {}, before_post 
 					.get_primary_btn()
 					.text(moving ? __("Post {0}, move {1}", [posting.length, moving]) : __("Post to books"));
 			});
+			check.$input.on("change", check_ledgers);
+			fixes.push({ clash, check });
+			$clashes.addClass("mt-4").append($box);
+		}
+		// rows going to their customer's or supplier's own ledger, not the sheet's Post to
+		for (const clash of get_own_ledger_rows(frm, party_type, post_to)) {
+			const $box = $(`<div class="flex flex-col gap-1"></div>`).append(
+				$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(
+					clash.rows.length === 1
+						? __("1 row goes to {0}, its own ledger", [short_account(frm, clash.from_account)])
+						: __("{0} rows go to {1}, their own ledger", [
+								clash.rows.length,
+								short_account(frm, clash.from_account),
+						  ])
+				),
+				$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
+					__("{0} · not {1}, this sheet's Post to.", [
+						format_currency(clash.parties[0].amount, currency),
+						short_account(frm, post_to),
+					])
+				)
+			);
+			const check = frappe.ui.form.make_control({
+				df: { fieldtype: "Check", fieldname: "use_post_to", label: __("Use Post to for these") },
+				parent: $box,
+				render_input: true,
+			});
+			check.$wrapper.addClass("mb-0 mt-1");
+			check.$input.on("change", check_ledgers);
 			fixes.push({ clash, check });
 			$clashes.addClass("mt-4").append($box);
 		}
 		confirm.show();
+		check_ledgers();
 	});
 }
 
@@ -3851,8 +4918,11 @@ function make_account_clash(clash, party_type, currency) {
 	const count = clash.parties.reduce((sum, party) => sum + party.count, 0);
 	const invoices = count_invoices(count, party_type);
 	clash = { ...clash, account: clash.account_name, from_account: clash.from_account_name };
+	const sheet = clash.parties[0]?.sources[0];
 	const goes_to =
-		clash.kind === "posted"
+		clash.kind === "split"
+			? __("The rest of {0} is on {1}, where your trial balance is short.", [sheet, clash.account])
+			: clash.kind === "posted"
 			? clash.said
 				? __("This sheet says {0}.", [clash.account])
 				: __("Their saved account is {0}.", [clash.account])
@@ -3860,7 +4930,9 @@ function make_account_clash(clash, party_type, currency) {
 			? __("This sheet says {0}.", [clash.from_account])
 			: __("These would go to {0}.", [clash.from_account]);
 	const before =
-		clash.kind === "posted"
+		clash.kind === "split"
+			? __("These went to {0}, which is over its trial balance line.", [clash.from_account])
+			: clash.kind === "posted"
 			? __("Earlier sheets put them on {0}.", [clash.from_account])
 			: clash.earlier && clash.saved
 			? __("Their earlier invoices and saved account are on {0}.", [clash.account])
@@ -3869,8 +4941,16 @@ function make_account_clash(clash, party_type, currency) {
 			: __("Their earlier invoices are on {0}.", [clash.account]);
 	return $(`<div class="flex flex-col gap-2"></div>`).append(
 		$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(
-			clash.kind === "posted"
-				? __("{0} already posted are on another account", [invoices])
+			clash.kind === "split"
+				? count === 1
+					? __("{0} of {1} is on {2}", [invoices, sheet, clash.from_account])
+					: __("{0} of {1} are on {2}", [invoices, sheet, clash.from_account])
+				: clash.kind === "posted"
+				? count === 1
+					? __("{0} already posted is on another account", [invoices])
+					: __("{0} already posted are on another account", [invoices])
+				: count === 1
+				? __("{0} in this sheet goes to a different account than before", [invoices])
 				: __("{0} in this sheet go to a different account than before", [invoices])
 		),
 		$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(goes_to + " " + before),
@@ -3886,7 +4966,7 @@ function make_account_clash(clash, party_type, currency) {
 					$(`<span class="text-ink-gray-5 truncate"></span>`).text(
 						[
 							count_invoices(party.count, party_type),
-							clash.kind === "posted" &&
+							clash.kind !== "draft" &&
 								party.sources.map((source) => source || __("Typed in")).join(", "),
 						]
 							.filter(Boolean)
@@ -3982,6 +5062,100 @@ function make_old_dates_choice(dates, party_type, currency, day_before, on_chang
 	);
 }
 
+// What to do about a ledger going over its line: the tick below that moves rows off it, else the rows
+// picked on it by hand, else the sheet's Post to
+function ledger_over_hint(frm, party_type, account, fixes) {
+	const tick = fixes.find(({ clash }) => clash.from_account === account && clash.kind !== "posted");
+	if (tick?.clash.kind === "split") return __("Tick the move below for the earlier invoices on it.");
+	if (tick?.clash.kind === "own") return __('Tick "Use Post to for these" below.');
+	if (tick?.clash.kind === "draft") {
+		return __('Tick "{0}" below.', [clash_fix_label(tick.clash, party_type)]);
+	}
+	const by_hand = (frm.doc[PARTY[party_type].table] || []).filter(
+		(row) => row.status !== "Created" && row.account_by_hand && row.account === account
+	);
+	if (by_hand.length) {
+		return by_hand.length === 1
+			? __("1 row was set to {0} by hand: {1}. Change its account back in the window.", [
+					short_account(frm, account),
+					[by_hand[0].party || by_hand[0].party_name, by_hand[0].invoice_number]
+						.filter(Boolean)
+						.join(" · "),
+			  ])
+			: __("{0} rows were set to {1} by hand. Change their account back in the window.", [
+					by_hand.length,
+					short_account(frm, account),
+			  ]);
+	}
+	return __("Go back and pick the ledger this sheet is for in Post to.");
+}
+
+// The draft rows going to their customer's or supplier's own ledger rather than the sheet's Post to,
+// by ledger, as moves the confirm can tick
+function get_own_ledger_rows(frm, party_type, post_to) {
+	if (!post_to) return [];
+	const by_account = {};
+	for (const row of frm.doc[PARTY[party_type].table] || []) {
+		if (row.status === "Created" || row.account_by_hand || !row.account || row.account === post_to)
+			continue;
+		(by_account[row.account] ||= []).push(row);
+	}
+	return Object.entries(by_account).map(([account, list]) => ({
+		kind: "own",
+		from_account: account,
+		account: post_to,
+		rows: list.map((row) => row.name),
+		parties: [
+			{
+				amount: list.reduce((sum, row) => sum + flt(row.outstanding_amount), 0),
+				count: list.length,
+			},
+		],
+	}));
+}
+
+// The ledgers the drafts would put above their trial balance line while another is short, as the
+// server checks it, with the account fixes ticked moving their amounts
+function get_ledger_overs(frm, party_type, ticked = []) {
+	const match = frm.doc.__onload?.sheet_match?.[party_type];
+	if (!match?.by_account) return [];
+	const lines = {};
+	for (const line of match.lines) lines[line.account] = { ...line };
+	const line_of = (account) => (lines[account] ||= { account: account, sheet: null, entered: 0, draft: 0 });
+	for (const clash of ticked) {
+		const amount = clash.parties.reduce((sum, party) => sum + flt(party.amount), 0);
+		const from = line_of(clash.from_account);
+		const to = line_of(clash.account);
+		from.entered -= amount;
+		if (clash.kind === "draft" || clash.kind === "own") from.draft -= amount;
+		to.entered += amount;
+		to.draft += amount;
+	}
+	const all = Object.values(lines);
+	const short = all.filter((line) => line.sheet !== null && line.sheet - line.entered >= 1);
+	if (!short.length) return [];
+	return all
+		.filter((line) => Math.abs(flt(line.draft)) >= 0.005 && line.entered - flt(line.sheet) >= 1)
+		.map((line) => ({ ...line, short: short }));
+}
+
+// a minus row is an advance, or a credit the party is owed back, worded as the country says it
+function credit_rows_label(is_customer) {
+	if (is_customer) {
+		return says_check ? __("Credit memos and advances") : __("Credit notes and advances");
+	}
+	return says_check ? __("Vendor credits and advances") : __("Debit notes and advances");
+}
+
+// Whether a draft row is one an opening invoice made by hand stands for, as the server found it
+function make_hand_posted_test(names) {
+	const key = (party, number, amount) => [party || "", number || "", flt(amount, 2)].join("\u0001");
+	const keys = new Set(
+		(names.hand_posted || []).map((row) => key(row.party, row.invoice_number, row.amount))
+	);
+	return (row) => keys.has(key(row.party, row.invoice_number, row.outstanding_amount));
+}
+
 function count_invoices(count, party_type) {
 	if (party_type === "Customer") {
 		return count === 1 ? __("1 invoice") : __("{0} invoices", [count]);
@@ -3989,18 +5163,34 @@ function count_invoices(count, party_type) {
 	return count === 1 ? __("1 bill") : __("{0} bills", [count]);
 }
 
+// Like "98 invoices and 2 advances": count is every row, advances among them
+function count_entries(count, advances, party_type) {
+	const parts = [
+		count - advances && count_invoices(count - advances, party_type),
+		advances && (advances === 1 ? __("1 advance") : __("{0} advances", [advances])),
+	].filter(Boolean);
+	return parts.length === 2 ? __("{0} and {1}", parts) : parts[0] || count_invoices(0, party_type);
+}
+
 function clash_fix_label(clash, party_type) {
 	const count = clash.parties.reduce((sum, party) => sum + party.count, 0);
 	const invoices = count_invoices(count, party_type);
-	return clash.kind === "posted"
+	return clash.kind !== "draft"
 		? __("Also move these {0} to {1}", [invoices, clash.account_name])
 		: __("Post these {0} on {1} instead", [invoices, clash.account_name]);
 }
 
 function clash_fix_note(clash, party_type, currency) {
 	const short = __("Your trial balance is {0} short there.", [format_currency(clash.short, currency)]);
+	if (clash.kind === "split") {
+		return (
+			__("They're taken out and posted again on {0} under the same numbers.", [clash.account_name]) +
+			" " +
+			short
+		);
+	}
 	return clash.kind === "posted"
-		? __("They're cancelled and posted again on {0}.", [clash.account_name]) +
+		? __("They're taken out and posted again on {0} under the same numbers.", [clash.account_name]) +
 				" " +
 				short +
 				" " +
@@ -4016,13 +5206,13 @@ function show_posting_result(frm, party_type, new_names = []) {
 	const failed = rows.filter((row) => row.status === "Failed");
 	const added = new_names.filter((name) => rows.some((row) => row.party_name === name && row.party));
 	if (!failed.length) {
-		frappe.show_alert({
+		frappe.ui.toast({
+			type: "success",
 			message: added.length
 				? __("Posted. Added {0}.", [added.join(", ")])
 				: party_type === "Customer"
 				? __("Invoices posted.")
 				: __("Bills posted."),
-			indicator: "green",
 		});
 		return;
 	}
@@ -4074,16 +5264,56 @@ function import_buttons(frm, doctype, step) {
 	];
 }
 
-function open_party_import(frm, doctype) {
-	if (!frappe.model.can_create("Data Import")) return;
-	frappe.require("data_import_tools.bundle.js", () =>
-		frappe.data_import.open_data_import_dialog({
-			reference_doctype: doctype,
-			import_type: "Insert New Records",
-			// the counts on the tasks change after an import
-			on_close: () => frm.reload_doc(),
-		})
+// items with batch or serial numbers import only once Stock Settings tracks them: asked before
+// the import opens, while they are off
+function ask_serial_and_batch(frm) {
+	return new Promise((resolve) =>
+		frappe.confirm(
+			__("Do any of your items use batch or serial numbers?"),
+			() =>
+				call_method(frm, "turn_on_serial_and_batch")
+					.then(() => reload_fresh(frm))
+					.then(resolve),
+			resolve
+		)
 	);
+}
+
+// customers, suppliers and items come as other software exports them: the sheet is read here first,
+// so the title rows above its headings are left out before Data Import takes the first row
+const TITLED_IMPORTS = ["Customer", "Supplier", "Item"];
+
+function open_party_import(frm, doctype, after = null, asked = false) {
+	if (!frappe.model.can_create("Data Import")) return;
+	if (doctype === "Item" && !asked && frm.doc.__onload?.serial_batch_off) {
+		return ask_serial_and_batch(frm).then(() => open_party_import(frm, doctype, after, true));
+	}
+	const open = (data_import) =>
+		frappe.require("data_import_tools.bundle.js", () => {
+			// a BOM is used only once submitted; a BOM's sub-assemblies need theirs first
+			if (doctype === "BOM") frappe.route_options = { submit_after_import: 1 };
+			frappe.data_import.open_data_import_dialog({
+				data_import: data_import,
+				reference_doctype: doctype,
+				import_type: "Insert New Records",
+				title: doctype === "BOM" ? __("Import BOMs: sub-assemblies first") : null,
+				// the counts on the tasks change after an import
+				on_close: () => reload_fresh(frm).then(() => after?.()),
+			});
+		});
+	if (!TITLED_IMPORTS.includes(doctype)) return open(null);
+	let picked = false;
+	const uploader = new frappe.ui.FileUploader({
+		restrictions: { allowed_file_types: [".xlsx", ".csv"] },
+		on_success: (file) => {
+			picked = true;
+			call_method(frm, "prepare_import", { doctype: doctype, file_url: file.file_url }).then((r) =>
+				open(r.message)
+			);
+		},
+	});
+	// closed with no file: back to where the import was opened from
+	uploader.dialog?.$wrapper.on("hidden.bs.modal", () => !picked && after?.());
 }
 
 // The chart to edit; until a chart is chosen, the one made during setup is confirmed from here
@@ -4099,7 +5329,7 @@ function show_chart(frm) {
 			chosen
 				? dialog.hide()
 				: call_method(frm, "use_existing_chart")
-						.then(() => frm.reload_doc())
+						.then(() => reload_fresh(frm))
 						.then(() => dialog.hide()),
 		secondary_action_label: __("Open full page"),
 		secondary_action: () => {
@@ -4322,6 +5552,8 @@ function show_chart_import(frm) {
 	fill_where(frm, dialog, "chart_of_accounts");
 
 	let last_preview;
+	// what each group of a Busy list that Busy doesn't ship holds, as the user says
+	const group_kinds = {};
 	const stepper = new frappe.ui.Stepper({
 		steps: [{ label: __("Upload") }, { label: __("Review") }],
 		is_locked: (index) => index === 1 && !last_preview,
@@ -4381,46 +5613,98 @@ function show_chart_import(frm) {
 		$new_chart.empty();
 		show_step(0);
 		if (!file_url) return;
-		call_method(frm, "preview_chart", { file_url: file_url }).then((r) => {
+		call_method(frm, "preview_chart", { file_url: file_url, group_kinds: group_kinds }).then((r) => {
 			// another file was picked meanwhile
 			if (dialog.get_value("file") !== file_url) return;
 			last_preview = r.message;
 			render_import_preview(frm, $review, $new_chart, r.message, company, file_url, () => {
 				dialog.set_value("file", "");
 			});
+			$review.prepend(
+				make_group_kinds(r.message.unknown_groups, group_kinds, (group, kind) => {
+					if (!kind || kind === group_kinds[group]) return;
+					group_kinds[group] = kind;
+					preview();
+				})
+			);
 			show_step(1);
 		});
 	};
 	const replace = () =>
-		frappe.confirm(
+		frappe.warn(
+			__("Replace the chart?"),
 			__(
 				"Delete the {0} accounts and tax templates of {1} and make the chart from your sheet? This can't be undone.",
-				[last_preview?.current_accounts, company]
+				[last_preview?.current_accounts, frappe.utils.escape_html(company)]
 			),
 			() =>
 				call_method(
 					frm,
 					"import_chart",
-					{ file_url: dialog.get_value("file") },
+					{ file_url: dialog.get_value("file"), group_kinds: group_kinds },
 					{ freeze: true, freeze_message: __("Importing the chart...") }
 				).then((r) => {
 					dialog.hide();
-					frm.reload_doc();
+					reload_fresh(frm);
 					const added = r.message?.added_accounts || [];
-					frappe.show_alert(
-						{
-							message: added.length
-								? __("Chart imported. Added accounts ERPNext needs: {0}", [added.join(", ")])
-								: __("Chart imported"),
-							indicator: "green",
-						},
-						added.length ? 10 : 5
-					);
-				})
+					frappe.ui.toast({
+						type: "success",
+						message: added.length
+							? __("Chart imported. Added accounts ERPNext needs: {0}", [added.join(", ")])
+							: __("Chart imported"),
+						duration: (added.length ? 10 : 5) * 1000,
+					});
+				}),
+			__("Replace chart")
 		);
 
 	dialog.show();
 	show_step(0);
+}
+
+// For each group of a Busy list that Busy doesn't ship: does it hold customers, suppliers or
+// accounts of the company's own; customers and suppliers become one ledger of the group's name
+function make_group_kinds(groups, kinds, on_change) {
+	if (!groups?.length) return [];
+	return $(`<div class="flex flex-col gap-2 mb-3"></div>`).append(
+		frappe.ui.alert({
+			theme: groups.every((group) => kinds[group]) ? "blue" : "yellow",
+			title: __("Busy doesn't say what these groups hold"),
+			description: __(
+				"A group of customers, like insurers under Sundry Debtors, becomes one receivable account; their invoices come in under Selling."
+			),
+		}),
+		groups.map((group) => {
+			const [$select] = make_kind_select(kinds[group], (kind) => on_change(group, kind));
+			return $(`<div class="flex items-center justify-between gap-3"></div>`).append(
+				$(`<span class="text-base text-ink-gray-8"></span>`).text(group),
+				$select
+			);
+		})
+	);
+}
+
+function make_kind_select(value, onchange) {
+	const $parent = $(`<div class="shrink-0"></div>`);
+	const control = frappe.ui.form.make_control({
+		df: {
+			fieldtype: "Select",
+			fieldname: "kind",
+			options: [
+				{ value: "", label: __("Pick one") },
+				{ value: "Customers", label: __("Customers") },
+				{ value: "Suppliers", label: __("Suppliers") },
+				{ value: "Accounts", label: __("Our own accounts") },
+			],
+			change: () => onchange(control.get_value()),
+		},
+		parent: $parent,
+		only_input: true,
+		render_input: true,
+	});
+	control.set_value(value || "");
+	$parent.find(".form-group").addClass("mb-0");
+	return [$parent, control];
 }
 
 // What the sheet holds and what replacing the chart does; the new chart itself folds away
@@ -4444,7 +5728,7 @@ function render_import_preview(frm, $preview, $tree, data, company, file_url, re
 	const left_out_total =
 		Math.abs(left_out.Receivable || 0) + Math.abs(left_out.Payable || 0) + Math.abs(left_out.Stock || 0);
 	const cards = [
-		frappe.ui.stat_card({
+		{
 			label: __("Accounts"),
 			value: format_number(data.accounts.length, null, 0),
 			caption: data.added_accounts?.length
@@ -4453,8 +5737,8 @@ function render_import_preview(frm, $preview, $tree, data, company, file_url, re
 						data.added_accounts.join(", "),
 				  ])
 				: __("Replaces your {0}", [data.current_accounts]),
-		}),
-		frappe.ui.stat_card({
+		},
+		{
 			label: __("Opening balances"),
 			value: format_number(data.balances || 0, null, 0),
 			caption: data.balances
@@ -4468,28 +5752,37 @@ function render_import_preview(frm, $preview, $tree, data, company, file_url, re
 					? __("Your 1 draft stays")
 					: __("Your {0} drafts stay", [data.draft_balances])
 				: __("None on the sheet"),
-		}),
+		},
 	];
 	if (left_out_total) {
-		cards.push(
-			frappe.ui.stat_card({
-				label: __("Left out"),
-				value: format_currency(left_out_total, currency),
-				caption: left_out.Stock
-					? __("Customers, suppliers and stock come in their own way")
-					: __("Customers and suppliers come in as invoices and bills"),
-			})
-		);
+		cards.push({
+			label: __("Left out"),
+			value: format_currency(left_out_total, currency),
+			caption: left_out.Stock
+				? __("Customers, suppliers and stock come in their own way")
+				: __("Customers and suppliers come in as invoices and bills"),
+		});
 	}
-	$(`<div class="es-stat-card-grid"></div>`).append(cards).appendTo($body);
+	frappe.ui.stat_cards({ items: cards }).appendTo($body);
 
 	$body.append(
 		frappe.ui.alert({
 			theme: "yellow",
 			title: __("Replaces your {0} accounts and tax templates", [data.current_accounts]),
-			description: __("Your sheet becomes the chart. The company's default accounts are set again."),
+			description: __(
+				"Your sheet becomes the chart. The company's default accounts are set again. Add your tax templates in Taxes after the import."
+			),
 		})
 	);
+	if (data.renamed?.length) {
+		$(`<div class="text-p-sm text-ink-gray-5"></div>`)
+			.text(
+				__("Names used under more than one parent get the parent's name: {0}", [
+					data.renamed.join(", "),
+				])
+			)
+			.appendTo($body);
+	}
 	const left_out_note = left_out_text(frm, left_out);
 	if (left_out_note) {
 		$(`<div class="text-p-sm text-ink-gray-5"></div>`).text(left_out_note).appendTo($body);
@@ -4564,7 +5857,7 @@ function make_company_card(frm) {
 			<span class="company-edit flex items-center gap-1 shrink-0"></span>
 		</div>
 		${frappe.ui.divider.html()}
-		<div class="company-lines grid gap-3" style="grid-template-columns: repeat(2, minmax(0, 1fr))"></div>
+		<div class="company-lines grid gap-3 company-setup-two-columns"></div>
 	</div>`);
 
 	$card.find(".company-logo").html(
@@ -4575,7 +5868,11 @@ function make_company_card(frm) {
 			shape: "square",
 		})
 	);
-	$card.find(".company-name").text(details.company_name || frm.doc.company);
+	$card.find(".company-name").append(
+		$(`<a class="text-ink-gray-8"></a>`)
+			.attr("href", frappe.utils.get_form_link("Company", frm.doc.company))
+			.text(details.company_name || frm.doc.company)
+	);
 	$card
 		.find(".company-meta")
 		.text([details.abbr, details.country, details.default_currency].filter(Boolean).join(" · "));
@@ -4583,7 +5880,8 @@ function make_company_card(frm) {
 		frappe.ui.button({
 			label: __("Edit"),
 			icon: "pencil",
-			onclick: () => edit_company_details(frm, details),
+			onclick: () =>
+				frappe.model.with_doctype("Company").then(() => edit_company_details(frm, details)),
 		})
 	);
 
@@ -4605,7 +5903,7 @@ function make_company_card(frm) {
 			.append(frappe.utils.icon(icon, "sm", "", "", "text-ink-gray-5 shrink-0", true))
 			.appendTo($lines);
 		// the address is the long one, so it takes the whole row
-		if (full_width) $line.css("grid-column", "1 / -1");
+		if (full_width) $line.addClass("company-setup-full-row");
 		$("<span class='truncate'></span>")
 			.addClass(value ? "text-ink-gray-7" : "text-ink-gray-4")
 			.text(value || __("{0} not set", [label]))
@@ -4632,6 +5930,7 @@ function edit_company_details(frm, details) {
 			{ fieldname: "state", fieldtype: "Data", label: __("State") },
 			{ fieldname: "pincode", fieldtype: "Data", label: __("Postal Code") },
 			{ fieldname: "country", fieldtype: "Link", options: "Country", label: __("Country") },
+			...get_module_fields(),
 			{ fieldtype: "Section Break", label: __("More"), collapsible: 1 },
 			{ fieldname: "date_of_incorporation", fieldtype: "Date", label: __("Date of Incorporation") },
 			{
@@ -4645,9 +5944,4885 @@ function edit_company_details(frm, details) {
 		primary_action: (values) =>
 			call_method(frm, "update_company_details", { values: values }).then(() => {
 				dialog.hide();
-				frm.reload_doc();
+				reload_fresh(frm);
 			}),
 	});
 	dialog.set_values(details);
 	dialog.show();
+}
+
+// The Company's Modules Used checks it has, as on its form: each child needs its parent ticked
+function get_module_fields() {
+	const parents = { manufacturing: "stock", subcontracting: "manufacturing" };
+	const check = (fieldname) =>
+		frappe.meta.has_field("Company", fieldname) && {
+			fieldname: fieldname,
+			fieldtype: "Check",
+			label: __(frappe.meta.get_label("Company", fieldname)),
+			depends_on: parents[fieldname] && `eval:doc.${parents[fieldname]}`,
+			onchange: function () {
+				const child = Object.keys(parents).find((name) => parents[name] === fieldname);
+				if (child && !this.get_value() && this.layout.get_value(child)) {
+					this.layout.set_value(child, 0);
+				}
+			},
+		};
+	const left = ["stock", "manufacturing", "subcontracting"].map(check).filter(Boolean);
+	const right = ["assets", "projects", "pos"].map(check).filter(Boolean);
+	if (!left.length && !right.length) return [];
+	return [
+		{ fieldtype: "Section Break", label: __("Modules Used") },
+		...left,
+		...(left.length && right.length ? [{ fieldtype: "Column Break" }] : []),
+		...right,
+	];
+}
+
+// the countries whose English says "check", as the server words it
+const CHECK_COUNTRIES = ["United States", "Canada"];
+let says_check = false;
+
+function cheque_words(text) {
+	return says_check ? text.replace(/cheque/g, "check").replace(/Cheque/g, "Check") : text;
+}
+
+function bank_menu(frm) {
+	const bank = frm.doc.__onload?.bank || {};
+	return [
+		(bank.cheques || bank.charges || bank.deposits || (frm.doc.undone_cheques || []).length) && {
+			label: cheque_words(__("Posted cheques")),
+			icon: "list",
+			onclick: () => show_posted_cheques(frm),
+		},
+		{ label: __("Download sheet"), icon: "download", onclick: () => download_cheques(frm) },
+	].filter(Boolean);
+}
+
+function download_cheques(frm, undone_from) {
+	open_url_post(
+		"/api/method/erpnext.setup.doctype.company_setup.bank_accounts.download_uncleared_cheques",
+		undone_from === undefined
+			? { company: frm.doc.company }
+			: { company: frm.doc.company, undone_from: undone_from }
+	);
+}
+
+// Like "11 cheques and 1 deposit", or "4 cheques, 1 card charge and 1 deposit"
+function count_cheques(cheques, deposits, charges = 0) {
+	const parts = [
+		cheques &&
+			(cheques === 1 ? cheque_words(__("1 cheque")) : cheque_words(__("{0} cheques", [cheques]))),
+		charges && (charges === 1 ? __("1 card charge") : __("{0} card charges", [charges])),
+		deposits && (deposits === 1 ? __("1 deposit") : __("{0} deposits", [deposits])),
+	].filter(Boolean);
+	return frappe.utils.comma_and(parts);
+}
+
+// What uncleared rows count as: a credit card's issued rows are charges, not cheques
+function count_cheque_rows(frm, rows) {
+	const cards = new Set(frm.doc.__onload?.bank?.card_ledgers || []);
+	const issued = rows.filter((row) => row.entry_type === "Issued");
+	return count_cheques(
+		issued.filter((row) => !cards.has(row.bank_account)).length,
+		rows.filter((row) => row.entry_type === "Deposited").length,
+		issued.filter((row) => cards.has(row.bank_account)).length
+	);
+}
+
+function count_rows(count) {
+	return count === 1 ? __("1 row") : __("{0} rows", [count]);
+}
+
+function short_account(frm, account) {
+	const abbr = frm.doc.__onload?.company_details?.abbr;
+	return abbr && account ? account.replace(new RegExp(` - ${abbr}$`), "") : account || "";
+}
+
+function show_cheques_posted(frm) {
+	const bank = frm.doc.__onload?.bank || {};
+	frappe.ui.toast({
+		type: "success",
+		message: __("{0} posted on {1}. Clear them from that date in Bank Clearance.", [
+			count_cheques(bank.cheques, bank.deposits, bank.charges),
+			frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1)),
+		]),
+		duration: 10000,
+	});
+}
+
+// Check your books: each bank against its line, stock by line, and the asset register
+function make_books_checks(frm, dialog) {
+	const onload = frm.doc.__onload || {};
+	const currency = erpnext.get_currency(frm.doc.company);
+	const money = (value) => format_currency(value, currency);
+	const rows = [];
+	const bank = onload.bank_match;
+	if (bank?.total) {
+		const matches = bank.matched === bank.total;
+		rows.push({
+			title: __("Bank"),
+			line:
+				bank.total === 1
+					? matches
+						? __("1 of 1 account matches its line")
+						: __("0 of 1 account matches its line")
+					: __("{0} of {1} accounts match their lines", [bank.matched, bank.total]),
+			badge: matches
+				? { label: __("Matches"), theme: "green" }
+				: { label: __("{0} off", [bank.total - bank.matched]), theme: "amber" },
+			open: !matches && (() => (show_tab(frm, "accounts_tab"), show_bank_accounts(frm))),
+		});
+	}
+	const stock = onload.stock_match;
+	if (stock?.line) {
+		rows.push({
+			title: __("Stock"),
+			line: [
+				stock.difference_posted
+					? __("Books {0} + difference {1}", [money(stock.books), money(stock.difference_posted)])
+					: __("Books {0}", [money(stock.books)]),
+				__("trial balance {0}", [money(stock.line)]),
+				!stock.matches &&
+					stock.lines_off?.length &&
+					__("off on {0}", [
+						stock.lines_off
+							.map((account) => short_account(frm, account) || __("Stock"))
+							.join(", "),
+					]),
+			]
+				.filter(Boolean)
+				.join(" · "),
+			badge: stock.matches
+				? { label: __("Matches"), theme: "green" }
+				: {
+						label: __("Off by {0}", [format_currency(Math.abs(stock.off), currency, 0)]),
+						theme: "amber",
+				  },
+			open: !stock.matches && (() => (show_tab(frm, "stock_tab"), show_opening_stock(frm))),
+		});
+	}
+	if (get_steps(frm).some((step) => step.name === "fixed_assets")) {
+		const assets = onload.asset_match;
+		const hand_after = assets?.hand_after;
+		rows.push({
+			title: __("Fixed assets"),
+			line: hand_after
+				? [HAND_AFTER_TEXT(), assets.hand_after_entries.map((entry) => entry.name).join(", ")].join(
+						" "
+				  )
+				: assets
+				? assets.matches
+					? __("Register and lines match, as on today · cost {0} · depreciation {1}", [
+							money(assets.cost),
+							money(assets.depreciation),
+					  ])
+					: __("Register {0} · lines {1}, as on today", [
+							money(assets.cost),
+							money(assets.books_cost),
+					  ])
+				: __("Not added yet"),
+			badge: !assets
+				? { label: __("Not added"), theme: "gray" }
+				: assets.matches && !hand_after
+				? { label: __("Matches"), theme: "green" }
+				: { label: __("Off"), theme: "amber" },
+			open:
+				!(assets && assets.matches && !hand_after) &&
+				(() => (show_tab(frm, "assets_tab"), show_fixed_assets(frm))),
+		});
+	}
+	if (!rows.length) return [];
+	return $(`<div class="flex flex-col border rounded-lg mb-3"></div>`).append(
+		rows.map((row, index) => {
+			const $row = $(`<div class="flex items-center gap-3 px-3 py-2.5"></div>`)
+				.toggleClass("border-t", index > 0)
+				.append(
+					$(`<div class="flex flex-col gap-0.5 grow min-w-0"></div>`).append(
+						$(`<span class="text-base text-ink-gray-8"></span>`).text(row.title),
+						$(`<span class="text-p-sm text-ink-gray-5"></span>`).text(row.line)
+					),
+					frappe.ui.badge(row.badge)
+				);
+			if (row.open) {
+				$row.addClass("company-setup-step cursor-pointer rounded-lg")
+					.attr({ role: "button", tabindex: 0 })
+					.append(
+						$(`<span class="shrink-0 text-ink-gray-5"></span>`).html(
+							frappe.utils.icon("chevron-right", "sm")
+						)
+					)
+					.on("click", () => {
+						dialog.hide();
+						row.open();
+					});
+			}
+			return $row;
+		})
+	);
+}
+
+// Bank accounts: the bank details of each bank ledger, then the uncleared cheques and deposits
+function show_bank_accounts(frm) {
+	Promise.all([
+		get_data(frm, "get_bank_accounts"),
+		frappe.db.get_list("Bank", { fields: ["name"], limit: 0 }),
+	]).then(([r, banks]) =>
+		new BankAccountsWindow(
+			frm,
+			r.message,
+			banks.map((bank) => bank.name)
+		).show()
+	);
+}
+
+class BankAccountsWindow {
+	constructor(frm, details, bank_names) {
+		this.frm = frm;
+		this.details = details;
+		this.known_banks = new Set(bank_names.map((name) => name.trim().toLowerCase()));
+		this.currency = erpnext.get_currency(frm.doc.company);
+		this.day = details.day_before ? frappe.datetime.str_to_user(details.day_before) : null;
+		this.accounts = details.rows.map((row) => ({
+			account: row.account,
+			bank: row.bank,
+			bank_account_no: row.bank_account_no,
+			branch_code: row.branch_code,
+			statement_balance: row.statement_balance,
+			is_default: row.is_default ? 1 : 0,
+			is_credit_card: row.is_credit_card ? 1 : 0,
+			account_currency: row.account_currency,
+			book: row.book,
+			line: row.line,
+			root_type: row.root_type,
+		}));
+		// no default yet: the only account that isn't overdrawn or owed is ticked, to change if need be
+		const in_credit = this.accounts.filter((row) => row.root_type === "Asset" && flt(row.book) >= 0);
+		if (!this.accounts.some((row) => row.is_default) && in_credit.length === 1) {
+			in_credit[0].is_default = 1;
+		}
+		this.make_dialog();
+	}
+
+	money(value) {
+		return format_currency(value, this.currency);
+	}
+
+	is_new_bank(bank) {
+		return Boolean(bank) && !this.known_banks.has(bank.trim().toLowerCase());
+	}
+
+	show() {
+		const status = this.frm.doc.__onload?.bank || {};
+		// bank details saved and cheques waiting: straight to them
+		const to_cheques =
+			this.details.has_uncleared_cheques === "Yes" &&
+			status.accounts &&
+			status.added === status.accounts &&
+			status.drafts;
+		this.dialog.show();
+		to_cheques ? this.show_cheques() : this.show_accounts();
+	}
+
+	make_dialog() {
+		const country = this.frm.doc.__onload?.company_details?.country;
+		const india = country === "India";
+		const refresh = () => this.refresh_accounts();
+		const refresh_cheques = () => this.refresh_cheques();
+		const company = this.frm.doc.company;
+		const win = this;
+		this.dialog = new frappe.ui.Dialog({
+			title: __("Bank accounts"),
+			size: "extra-large",
+			fields: [
+				{ fieldname: "accounts_head", fieldtype: "HTML" },
+				{
+					fieldname: "accounts",
+					fieldtype: "Table",
+					cannot_add_rows: 1,
+					cannot_delete_rows: 1,
+					in_place_edit: 1,
+					data: this.accounts,
+					fields: [
+						{
+							fieldname: "account",
+							fieldtype: "Link",
+							options: "Account",
+							label: __("Account"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 3,
+							formatter: (value) =>
+								value
+									? `<span class="block truncate" title="${frappe.utils.escape_html(
+											value
+									  )}">${frappe.utils.escape_html(short_account(this.frm, value))}</span>`
+									: "",
+						},
+						{
+							fieldname: "bank",
+							fieldtype: "Link",
+							options: "Bank",
+							label: __("Bank"),
+							in_list_view: 1,
+							columns: 2,
+							ignore_link_validation: 1,
+							formatter: (value) =>
+								value
+									? `<span class="flex items-center gap-2 min-w-0">
+										<span class="truncate">${frappe.utils.escape_html(value)}</span>
+										${
+											this.is_new_bank(value)
+												? `<span class="shrink-0">${frappe.ui.badge.html({
+														label: __("New"),
+														theme: "blue",
+												  })}</span>`
+												: ""
+										}
+									</span>`
+									: "",
+							onchange: refresh,
+						},
+						{
+							fieldname: "bank_account_no",
+							fieldtype: "Data",
+							label: __("Account number"),
+							in_list_view: 1,
+							columns: 2,
+							onchange: refresh,
+						},
+						{
+							fieldname: "branch_code",
+							fieldtype: "Data",
+							label: india
+								? __("IFSC")
+								: country === "United States"
+								? __("Routing number")
+								: __("Branch code"),
+							in_list_view: 1,
+							columns: 1,
+						},
+						{
+							fieldname: "statement_balance",
+							fieldtype: "Currency",
+							options: "account_currency",
+							// the date is on the cards above: the column is too narrow for it
+							label: __("Statement"),
+							in_list_view: 1,
+							columns: 1,
+							onchange: refresh,
+						},
+						{
+							fieldname: "is_default",
+							fieldtype: "Check",
+							label: __("Default"),
+							in_list_view: 1,
+							columns: 1,
+							onchange: function () {
+								win.set_default(this.doc);
+							},
+						},
+						{
+							fieldname: "is_credit_card",
+							fieldtype: "Check",
+							label: __("Credit card"),
+							description: cheque_words(
+								__("Its charges post as Credit Card Entries and aren't counted as cheques.")
+							),
+						},
+						{ fieldname: "account_currency", fieldtype: "Link", options: "Currency", hidden: 1 },
+					],
+				},
+				{
+					fieldname: "has_uncleared_cheques",
+					fieldtype: "Select",
+					label: this.day
+						? cheque_words(
+								__("Any cheques or deposits not cleared by the bank on {0}?", [this.day])
+						  )
+						: cheque_words(
+								__(
+									"Any cheques or deposits not cleared by the bank on the day before migration?"
+								)
+						  ),
+					options: [
+						{ value: "", label: "" },
+						{ value: "No", label: __("No") },
+						{ value: "Yes", label: __("Yes") },
+					],
+					default: this.details.has_uncleared_cheques || "",
+					change: refresh,
+				},
+				{ fieldname: "cheques_head", fieldtype: "HTML", hidden: 1 },
+				{
+					fieldname: "cheques",
+					fieldtype: "Table",
+					hidden: 1,
+					in_place_edit: 1,
+					data: [],
+					on_delete_rows: refresh_cheques,
+					fields: [
+						{
+							fieldname: "bank_account",
+							fieldtype: "Link",
+							options: "Account",
+							label: __("Bank account"),
+							in_list_view: 1,
+							columns: 2,
+							get_query: () => ({
+								filters: { company: company, account_type: "Bank", is_group: 0 },
+							}),
+							onchange: refresh_cheques,
+						},
+						{
+							fieldname: "entry_type",
+							fieldtype: "Select",
+							options: ["", "Issued", "Deposited"],
+							label: __("Issued/Deposited"),
+							in_list_view: 1,
+							columns: 1,
+							onchange: refresh_cheques,
+						},
+						{
+							fieldname: "reference_no",
+							fieldtype: "Data",
+							label: cheque_words(__("Cheque or reference no")),
+							in_list_view: 1,
+							columns: 2,
+							onchange: refresh_cheques,
+						},
+						{
+							fieldname: "reference_date",
+							fieldtype: "Date",
+							label: __("Date"),
+							in_list_view: 1,
+							columns: 1,
+							onchange: refresh_cheques,
+						},
+						{
+							fieldname: "party_name",
+							fieldtype: "Data",
+							label: __("Party"),
+							in_list_view: 1,
+							columns: 2,
+						},
+						{
+							fieldname: "amount",
+							fieldtype: "Currency",
+							label: __("Amount"),
+							in_list_view: 1,
+							columns: 2,
+							onchange: refresh_cheques,
+						},
+						{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+					],
+				},
+				{ fieldname: "cheques_notes", fieldtype: "HTML", hidden: 1 },
+				{ fieldname: "confirm", fieldtype: "HTML", hidden: 1 },
+				...where_to_find_fields(this.frm, "uncleared_cheques", {
+					has_data: (this.frm.doc.uncleared_cheques || []).length,
+					posted: false,
+				}),
+			],
+			primary_action_label: __("Save bank details"),
+			primary_action: () => this.save_accounts(),
+			secondary_action_label: __("Save draft"),
+			secondary_action: () => this.save_accounts(true),
+		});
+		fill_where(this.frm, this.dialog, "uncleared_cheques");
+		this.accounts_grid = this.dialog.fields_dict.accounts.grid;
+		fix_delete_all_rows(this.accounts_grid);
+		this.cheques_grid = this.dialog.fields_dict.cheques.grid;
+		fix_delete_all_rows(this.cheques_grid);
+		this.$back = $(`<div class="hide"></div>`)
+			.append(frappe.ui.button({ label: __("Back"), onclick: () => this.show_accounts() }))
+			.appendTo(this.dialog.custom_actions);
+	}
+
+	// one window, three views: the bank details, the uncleared cheques, and the confirm
+	set_view(view) {
+		const views = {
+			accounts: ["accounts_head", "accounts", "has_uncleared_cheques"],
+			cheques: ["cheques_head", "cheques", "cheques_notes", "where_section"],
+			confirm: ["confirm"],
+		};
+		for (const [name, fields] of Object.entries(views)) {
+			for (const field of fields) {
+				if (this.dialog.fields_dict[field]) {
+					this.dialog.set_df_property(field, "hidden", name === view ? 0 : 1);
+				}
+			}
+		}
+		this.$back.toggleClass("hide", view !== "cheques");
+		this.dialog.get_primary_btn().removeAttr("data-theme");
+	}
+
+	// one default bank: ticking one unticks the others
+	set_default(row) {
+		if (row?.is_default) {
+			for (const other of this.accounts) if (other !== row) other.is_default = 0;
+			this.accounts_grid.refresh();
+		}
+		this.refresh_accounts();
+	}
+
+	show_accounts() {
+		this.set_view("accounts");
+		this.dialog.set_title(__("Bank accounts"));
+		this.dialog.set_primary_action(__("Save bank details"), () => this.save_accounts());
+		this.dialog.set_secondary_action_label(__("Save draft"));
+		this.dialog.set_secondary_action(() => this.save_accounts(true));
+		this.refresh_accounts();
+	}
+
+	refresh_accounts() {
+		const rows = this.accounts;
+		const $head = this.dialog.get_field("accounts_head").$wrapper.empty();
+		$head.append(
+			make_sheet_head(
+				this.frm.doc.__onload?.company_details?.country === "India"
+					? __("One row per bank account, overdraft and cash credit too.")
+					: __("One row per bank account, overdraft and credit card too."),
+				null,
+				bank_menu(this.frm)
+			)
+		);
+		const in_credit = rows.filter((row) => flt(row.book) >= 0);
+		const overdrawn = rows.filter((row) => flt(row.book) < 0);
+		const sum = (list) => list.reduce((total, row) => total + flt(row.book), 0);
+		const typed = rows.filter((row) => ![null, undefined, ""].includes(row.statement_balance)).length;
+		const on_day = this.day ? __("On {0}", [this.day]) : null;
+		if (rows.length) {
+			$head.append(
+				$(`<div class="es-stat-card-grid mb-3"></div>`).append(
+					frappe.ui.stat_card({
+						label: __("Bank accounts"),
+						value: format_number(rows.length, null, 0),
+						caption: __("{0} have bank details", [
+							rows.filter((row) => row.bank && row.bank_account_no).length,
+						]),
+					}),
+					make_lines_card(
+						__("Book balance"),
+						[
+							[__("In credit · {0}", [in_credit.length]), this.money(sum(in_credit))],
+							[__("Overdrawn or owed · {0}", [overdrawn.length]), this.money(sum(overdrawn))],
+						],
+						on_day
+					),
+					frappe.ui.stat_card({
+						label: __("Statement balance"),
+						value: __("{0} of {1} typed", [typed, rows.length]),
+						caption: on_day,
+					})
+				)
+			);
+		}
+		const new_banks = [...new Set(rows.map((row) => row.bank).filter((bank) => this.is_new_bank(bank)))];
+		const alerts = [];
+		if (new_banks.length && !this.details.can_create_bank) {
+			alerts.push({
+				theme: "red",
+				title: __("You can't add a Bank, so {0} can't be made.", [new_banks.join(", ")]),
+				description: __("Pick an existing Bank, or ask someone who can add one."),
+			});
+		}
+		const defaults = rows.filter((row) => row.is_default).length;
+		if (defaults > 1) alerts.push({ theme: "red", title: __("Pick one default bank.") });
+		// the same number on two banks: details typed on the wrong row
+		const numbers = {};
+		for (const row of rows.filter((row) => row.bank_account_no)) {
+			(numbers[[row.bank_account_no, row.branch_code || ""]] ||= []).push(row);
+		}
+		for (const same of Object.values(numbers).filter((list) => list.length > 1)) {
+			alerts.push({
+				theme: "red",
+				title: __("Account number {0} is on {1}.", [
+					same[0].bank_account_no,
+					same.map((row) => short_account(this.frm, row.account)).join(", "),
+				]),
+				description: __("Each bank account has its own number."),
+			});
+		}
+		// with nothing uncleared, the statement is the book balance (or the trial balance's line)
+		if (this.dialog.get_value("has_uncleared_cheques") === "No") {
+			const off = rows.filter((row) => {
+				const expected = flt(row.book) || (row.line ?? null);
+				return (
+					![null, undefined, ""].includes(row.statement_balance) &&
+					expected !== null &&
+					Math.abs(flt(row.statement_balance) - flt(expected)) >= 1
+				);
+			});
+			if (off.length) {
+				alerts.push({
+					theme: "red",
+					// shown, but the details can still be saved and fixed later
+					can_save: true,
+					title: __("Statement balance differs from the books: {0}.", [
+						off.map((row) => short_account(this.frm, row.account)).join(", "),
+					]),
+					description: cheque_words(
+						__(
+							"With no uncleared cheques, the bank's statement is the book balance. Check the details are on the right bank, or answer Yes and add the uncleared rows."
+						)
+					),
+				});
+			}
+		}
+		if (rows.length && !defaults) {
+			alerts.push({
+				theme: "yellow",
+				title: __("Tick the default bank."),
+				description: cheque_words(
+					__("Payments by cheque or transfer use it. This step is done once one is ticked.")
+				),
+			});
+		}
+		const unmarked = this.details.unmarked || [];
+		if (unmarked.length) {
+			alerts.push({
+				theme: "yellow",
+				title:
+					unmarked.length === 1
+						? __("1 account under a bank group is not marked as a bank account: {0}.", [
+								short_account(this.frm, unmarked[0]),
+						  ])
+						: __("{0} accounts under a bank group are not marked as bank accounts: {1}.", [
+								unmarked.length,
+								unmarked.map((account) => short_account(this.frm, account)).join(", "),
+						  ]),
+				description: __("Mark them to add their bank details."),
+				buttons: [{ label: __("Mark them"), onclick: () => this.mark_accounts() }],
+			});
+		}
+		$head.append(make_alerts(alerts).addClass("mb-3"));
+		if (new_banks.length && this.details.can_create_bank) {
+			$head.append(
+				grey_line(
+					new_banks.length === 1
+						? __("1 bank is new: {0}. It is made when you save.", [new_banks[0]])
+						: __("{0} banks are new: {1}. They are made when you save.", [
+								new_banks.length,
+								new_banks.join(", "),
+						  ])
+				).addClass("mb-3")
+			);
+		}
+		this.dialog.set_df_property("accounts", "hidden", rows.length ? 0 : 1);
+		set_footer_reason(
+			this.dialog,
+			!rows.length
+				? __("Mark the bank accounts to add their details.")
+				: alerts.some((alert) => alert.theme === "red" && !alert.can_save)
+				? __("Clear the red to save.")
+				: !this.dialog.get_value("has_uncleared_cheques")
+				? __("Answer the question to save.")
+				: null
+		);
+	}
+
+	get_account_rows() {
+		return this.accounts.map((row) => ({
+			account: row.account,
+			bank: row.bank,
+			bank_account_no: row.bank_account_no,
+			branch_code: row.branch_code,
+			statement_balance: [null, undefined, ""].includes(row.statement_balance)
+				? null
+				: row.statement_balance,
+			is_default: row.is_default ? 1 : 0,
+			is_credit_card: row.is_credit_card ? 1 : 0,
+		}));
+	}
+
+	save_accounts(draft = false) {
+		const answer = this.dialog.get_value("has_uncleared_cheques");
+		return call_method(
+			this.frm,
+			"save_bank_accounts",
+			{ rows: this.get_account_rows(), has_uncleared_cheques: answer || null, draft: draft ? 1 : 0 },
+			{ freeze: !draft }
+		).then(() =>
+			reload_fresh(this.frm).then(() => {
+				if (draft) {
+					frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
+				} else if (answer === "Yes") {
+					this.show_cheques();
+				} else {
+					this.dialog.hide();
+					const off = this.frm.doc.__onload?.bank?.statement_off || [];
+					const has_default = this.accounts.some((row) => row.is_default);
+					frappe.ui.toast({
+						type: "info",
+						message: off.length
+							? __("Bank details saved. The statement balance differs from the books: {0}.", [
+									off.join(", "),
+							  ])
+							: has_default
+							? __("Bank details saved.")
+							: __("Bank details saved. Tick a default bank to finish this step."),
+						indicator: has_default && !off.length ? "green" : "orange",
+					});
+				}
+			})
+		);
+	}
+
+	mark_accounts() {
+		call_method(this.frm, "save_bank_accounts", {
+			rows: this.get_account_rows(),
+			has_uncleared_cheques: this.dialog.get_value("has_uncleared_cheques") || null,
+			draft: 1,
+		})
+			.then(() => call_method(this.frm, "mark_bank_accounts"))
+			.then(() => {
+				this.dialog.hide();
+				reload_fresh(this.frm).then(() => show_bank_accounts(this.frm));
+			});
+	}
+
+	// Part 2: the drafts of every bank, filtered to one by the picker
+	show_cheques(account) {
+		return get_data(this.frm, "get_uncleared_cheques").then((r) => {
+			this.checks = r.message;
+			this.cheques = this.get_drafts();
+			const with_rows = this.checks.banks.find((bank) =>
+				this.cheques.some((row) => row.bank_account === bank.account)
+			);
+			this.picked =
+				account ||
+				with_rows?.account ||
+				this.frm.doc.__onload?.bank?.default_bank ||
+				this.checks.banks[0]?.account;
+			this.set_view("cheques");
+			this.dialog.set_title(__("Bank accounts"));
+			this.dialog.set_primary_action(__("Post to books"), () => this.post());
+			this.dialog.set_secondary_action_label(__("Save draft"));
+			this.dialog.set_secondary_action(() =>
+				this.save_cheques()
+					.then(() => reload_fresh(this.frm))
+					.then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }))
+			);
+			this.make_cheques_head();
+			this.show_bank_rows();
+		});
+	}
+
+	make_cheques_head() {
+		const $head = this.dialog.get_field("cheques_head").$wrapper.empty();
+		const menu = bank_menu(this.frm);
+		$head.append(
+			make_back_header(
+				cheque_words(__("Uncleared cheques and deposits")),
+				this.day
+					? cheque_words(__("Cheques and deposits the bank had not cleared by {0}.", [this.day]))
+					: null,
+				() => this.show_accounts(),
+				make_sheet_buttons(() => this.upload(), menu)
+			).addClass("mb-3")
+		);
+		const $picker = $(`<div class="max-w-sm"></div>`).appendTo($head);
+		this.picker = frappe.ui.form.make_control({
+			df: {
+				fieldtype: "Link",
+				fieldname: "bank_account",
+				options: "Account",
+				label: __("Bank account"),
+				placeholder: __("All bank accounts"),
+				get_query: () => ({
+					filters: { company: this.frm.doc.company, account_type: "Bank", is_group: 0 },
+				}),
+				change: () => {
+					const value = this.picker.get_value() || null;
+					if (value !== this.picked) this.pick(value);
+				},
+			},
+			parent: $picker,
+			render_input: true,
+		});
+		this.picker.set_value(this.picked || "");
+		this.$stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($head);
+		this.$alerts = $(`<div class="mb-3"></div>`).appendTo($head);
+	}
+
+	// the grid's rows go back into the list of all drafts; rows added under a bank get that bank
+	sync() {
+		const shown = this.cheques_grid.df.data || [];
+		if (this.picked) {
+			for (const row of shown) row.bank_account ||= this.picked;
+		}
+		this.cheques = [
+			...this.cheques.filter(
+				(row) => this.picked && row.bank_account !== this.picked && !shown.includes(row)
+			),
+			...shown,
+		];
+		return this.cheques;
+	}
+
+	pick(account) {
+		this.sync();
+		this.picked = account;
+		if ((this.picker.get_value() || null) !== account) this.picker.set_value(account || "");
+		this.show_bank_rows();
+	}
+
+	show_bank_rows(first) {
+		const rows = this.picked
+			? this.cheques.filter((row) => row.bank_account === this.picked)
+			: this.cheques;
+		this.cheques_grid.df.data = first
+			? [...rows.filter(first), ...rows.filter((row) => !first(row))]
+			: rows;
+		this.cheques_grid.set_column_disp_in_list_view("bank_account", !this.picked);
+		this.cheques_grid.refresh();
+		this.refresh_cheques();
+	}
+
+	// what the server checks again when posting, from the rows as they are now
+	get_state() {
+		const rows = this.sync();
+		const posted = (this.frm.doc.uncleared_cheques || []).filter((row) => row.status === "Posted");
+		const banks = this.checks.banks.map((bank) => {
+			const mine = [...posted, ...rows].filter((row) => row.bank_account === bank.account);
+			const total = (type) =>
+				mine.filter((row) => row.entry_type === type).reduce((sum, row) => sum + flt(row.amount), 0);
+			const count = (type) => mine.filter((row) => row.entry_type === type).length;
+			const worked_out = flt(bank.book + total("Issued") - total("Deposited"), 2);
+			const off = bank.statement === null ? null : flt(worked_out - bank.statement, 2);
+			return {
+				...bank,
+				issued: total("Issued"),
+				issued_count: count("Issued"),
+				deposited: total("Deposited"),
+				deposited_count: count("Deposited"),
+				worked_out: worked_out,
+				off: off === null ? null : Math.abs(off) < 1 ? 0 : off,
+			};
+		});
+		const day_before = this.checks.day_before;
+		// a cheque posted on one bank, again on another: a sheet's rows put on the wrong bank
+		const posted_on = {};
+		for (const row of posted) {
+			if (row.reference_no) {
+				posted_on[[row.entry_type, row.reference_no, flt(row.amount, 2)]] = row.bank_account;
+			}
+		}
+		const stale_before = frappe.datetime.add_months(day_before, -this.checks.stale_months);
+		const company_currency = this.currency;
+		const foreign = new Set(
+			banks.filter((bank) => bank.account_currency !== company_currency).map((bank) => bank.account)
+		);
+		return {
+			rows,
+			banks,
+			no_bank: (row) => !row.bank_account,
+			other_currency: (row) => foreign.has(row.bank_account),
+			no_type: (row) => !row.entry_type,
+			no_date: (row) => !row.reference_date,
+			no_amount: (row) => flt(row.amount) <= 0,
+			stale: (row) => row.reference_date && row.reference_date < stale_before,
+			post_dated: (row) => row.reference_date && row.reference_date > day_before,
+			no_reference: (row) => !row.reference_no,
+			posted_elsewhere: (row) => {
+				const on =
+					row.reference_no && posted_on[[row.entry_type, row.reference_no, flt(row.amount, 2)]];
+				return Boolean(on) && on !== row.bank_account;
+			},
+		};
+	}
+
+	refresh_cheques() {
+		if (!this.checks) return;
+		const state = this.get_state();
+		const { rows, banks } = state;
+		const name_of = (account) =>
+			banks.find((bank) => bank.account === account)?.bank || short_account(this.frm, account);
+		const picked = banks.find((bank) => bank.account === this.picked);
+		const on = (label) => (picked ? __("{0} · {1}", [label, name_of(picked.account)]) : label);
+		const sum = (field) => banks.reduce((total, bank) => total + flt(bank[field]), 0);
+		const shown = picked ? [picked] : banks;
+		const statement = picked?.statement;
+		this.$stats.empty().append(
+			frappe.ui.stat_card({
+				label: on(__("Book balance")),
+				value: this.money(picked ? picked.book : sum("book")),
+				caption: this.day ? __("On {0}", [this.day]) : null,
+			}),
+			make_lines_card(on(__("Uncleared")), [
+				[
+					__("Issued · {0}", [shown.reduce((n, bank) => n + bank.issued_count, 0)]),
+					this.money(picked ? picked.issued : sum("issued")),
+				],
+				[
+					__("Deposited · {0}", [shown.reduce((n, bank) => n + bank.deposited_count, 0)]),
+					this.money(picked ? picked.deposited : sum("deposited")),
+				],
+			]),
+			frappe.ui.stat_card({
+				label: on(__("Worked out")),
+				value: this.money(picked ? picked.worked_out : sum("worked_out")),
+				caption: picked
+					? statement === null
+						? __("No statement balance typed")
+						: picked.off
+						? __("Statement {0} · off by {1}", [
+								this.money(statement),
+								this.money(Math.abs(picked.off)),
+						  ])
+						: __("Statement {0} · matches", [this.money(statement)])
+					: __("{0} of {1} match their statement", [
+							banks.filter((bank) => bank.off === 0).length,
+							banks.filter((bank) => bank.off !== null).length,
+					  ]),
+			})
+		);
+
+		const count = (test) => rows.filter(test).length;
+		const show_rows = (test) => ({
+			label: __("Show rows"),
+			onclick: () => {
+				const row = this.sync().find(test);
+				if (row && this.picked && row.bank_account !== this.picked) this.pick(row.bank_account);
+				this.show_bank_rows(test);
+			},
+		});
+		const red = (title, test, description) => ({
+			theme: "red",
+			title,
+			description,
+			buttons: test ? [show_rows(test)] : [],
+		});
+		const reds = [];
+		if (!this.checks.balances_posted) {
+			reds.push({
+				...red(cheque_words(__("Post opening balances first to add uncleared cheques."))),
+				buttons: [
+					{
+						label: __("Opening balances"),
+						onclick: () => {
+							this.dialog.hide();
+							show_opening_balances(this.frm);
+						},
+					},
+				],
+			});
+		}
+		if (this.checks.posting_blocker) {
+			reds.push({
+				...red(this.checks.posting_blocker),
+				buttons: this.checks.posting_fix ? [fix_button(this.checks.posting_fix, this.frm)] : [],
+			});
+		}
+		if (count(state.no_bank)) {
+			reds.push(
+				red(__("Bank account missing for {0}.", [count_rows(count(state.no_bank))]), state.no_bank)
+			);
+		}
+		if (count(state.posted_elsewhere)) {
+			reds.push(
+				red(
+					__("{0} posted already on another bank.", [count_rows(count(state.posted_elsewhere))]),
+					state.posted_elsewhere,
+					count(state.posted_elsewhere) === 1
+						? __("Remove it, or fix its bank.")
+						: __("Remove them, or fix their bank.")
+				)
+			);
+		}
+		if (count(state.other_currency)) {
+			reds.push(
+				red(
+					__("Foreign currency bank accounts come later. Remove {0}.", [
+						count_rows(count(state.other_currency)),
+					]),
+					state.other_currency
+				)
+			);
+		}
+		if (count(state.no_type)) {
+			reds.push(
+				red(
+					__("Issued or deposited missing for {0}.", [count_rows(count(state.no_type))]),
+					state.no_type
+				)
+			);
+		}
+		const no_date = rows.filter(state.no_date);
+		const no_date_banks = [...new Set(no_date.map((row) => row.bank_account))];
+		if (no_date.length) {
+			reds.push(
+				red(
+					no_date_banks.length === 1
+						? __("Date missing for {0} of {1}.", [
+								count_rows(no_date.length),
+								short_account(this.frm, no_date_banks[0]),
+						  ])
+						: __("Date missing for {0} of {1} banks.", [
+								count_rows(no_date.length),
+								no_date_banks.length,
+						  ]),
+					state.no_date
+				)
+			);
+		}
+		if (count(state.no_amount)) {
+			reds.push(
+				red(__("Amount missing for {0}.", [count_rows(count(state.no_amount))]), state.no_amount)
+			);
+		}
+
+		const yellows = banks
+			.filter((bank) => bank.off)
+			.map((bank) => ({
+				theme: "yellow",
+				title: __("{0} is off by {1}. Check the statement balance or the rows.", [
+					name_of(bank.account),
+					this.money(Math.abs(bank.off)),
+				]),
+				buttons: [{ label: __("Show rows"), onclick: () => this.pick(bank.account) }],
+			}));
+		// what only points something out is said for the bank shown
+		const mine = this.picked ? rows.filter((row) => row.bank_account === this.picked) : rows;
+		const count_mine = (test) => mine.filter(test).length;
+		const yellow = (test, title, description) =>
+			count_mine(test) &&
+			yellows.push({ theme: "yellow", title, description, buttons: [show_rows(test)] });
+		yellow(
+			state.stale,
+			__("{0} older than {1} months.", [count_rows(count_mine(state.stale)), this.checks.stale_months]),
+			cheque_words(__("A cheque this old may have lapsed. Check with the bank before you post it."))
+		);
+		yellow(
+			state.post_dated,
+			__("{0} dated after {1}.", [count_rows(count_mine(state.post_dated)), this.day]),
+			__("They are posted on {0} with their own date.", [this.day])
+		);
+		yellow(
+			state.no_reference,
+			cheque_words(
+				__("{0} with no cheque or reference number.", [count_rows(count_mine(state.no_reference))])
+			),
+			__("Add it, so Bank Clearance can tell them apart.")
+		);
+		this.$alerts.empty().append(make_alerts([...reds, ...yellows]));
+		set_footer_reason(
+			this.dialog,
+			!rows.length
+				? __("Upload a sheet or add rows to post.")
+				: reds.length
+				? __("Clear the red to post.")
+				: null
+		);
+	}
+
+	save_cheques() {
+		return call_method(this.frm, "save_uncleared_cheques", {
+			rows: this.sync().filter((row) => row.bank_account || flt(row.amount)),
+		});
+	}
+
+	upload() {
+		upload_sheet(
+			this.frm,
+			"import_uncleared_cheques",
+			{ bank_account: this.picked },
+			{
+				replaces:
+					this.sync().length &&
+					__(
+						"The sheet replaces the draft rows of the banks on it, unsaved changes included. Posted rows stay as they are. Continue?"
+					),
+				after: (result) => this.after_upload(result),
+			}
+		);
+	}
+
+	after_upload(result) {
+		const banks = result.banks || [];
+		this.show_cheques(banks.length === 1 ? banks[0] : null).then(() => {
+			const $notes = this.dialog.get_field("cheques_notes").$wrapper.empty();
+			const bank = banks.length === 1 && short_account(this.frm, banks[0]);
+			$notes.append(
+				$(`<div class="flex flex-col gap-1 mt-2"></div>`).append(
+					grey_line(__("{0} read from the sheet.", [count_rows(result.added)])),
+					result.no_bank_column && bank
+						? grey_line(
+								result.title_bank
+									? __(
+											"The sheet has no bank column; its title names {0}, so its rows are for it.",
+											[bank]
+									  )
+									: __("The sheet has no bank column, so its rows are for {0}.", [bank])
+						  )
+						: [],
+					result.replaced
+						? grey_line(
+								result.replaced === 1
+									? __("1 draft replaced.")
+									: __("{0} drafts replaced.", [result.replaced])
+						  )
+						: [],
+					result.skipped
+						? grey_line(__("{0} already posted are left out.", [count_rows(result.skipped)]))
+						: [],
+					result.unknown_banks?.length
+						? grey_line(
+								__("Rows of these banks are left out, no bank account matches them: {0}.", [
+									result.unknown_banks.join(", "),
+								])
+						  )
+						: []
+				)
+			);
+		});
+	}
+
+	post() {
+		return this.save_cheques()
+			.then(() => get_data(this.frm, "get_uncleared_cheques"))
+			.then((r) => {
+				this.checks = r.message;
+				this.cheques = this.get_drafts();
+				this.show_bank_rows();
+				if (this.checks.blocker) {
+					frappe.ui.toast({ type: "error", message: this.checks.blocker });
+				} else if (this.cheques.length) {
+					this.show_confirm();
+				}
+			});
+	}
+
+	get_drafts() {
+		return (this.frm.doc.uncleared_cheques || [])
+			.filter((row) => row.status !== "Posted")
+			.map((row) => ({
+				bank_account: row.bank_account,
+				entry_type: row.entry_type,
+				reference_no: row.reference_no,
+				reference_date: row.reference_date,
+				party_name: row.party_name,
+				amount: row.amount,
+				source: row.source,
+			}));
+	}
+
+	show_confirm() {
+		const rows = this.cheques;
+		const issued = rows.filter((row) => row.entry_type === "Issued");
+		const deposited = rows.filter((row) => row.entry_type === "Deposited");
+		const total = (list) => list.reduce((sum, row) => sum + flt(row.amount), 0);
+		const counts = count_cheque_rows(this.frm, rows);
+		this.set_view("confirm");
+		this.dialog.set_title(cheque_words(__("Post uncleared cheques?")));
+		this.dialog
+			.get_field("confirm")
+			.$wrapper.empty()
+			.append(
+				$(`<div class="flex flex-col gap-3"></div>`).append(
+					make_back_line(
+						cheque_words(
+							__("Back to the uncleared cheques. Nothing is posted until you confirm.")
+						),
+						() => this.show_cheques()
+					),
+					make_kv_lines([
+						[
+							__("To post"),
+							__("{0} · {1} issued, {2} deposited", [
+								counts,
+								this.money(total(issued)),
+								this.money(total(deposited)),
+							]),
+						],
+						[
+							rows.length && new Set(rows.map((row) => row.bank_account)).size === 1
+								? __("Bank")
+								: __("Banks"),
+							[...new Set(rows.map((row) => row.bank_account))]
+								.map((account) => short_account(this.frm, account))
+								.join(", "),
+						],
+						[__("Dated"), this.day],
+					]),
+					grey_line(__("Your bank balance and Temporary Opening do not change."))
+				)
+			);
+		set_footer_reason(this.dialog, null);
+		this.dialog.set_primary_action(__("Post {0}", [count_rows(rows.length)]), () =>
+			call_method(this.frm, "post_uncleared_cheques", {}, { freeze: true }).then((r) => {
+				this.dialog.hide();
+				after_run(
+					this.frm,
+					r.message,
+					__("Posting in the background. This page updates when it's done."),
+					() => show_cheques_posted(this.frm)
+				);
+			})
+		);
+		this.dialog.set_secondary_action_label(__("Back"));
+		this.dialog.set_secondary_action(() => this.show_cheques());
+	}
+}
+
+// What was posted, by sheet: each to view, and to undo in part or whole until going live
+function show_posted_cheques(frm) {
+	const total_of = (rows) => rows.reduce((sum, row) => sum + flt(row.amount), 0);
+	show_posted_window(frm, {
+		title: cheque_words(__("Posted cheques")),
+		load: () => get_data(frm, "get_posted_entries", { kind: "cheques" }).then((r) => r.message),
+		posted_word: (when) => __("Posted {0}", [when]),
+		group_line: (group) => count_rows(group.count),
+		group_amount: (group, money) =>
+			__("{0} issued · {1} deposited", [money(group.issued), money(group.deposited)]),
+		undone: (posted) =>
+			posted.undone.map((group) => ({
+				source: group.source,
+				line: __("{0} · removed from ERPNext", [count_rows(group.count)]),
+				amount: format_currency(group.amount, erpnext.get_currency(frm.doc.company)),
+				download: () => download_cheques(frm, group.source),
+			})),
+		fields: [
+			["bank", "Data", __("Bank"), 2],
+			["entry_type", "Data", __("Issued/Deposited"), 1],
+			["reference_no", "Data", cheque_words(__("Cheque no")), 1],
+			["reference_date", "Date", __("Date"), 1],
+			["party_name", "Data", __("Party"), 2],
+			["amount", "Currency", __("Amount"), 2],
+			["clearance_date", "Date", __("Cleared"), 1],
+		].map(([fieldname, fieldtype, label, columns]) => ({ fieldname, fieldtype, label, columns })),
+		rows: (group) =>
+			group.rows.map((row) => ({ ...row, bank: row.bank || short_account(frm, row.bank_account) })),
+		blocked: (row) => row.clearance_date,
+		blocked_alert: (rows) => ({
+			title:
+				rows.length === 1
+					? cheque_words(__("1 cheque is already cleared."))
+					: cheque_words(__("{0} cheques are already cleared.", [rows.length])),
+			description: __("Remove the clearance date first."),
+		}),
+		undo_label: (selected, group, money) =>
+			selected.length
+				? __("Undo {0} selected · {1}", [selected.length, money(total_of(selected))])
+				: __("Undo this upload"),
+		confirm_title: (rows) => __("Undo {0}?", [count_cheque_rows(frm, rows)]),
+		confirm_text: (rows) =>
+			plural(
+				rows.length,
+				__(
+					"This {0} will be cancelled and deleted in ERPNext. You can download it, fix it and upload again.",
+					[count_cheque_rows(frm, rows)]
+				),
+				__(
+					"These {0} will be cancelled and deleted in ERPNext. You can download them, fix them and upload again.",
+					[count_cheque_rows(frm, rows)]
+				)
+			),
+		confirm_rows: (rows, money) =>
+			rows.map((row) => [
+				make_text(row.reference_no || "—", "text-ink-gray-8 shrink-0"),
+				make_text(
+					[row.party_name, short_account(frm, row.bank_account)].filter(Boolean).join(" · "),
+					"text-ink-gray-5 grow truncate"
+				),
+				make_text(money(row.amount), "text-ink-gray-8 shrink-0"),
+			]),
+		total: total_of,
+		confirm_button: (rows) => __("Undo {0}", [count_cheque_rows(frm, rows)]),
+		undo: (group, selected) =>
+			call_method(frm, "undo_uncleared_cheques", {
+				source: group.source,
+				entries: selected ? selected.map((row) => row.journal_entry) : null,
+			}),
+		after_undo: (result, group) => show_undo_result(frm, "cheques", result, group.source),
+	});
+}
+
+// a qty with decimals only when it has them
+function format_qty(value) {
+	return format_number(value, null, Number.isInteger(flt(value)) ? 0 : 3);
+}
+
+function plural(count, one, many) {
+	return count === 1 ? one : many;
+}
+
+function day_before_text(frm) {
+	return frm.doc.migration_date
+		? frappe.datetime.str_to_user(frappe.datetime.add_days(frm.doc.migration_date, -1))
+		: __("the day before migration");
+}
+
+// A read-only table of a few rows, like the stock lines against the trial balance
+function make_read_table(columns, rows) {
+	return $(`<div class="border rounded-lg overflow-hidden"></div>`).append(
+		$(`<table class="table mt-0 mb-0"></table>`).append(
+			$(`<thead><tr class="bg-surface-gray-1"></tr></thead>`)
+				.find("tr")
+				.append(
+					columns.map(([label, right]) =>
+						$(`<th class="text-sm-medium text-ink-gray-6 border-0"></th>`)
+							.toggleClass("text-right", !!right)
+							.text(label)
+					)
+				)
+				.end(),
+			$(`<tbody></tbody>`).append(
+				rows.map((cells) =>
+					$(`<tr></tr>`).append(
+						cells.map((cell, index) =>
+							$(`<td class="text-base text-ink-gray-8"></td>`)
+								.toggleClass("text-right", !!columns[index][1])
+								.append(cell)
+						)
+					)
+				)
+			)
+		)
+	);
+}
+
+// A read-only table narrowed by a search box, the first 100 rows shown
+function make_search_table(columns, rows, to_cells) {
+	const $table = $(`<div></div>`);
+	const $count = grey_line("");
+	const render = (query) => {
+		const shown = rows.filter(
+			(row) => !query || JSON.stringify(row).toLowerCase().includes(query.toLowerCase())
+		);
+		$table.empty().append(make_read_table(columns, shown.slice(0, 100).map(to_cells)));
+		$count.text(
+			shown.length > 100 ? __("Showing 100 of {0}. Search to find others.", [shown.length]) : ""
+		);
+	};
+	const $search = $(`<div class="w-64"></div>`);
+	const search = frappe.ui.form.make_control({
+		df: {
+			fieldtype: "Data",
+			fieldname: "search",
+			placeholder: __("Search"),
+			change: () => render(search.get_value()),
+		},
+		parent: $search,
+		only_input: true,
+		render_input: true,
+	});
+	search.$input.on("input", () => render(search.get_value()));
+	render("");
+	return $(`<div class="flex flex-col gap-2"></div>`).append($search, $table, $count);
+}
+
+// A blank sheet of the fields Data Import needs, with the required child table fields too
+function download_import_sample(doctype) {
+	frappe.model.with_doctype(doctype, () => {
+		const required = (dt) =>
+			frappe
+				.get_meta(dt)
+				.fields.filter(
+					(df) =>
+						df.reqd &&
+						!df.hidden &&
+						!frappe.model.table_fields.includes(df.fieldtype) &&
+						!frappe.model.no_value_type.includes(df.fieldtype)
+				)
+				.map((df) => df.fieldname);
+		const fields = { [doctype]: required(doctype) };
+		for (const df of frappe.get_meta(doctype).fields) {
+			if (df.reqd && frappe.model.table_fields.includes(df.fieldtype)) {
+				fields[df.fieldname] = required(df.options);
+			}
+		}
+		open_url_post("/api/method/frappe.core.doctype.data_import.data_import.download_template", {
+			doctype: doctype,
+			export_fields: JSON.stringify(fields),
+			export_records: "blank_template",
+			file_type: "Excel",
+		});
+	});
+}
+
+function items_import_menu(frm) {
+	if (!frappe.model.can_create("Data Import")) return [];
+	return [
+		frappe.ui.dropdown({
+			button: { label: __("Import"), icon: "import", icon_right: "chevron-down" },
+			align: "end",
+			options: [
+				{
+					group: "",
+					options: [
+						{ label: __("Item groups"), onclick: () => open_party_import(frm, "Item Group") },
+						{ label: __("Units"), onclick: () => open_party_import(frm, "UOM") },
+						{ label: __("Items"), onclick: () => open_party_import(frm, "Item") },
+					],
+				},
+				{
+					group: "",
+					options: [
+						{ label: __("Download sample"), onclick: () => download_import_sample("Item") },
+					],
+				},
+			],
+		}),
+	];
+}
+
+const ORDER_TYPES = {
+	open_sales_orders: "Sales Order",
+	open_purchase_orders: "Purchase Order",
+	open_work_orders: "Work Order",
+	open_subcontracting_orders: "Subcontracting Order",
+};
+
+function order_rows(frm, order_type, made) {
+	return (frm.doc.open_orders || []).filter(
+		(row) => row.order_type === order_type && (row.status === "Made") === made
+	);
+}
+
+function order_buttons(frm, step) {
+	const order_type = ORDER_TYPES[step.name];
+	const drafts = order_rows(frm, order_type, false).length;
+	return [
+		{
+			label: drafts
+				? __("Edit orders")
+				: order_type === "Work Order"
+				? __("Add work orders")
+				: __("Add orders"),
+			icon: drafts ? "pencil" : "plus",
+			onclick: () => show_open_orders(frm, order_type),
+		},
+	];
+}
+
+function order_menu(frm, step) {
+	const order_type = ORDER_TYPES[step.name];
+	return [
+		(order_rows(frm, order_type, true).length || has_undone_orders(frm, order_type)) && {
+			label: made_orders_title(order_type),
+			icon: "list",
+			onclick: () => show_made_orders(frm, order_type),
+		},
+		{
+			label: __("Download sheet"),
+			icon: "download",
+			onclick: () => download_orders(frm, order_type),
+		},
+	].filter(Boolean);
+}
+
+function has_undone_orders(frm, order_type) {
+	return (frm.doc.undone_orders || []).some((row) => row.order_type === order_type);
+}
+
+function made_orders_title(order_type) {
+	return {
+		"Sales Order": __("Made sales orders"),
+		"Purchase Order": __("Made purchase orders"),
+		"Work Order": __("Made work orders"),
+		"Subcontracting Order": __("Made subcontracting orders"),
+	}[order_type];
+}
+
+function has_rows(rows, posted) {
+	return (rows || []).some((row) => (row.status === "Posted") === posted);
+}
+
+function download_orders(frm, order_type, undone_from) {
+	open_url_post(
+		"/api/method/erpnext.setup.doctype.company_setup.open_orders.download_open_orders",
+		undone_from === undefined
+			? { company: frm.doc.company, order_type: order_type }
+			: { company: frm.doc.company, order_type: order_type, undone_from: undone_from }
+	);
+}
+
+function download_stock(frm, undone_from) {
+	open_url_post(
+		"/api/method/erpnext.setup.doctype.company_setup.opening_stock.download_opening_stock",
+		undone_from === undefined
+			? { company: frm.doc.company }
+			: { company: frm.doc.company, undone_from: undone_from }
+	);
+}
+
+function download_assets(frm, undone_from) {
+	open_url_post(
+		"/api/method/erpnext.setup.doctype.company_setup.fixed_assets.download_fixed_assets",
+		undone_from === undefined
+			? { company: frm.doc.company }
+			: { company: frm.doc.company, undone_from: undone_from }
+	);
+}
+
+// Card buttons and ⋯ items of the steps added after the bank accounts
+Object.assign(STEP_ACTIONS, {
+	taxes: (frm, step) => [
+		{
+			label: step.is_complete ? __("Edit taxes") : __("Set up taxes"),
+			icon: step.is_complete ? "pencil" : undefined,
+			onclick: () => show_taxes(frm),
+		},
+	],
+	items: (frm) => items_import_menu(frm),
+	warehouses: (frm, step) => [
+		{
+			label: step.is_complete ? __("Edit warehouses") : __("Add warehouses"),
+			icon: step.is_complete ? "pencil" : "plus",
+			onclick: () => show_warehouses(frm),
+		},
+	],
+	opening_stock: (frm) => [
+		{
+			label: has_rows(frm.doc.opening_stock, false) ? __("Edit stock") : __("Add stock"),
+			icon: has_rows(frm.doc.opening_stock, false) ? "pencil" : "plus",
+			onclick: () => show_opening_stock(frm),
+		},
+	],
+	job_workers: (frm) => [
+		{
+			label: __("Edit in Warehouses"),
+			icon: "pencil",
+			onclick: () => show_warehouses(frm, { job_workers: true }),
+		},
+	],
+	open_sales_orders: order_buttons,
+	open_purchase_orders: order_buttons,
+	open_work_orders: order_buttons,
+	open_subcontracting_orders: order_buttons,
+	fixed_assets: (frm) => [
+		{
+			label: has_rows(frm.doc.fixed_assets, false) ? __("Edit assets") : __("Add assets"),
+			icon: has_rows(frm.doc.fixed_assets, false) ? "pencil" : "plus",
+			onclick: () => show_fixed_assets(frm),
+		},
+	],
+	boms: (frm) =>
+		frappe.model.can_create("Data Import")
+			? [{ label: __("Import BOMs"), icon: "import", onclick: () => open_party_import(frm, "BOM") }]
+			: [],
+});
+
+Object.assign(STEP_MORE, {
+	warehouses: () => [
+		{
+			label: __("Warehouse list"),
+			icon: "arrow-up-right",
+			onclick: () => frappe.set_route("List", "Warehouse"),
+		},
+	],
+	opening_stock: (frm) =>
+		[
+			has_rows(frm.doc.opening_stock, true) && {
+				label: __("Posted stock"),
+				icon: "list",
+				onclick: () => show_posted_stock(frm),
+			},
+			{ label: __("Download sheet"), icon: "download", onclick: () => download_stock(frm) },
+		].filter(Boolean),
+	job_workers: (frm) => [
+		{ label: __("Stock at job workers"), icon: "list", onclick: () => show_job_worker_stock(frm) },
+		party_list_item("Supplier"),
+	],
+	open_sales_orders: order_menu,
+	open_purchase_orders: order_menu,
+	open_work_orders: order_menu,
+	open_subcontracting_orders: order_menu,
+	fixed_assets: (frm) =>
+		[
+			(has_rows(frm.doc.fixed_assets, true) || (frm.doc.undone_assets || []).length) && {
+				label: __("Posted assets"),
+				icon: "list",
+				onclick: () => show_posted_assets(frm),
+			},
+			{ label: __("Download sheet"), icon: "download", onclick: () => download_assets(frm) },
+		].filter(Boolean),
+	boms: () => [
+		{
+			label: __("Open BOM Creator"),
+			icon: "arrow-up-right",
+			onclick: () => frappe.new_doc("BOM Creator"),
+		},
+		{ label: __("Download sample"), icon: "download", onclick: () => download_import_sample("BOM") },
+	],
+});
+
+Object.assign(STEP_OPENERS, {
+	taxes: (frm) => show_taxes(frm),
+	items: (frm, step) => !step.is_complete && open_party_import(frm, "Item"),
+	warehouses: (frm) => show_warehouses(frm),
+	opening_stock: (frm) => show_opening_stock(frm),
+	job_workers: (frm) => show_warehouses(frm, { job_workers: true }),
+	open_sales_orders: (frm) => show_open_orders(frm, "Sales Order"),
+	open_purchase_orders: (frm) => show_open_orders(frm, "Purchase Order"),
+	open_work_orders: (frm) => show_open_orders(frm, "Work Order"),
+	open_subcontracting_orders: (frm) => show_open_orders(frm, "Subcontracting Order"),
+	fixed_assets: (frm) => show_fixed_assets(frm),
+	boms: (frm) => show_boms(frm),
+});
+
+// ---------- Taxes ----------
+
+// ERPNext's own tax templates, one row per tax line; no rows means no tax is charged
+function show_taxes(frm) {
+	get_data(frm, "get_taxes").then((r) => {
+		const taxes = r.message;
+		const templates = {};
+		for (const row of taxes.rows) {
+			const key = `${row.tax_type}\n${row.title}`;
+			templates[key] = templates[key] || { ...row, lines: [] };
+			templates[key].lines.push(row);
+		}
+		const dialog = new frappe.ui.Dialog({
+			title: __("Taxes"),
+			size: "extra-large",
+			fields: [
+				{ fieldname: "intro", fieldtype: "HTML" },
+				{
+					fieldname: "rows",
+					fieldtype: "Table",
+					in_place_edit: 1,
+					data: taxes.rows.map((row) => ({ ...row })),
+					fields: [
+						{
+							fieldname: "tax_type",
+							fieldtype: "Select",
+							options: ["Sales", "Purchase"],
+							label: __("Type"),
+							in_list_view: 1,
+							columns: 2,
+							default: "Sales",
+							onchange: () => refresh_defaults(),
+						},
+						{
+							fieldname: "title",
+							fieldtype: "Data",
+							label: __("Template"),
+							in_list_view: 1,
+							columns: 4,
+							onchange: () => refresh_defaults(),
+						},
+						{
+							fieldname: "account",
+							fieldtype: "Link",
+							options: "Account",
+							label: __("Tax account"),
+							in_list_view: 1,
+							columns: 3,
+							// a new tax account is added with Add tax account, not the full form
+							only_select: 1,
+							filter_description: __("Only accounts of type Tax are listed."),
+							get_query: () => ({
+								filters: {
+									company: frm.doc.company,
+									account_type: "Tax",
+									is_group: 0,
+									disabled: 0,
+								},
+							}),
+						},
+						{
+							fieldname: "rate",
+							fieldtype: "Float",
+							label: __("Rate %"),
+							in_list_view: 1,
+							columns: 1,
+						},
+					],
+				},
+				{ fieldname: "notes", fieldtype: "HTML" },
+				// the template new invoices and bills start with, only when the user picks one: a company
+				// may sell exempt services too
+				...["Sales", "Purchase"].map((tax_type) => ({
+					fieldname: `default_${tax_type.toLowerCase()}`,
+					fieldtype: "Select",
+					label:
+						tax_type === "Sales" ? __("Default sales template") : __("Default purchase template"),
+					description: __("New invoices start with it. Leave empty for none."),
+					default: taxes.defaults?.[tax_type] || "",
+					hidden: 1,
+				})),
+			],
+			primary_action_label: __("Save taxes"),
+			primary_action: () =>
+				call_method(
+					frm,
+					"save_taxes",
+					{
+						rows: dialog.get_value("rows") || [],
+						defaults: {
+							Sales: dialog.get_value("default_sales"),
+							Purchase: dialog.get_value("default_purchase"),
+						},
+					},
+					{ freeze: true }
+				).then(() => {
+					dialog.hide();
+					reload_fresh(frm);
+					frappe.ui.toast({ type: "success", message: __("Taxes saved.") });
+				}),
+			secondary_action_label: __("Close"),
+			secondary_action: () => dialog.hide(),
+		});
+		// the default pickers offer the templates in the rows as they are typed
+		const refresh_defaults = () => {
+			for (const tax_type of ["Sales", "Purchase"]) {
+				const fieldname = `default_${tax_type.toLowerCase()}`;
+				const titles = [
+					...new Set(
+						(dialog.fields_dict.rows.df.data || [])
+							.filter((row) => row.tax_type === tax_type && cstr(row.title).trim())
+							.map((row) => cstr(row.title).trim())
+					),
+				];
+				const value = defaults_shown ? dialog.get_value(fieldname) : taxes.defaults?.[tax_type];
+				dialog.set_df_property(fieldname, "options", ["", ...titles]);
+				dialog.set_df_property(fieldname, "hidden", titles.length ? 0 : 1);
+				dialog.set_value(fieldname, titles.includes(value) ? value : "");
+			}
+			defaults_shown = true;
+		};
+		let defaults_shown = false;
+		const example = {
+			India: __(
+				"One row per tax line. Rows with the same template name make one template, like CGST 9% and SGST 9% in GST 18%."
+			),
+			"United States": __(
+				"One row per tax line. Rows with the same template name make one template, like State 6.25% and County 2% in Sales Tax 8.25%."
+			),
+		};
+		const add_tax_account = () => {
+			const prompt = frappe.prompt(
+				[
+					{ fieldname: "account_name", fieldtype: "Data", label: __("Account Name"), reqd: 1 },
+					{
+						fieldname: "parent",
+						fieldtype: "Link",
+						options: "Account",
+						label: __("Under"),
+						reqd: 1,
+						only_select: 1,
+						default: taxes.tax_group,
+						get_query: () => ({ filters: { company: frm.doc.company, is_group: 1 } }),
+					},
+				],
+				(values) =>
+					frappe
+						.call({
+							method: "erpnext.accounts.utils.add_ac",
+							args: {
+								doctype: "Account",
+								company: frm.doc.company,
+								account_name: values.account_name,
+								account_type: "Tax",
+								parent: values.parent,
+								is_group: 0,
+								is_root: 0,
+							},
+							freeze: true,
+						})
+						.then((r) => {
+							taxes.accounts.push(r.message);
+							dialog.$wrapper.find("[data-no-tax-account]").remove();
+							frappe.ui.toast({
+								type: "success",
+								message: __("{0} added. Pick it in a row.", [values.account_name]),
+								duration: 8000,
+							});
+						}),
+				__("Add tax account"),
+				__("Add")
+			);
+			// typing replaces the suggested group instead of adding to it
+			const $parent = prompt.get_field("parent").$input;
+			$parent.on("focus", () => setTimeout(() => $parent.select()));
+		};
+		dialog.get_field("intro").$wrapper.append(
+			$(`<div class="flex flex-wrap items-start justify-between gap-2 mb-3"></div>`).append(
+				$(`<div class="text-p-base text-ink-gray-7"></div>`).text(
+					example[taxes.country] ||
+						__(
+							"One row per tax line, like VAT 20%. Rows with the same template name make one template with all their lines."
+						)
+				),
+				frappe.ui.button({ label: __("Add tax account"), icon: "plus", onclick: add_tax_account })
+			),
+			taxes.other_templates?.length
+				? $(`<div class="mb-3"></div>`).append(
+						frappe.ui.alert({
+							theme: "blue",
+							title: __("Templates already in ERPNext: {0}", [
+								taxes.other_templates
+									.map((template) =>
+										template.is_default
+											? __("{0} ({1}, default)", [
+													template.title,
+													__(template.tax_type),
+											  ])
+											: __("{0} ({1})", [template.title, __(template.tax_type)])
+									)
+									.join(", "),
+							]),
+							description: taxes.other_templates.some((template) => template.tax_category)
+								? __(
+										"Some have a tax category, like {0}: an invoice whose customer or address has that category takes that template, not the default here. Add only what they lack here, and disable the ones you don't use from their list.",
+										[
+											taxes.other_templates.find((template) => template.tax_category)
+												.tax_category,
+										]
+								  )
+								: __(
+										"Invoices can pick these too, by tax category or as the default. Add only what they lack here; your default template of each type is set below. Disable the ones you don't use from their list."
+								  ),
+						})
+				  )
+				: []
+		);
+		dialog.get_field("notes").$wrapper.append(
+			Object.keys(templates).length
+				? make_kv_lines(
+						Object.values(templates).map((template) => [
+							__("{0} · {1}", [template.title, __(template.tax_type)]),
+							template.lines.length > 1
+								? __("{0} = {1}%", [
+										template.lines
+											.map((line) =>
+												__("{0} {1}%", [short_account(frm, line.account), line.rate])
+											)
+											.join(" + "),
+										template.lines.reduce((sum, line) => sum + flt(line.rate), 0),
+								  ])
+								: __("{0}%", [template.lines[0].rate]),
+						])
+				  ).addClass("mb-3")
+				: [],
+			grey_line(
+				__(
+					"Leave it empty if you charge no tax: saving with no rows marks this done. Tax accounts list only accounts of type Tax."
+				)
+			),
+			taxes.accounts.length
+				? []
+				: make_alerts([
+						{
+							theme: "yellow",
+							title: __("This company has no account of type Tax."),
+							description: __(
+								"Add one with Add tax account, or save with no rows if you charge no tax."
+							),
+							buttons: [{ label: __("Add tax account"), onclick: add_tax_account }],
+						},
+				  ])
+						.addClass("mt-3")
+						.attr("data-no-tax-account", 1)
+		);
+		dialog.show();
+		refresh_defaults();
+	});
+}
+
+// ---------- Warehouses ----------
+
+const WAREHOUSE_KINDS = ["Our warehouse", "Job worker", "Work in progress"];
+
+// Every warehouse with its kind, job worker and stock line; the ones only on a stock sheet are new
+function show_warehouses(frm, { job_workers = false } = {}) {
+	Promise.all([
+		get_data(frm, "get_warehouses"),
+		frappe.db.get_list("Supplier", { fields: ["name"], limit: 0 }),
+	]).then(([r, suppliers]) => {
+		const details = r.message;
+		const known = new Set(suppliers.map((supplier) => supplier.name.trim().toLowerCase()));
+		const is_new_supplier = (name) => Boolean(name) && !known.has(name.trim().toLowerCase());
+		const all = details.rows.map((row) => ({ ...row }));
+		const shown = job_workers ? all.filter((row) => row.kind === "Job worker") : all;
+		const badge = (text, is_new) =>
+			text
+				? `<span class="flex items-center gap-2 min-w-0">
+					<span class="truncate">${frappe.utils.escape_html(text)}</span>
+					${
+						is_new
+							? `<span class="shrink-0">${frappe.ui.badge.html({
+									label: __("New"),
+									theme: "blue",
+							  })}</span>`
+							: ""
+					}
+				</span>`
+				: "";
+		const refresh = () => refresh_state();
+		const dialog = new frappe.ui.Dialog({
+			title: __("Warehouses"),
+			size: "extra-large",
+			fields: [
+				{ fieldname: "intro", fieldtype: "HTML" },
+				{
+					fieldname: "rows",
+					fieldtype: "Table",
+					in_place_edit: 1,
+					data: shown,
+					on_delete_rows: refresh,
+					fields: [
+						{
+							fieldname: "warehouse_name",
+							fieldtype: "Data",
+							label: __("Warehouse"),
+							in_list_view: 1,
+							columns: 3,
+							formatter: (value, df, options, doc) => badge(value, doc && !doc.warehouse),
+							onchange: refresh,
+						},
+						{
+							fieldname: "kind",
+							fieldtype: "Select",
+							options: WAREHOUSE_KINDS,
+							label: __("Kind"),
+							in_list_view: 1,
+							columns: 2,
+							default: job_workers ? "Job worker" : "Our warehouse",
+							onchange: refresh,
+						},
+						{
+							fieldname: "job_worker",
+							fieldtype: "Link",
+							options: "Supplier",
+							label: __("Job worker"),
+							in_list_view: 1,
+							columns: 2,
+							ignore_link_validation: 1,
+							formatter: (value) => badge(value, is_new_supplier(value)),
+							onchange: refresh,
+						},
+						{
+							fieldname: "account",
+							fieldtype: "Link",
+							options: "Account",
+							label: __("Stock line"),
+							in_list_view: 1,
+							columns: 2,
+							get_query: () => ({
+								filters: { company: frm.doc.company, account_type: "Stock", is_group: 0 },
+							}),
+						},
+						{
+							fieldname: "rows_on_sheet",
+							fieldtype: "Int",
+							label: __("Rows on sheet"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 1,
+						},
+						{ fieldname: "warehouse", fieldtype: "Data", hidden: 1 },
+					],
+				},
+				{ fieldname: "notes", fieldtype: "HTML" },
+			],
+			primary_action_label: __("Save warehouses"),
+			primary_action: () => save(),
+			secondary_action_label: __("Close"),
+			secondary_action: () => dialog.hide(),
+		});
+		const grid = dialog.fields_dict.rows.grid;
+		fix_delete_all_rows(grid);
+		const rows = () => grid.df.data || [];
+		const save = () => {
+			const visible = rows();
+			const kept = all.filter((row) => !shown.includes(row));
+			return call_method(
+				frm,
+				"save_warehouses",
+				{ rows: [...kept, ...visible].filter((row) => row.warehouse_name) },
+				{ freeze: true }
+			).then(() => {
+				dialog.hide();
+				reload_fresh(frm);
+				frappe.ui.toast({ type: "success", message: __("Warehouses saved.") });
+			});
+		};
+		const refresh_state = () => {
+			const $intro = dialog.get_field("intro").$wrapper.empty();
+			$intro.append(
+				$(`<div class="text-p-base text-ink-gray-7 mb-3"></div>`).text(
+					job_workers
+						? __("Your job workers, each with a warehouse for your stock with them.")
+						: __("One row per warehouse. New warehouses from your stock sheet are listed too.")
+				)
+			);
+			const new_workers = [
+				...new Set(
+					rows()
+						.filter((row) => row.kind === "Job worker" && is_new_supplier(row.job_worker))
+						.map((row) => row.job_worker)
+				),
+			];
+			const alerts = [];
+			const no_worker = rows().filter((row) => row.kind === "Job worker" && !row.job_worker);
+			if (no_worker.length) {
+				alerts.push({
+					theme: "red",
+					title: plural(
+						no_worker.length,
+						__("Name the job worker of 1 warehouse."),
+						__("Name the job worker of {0} warehouses.", [no_worker.length])
+					),
+				});
+			}
+			if (new_workers.length && !details.can_create_supplier) {
+				alerts.push({
+					theme: "red",
+					title: __("You can't add a Supplier, so {0} can't be made. Ask someone who can.", [
+						new_workers.join(", "),
+					]),
+				});
+			}
+			$intro.append(make_alerts(alerts).addClass("mb-3"));
+			if (new_workers.length && details.can_create_supplier) {
+				$intro.append(
+					grey_line(
+						new_workers.length === 1
+							? __("1 job worker is new: {0}. It is made as a supplier when you save.", [
+									new_workers[0],
+							  ])
+							: __("{0} job workers are new: {1}. They are made as suppliers when you save.", [
+									new_workers.length,
+									new_workers.join(", "),
+							  ])
+					).addClass("mb-3")
+				);
+			}
+			const locked = rows().filter((row) => row.locked && row.account);
+			dialog
+				.get_field("notes")
+				.$wrapper.empty()
+				.append(
+					locked.map((row) =>
+						grey_line(
+							__("{0} has stock entries, so its stock line stays {1}.", [
+								row.warehouse_name,
+								short_account(frm, row.account),
+							])
+						).addClass("mt-2")
+					)
+				);
+			const added = rows().filter((row) => !row.warehouse && row.warehouse_name).length;
+			dialog
+				.get_primary_btn()
+				.text(
+					added
+						? plural(added, __("Add 1 warehouse"), __("Add {0} warehouses", [added]))
+						: __("Save warehouses")
+				);
+			set_footer_reason(dialog, alerts.length ? __("Clear the red to save.") : null);
+		};
+		dialog.show();
+		refresh_state();
+	});
+}
+
+// ---------- One window for a sheet: upload, checks, grid, confirm ----------
+
+// Frappe's Delete all rows clears this.frm.doc, which a dialog grid has not: clear its own rows
+function fix_delete_all_rows(grid) {
+	grid.delete_all_rows = () =>
+		frappe.confirm(__("Are you sure you want to delete all {0} rows?", [grid.data.length]), () => {
+			grid.df.data = [];
+			grid.refresh();
+			grid.df.on_delete_rows?.();
+		});
+}
+
+// a qty typed keeps the row's rate: the value follows
+function set_rate_on_amount() {
+	if (flt(this.doc.qty)) this.doc.rate = flt(this.doc.amount) / flt(this.doc.qty);
+}
+
+function keep_rate_on_qty() {
+	const row = this.doc;
+	const rate = flt(row.rate) || (flt(row.old_qty) ? flt(row.old_amount) / flt(row.old_qty) : 0);
+	if (!rate) return;
+	row.rate = rate;
+	row.amount = flt(flt(row.qty) * rate, 2);
+	this.grid_row?.refresh_field("amount");
+}
+
+function list_column(fieldname, fieldtype, label, columns, extra = {}) {
+	return { fieldname, fieldtype, label, columns, in_list_view: 1, ...extra };
+}
+
+// The sheet, its cards and messages, and the confirm that replaces it. Each step's window fills it.
+class SheetWindow {
+	// row_form: each row opens a form with the fields not in the list. open: opens this window again.
+	// save_method and get_method keep the rows and read the checks, with args.
+	constructor(
+		frm,
+		{
+			title,
+			where,
+			fields,
+			extra_fields = [],
+			has_data,
+			row_form = false,
+			open,
+			save_method,
+			get_method,
+			args = {},
+		}
+	) {
+		const win = this;
+		this.frm = frm;
+		this.open = open;
+		this.save_method = save_method;
+		this.get_method = get_method;
+		this.args = args;
+		this.currency = erpnext.get_currency(frm.doc.company);
+		this.day = day_before_text(frm);
+		this.title = title;
+		this.dirty = false;
+		this.dialog = new frappe.ui.Dialog({
+			title: title,
+			size: "extra-large",
+			fields: [
+				{ fieldname: "head", fieldtype: "HTML" },
+				{ fieldname: "stats", fieldtype: "HTML" },
+				{ fieldname: "alerts", fieldtype: "HTML" },
+				{
+					fieldname: "rows",
+					fieldtype: "Table",
+					in_place_edit: row_form ? 0 : 1,
+					data: [],
+					on_delete_rows: () => this.changed(),
+					fields: fields.map((df) =>
+						df.read_only || df.hidden
+							? df
+							: {
+									...df,
+									onchange: function (e) {
+										df.onchange?.apply(this, [e]);
+										win.changed();
+									},
+							  }
+					),
+				},
+				{ fieldname: "notes", fieldtype: "HTML" },
+				...extra_fields,
+				{ fieldname: "confirm", fieldtype: "HTML", hidden: 1 },
+				...(where ? where_to_find_fields(frm, where, { has_data: has_data, posted: false }) : []),
+			],
+			primary_action_label: __("Post to books"),
+			primary_action: () => this.post(),
+			secondary_action_label: __("Save draft"),
+			secondary_action: () => this.save_draft(),
+		});
+		if (where) fill_where(frm, this.dialog, where);
+		this.grid = this.dialog.fields_dict.rows.grid;
+		fix_delete_all_rows(this.grid);
+		this.$back = $(`<div class="hide"></div>`).appendTo(this.dialog.custom_actions);
+		this.views = {
+			sheet: ["head", "stats", "alerts", "rows", "notes", "where_section"],
+			confirm: ["confirm"],
+		};
+	}
+
+	money(value) {
+		return format_currency(value, this.currency);
+	}
+
+	render() {}
+
+	refresh_footer() {}
+
+	set_view(view) {
+		for (const [name, fields] of Object.entries(this.views)) {
+			for (const field of fields) {
+				if (this.dialog.fields_dict[field]) {
+					this.dialog.set_df_property(field, "hidden", name === view ? 0 : 1);
+				}
+			}
+		}
+		this.dialog.get_primary_btn().removeAttr("data-theme").removeClass("hide").prop("disabled", false);
+		this.$back.empty().addClass("hide");
+		this.view = view;
+	}
+
+	set_back(onclick) {
+		this.$back
+			.empty()
+			.removeClass("hide")
+			.append(frappe.ui.button({ label: __("Back"), onclick: onclick }));
+	}
+
+	set_rows(rows) {
+		this.grid.df.data = rows;
+		this.grid.refresh();
+	}
+
+	get_rows() {
+		return this.grid.df.data || [];
+	}
+
+	// a row the checks name goes first, so it is in view
+	show_rows(test) {
+		const rows = this.get_rows();
+		this.set_rows([...rows.filter(test), ...rows.filter((row) => !test(row))]);
+	}
+
+	changed() {
+		this.dirty = true;
+		this.refresh_footer();
+	}
+
+	make_head(intro, { upload, menu = [] } = {}) {
+		this.dialog.get_field("head").$wrapper.empty().append(make_sheet_head(intro, upload, menu));
+	}
+
+	set_stats(cards) {
+		this.dialog
+			.get_field("stats")
+			.$wrapper.empty()
+			.append(cards.length ? $(`<div class="es-stat-card-grid mb-3"></div>`).append(cards) : []);
+	}
+
+	set_alerts(alerts, lines = []) {
+		this.dialog
+			.get_field("alerts")
+			.$wrapper.empty()
+			.append(
+				make_alerts(alerts).addClass("mb-3"),
+				lines.filter(Boolean).map((line) => (line.jquery ? line : grey_line(line)).addClass("mb-3"))
+			);
+	}
+
+	upload(method, replaces, after = (result) => this.open(result)) {
+		upload_sheet(this.frm, method, this.args, { replaces, dialog: this.dialog, after });
+	}
+
+	show() {
+		this.set_rows(this.drafts);
+		this.show_sheet();
+		this.dialog.show();
+	}
+
+	save(rows = this.get_rows(), args = {}) {
+		return call_method(this.frm, this.save_method, {
+			...this.args,
+			...args,
+			rows: rows.map((row) => ({ ...row, doc_idx: undefined, idx: undefined })),
+		});
+	}
+
+	save_draft() {
+		return this.save().then(() =>
+			this.reopen().then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }))
+		);
+	}
+
+	// the checks again, on the rows saved: a red shows on the sheet, else the confirm
+	post() {
+		const go = () =>
+			get_data(this.frm, this.get_method, this.args).then((r) => {
+				this.checks = r.message;
+				if (this.checks.blocker) return this.render();
+				this.confirm_post();
+			});
+		if (!this.dirty) return go();
+		return this.save().then(() => {
+			this.dirty = false;
+			return go();
+		});
+	}
+
+	show_confirm({ title, back, body, primary, on_primary, theme }) {
+		this.set_view("confirm");
+		this.dialog.set_title(title);
+		this.dialog
+			.get_field("confirm")
+			.$wrapper.empty()
+			.append(
+				$(`<div class="flex flex-col gap-3"></div>`).append(
+					make_back_line(back, () => this.show_sheet()),
+					body
+				)
+			);
+		set_footer_reason(this.dialog, null);
+		this.dialog.set_primary_action(primary, on_primary);
+		if (theme) this.dialog.get_primary_btn().attr("data-theme", theme);
+		this.dialog.set_secondary_action_label(__("Back"));
+		this.dialog.set_secondary_action(() => this.show_sheet());
+	}
+
+	show_sheet() {
+		this.set_view("sheet");
+		this.dialog.set_title(this.title);
+		this.render();
+	}
+
+	reopen() {
+		this.dialog.hide();
+		return reload_fresh(this.frm).then(() => this.open());
+	}
+}
+
+// ---------- Opening stock ----------
+
+const STOCK_FIELDS = [
+	"item_name",
+	"warehouse_name",
+	"qty",
+	"uom",
+	"rate",
+	"amount",
+	"stock_group",
+	"batch_no",
+	"expiry_date",
+	"serial_no",
+	"challan_no",
+	"challan_date",
+	"return_due",
+	"source",
+	"idx",
+];
+
+function show_opening_stock(frm, result) {
+	get_data(frm, "get_opening_stock").then((r) => new OpeningStockWindow(frm, r.message, result).show());
+}
+
+class OpeningStockWindow extends SheetWindow {
+	constructor(frm, checks, result) {
+		const drafts = (frm.doc.opening_stock || []).filter((row) => row.status !== "Posted");
+		const job_work =
+			checks.reds.some((red) => red.key === "challan") ||
+			drafts.some((row) => row.challan_no || row.challan_date);
+		const batched = !job_work && drafts.some((row) => row.batch_no || row.expiry_date);
+		super(frm, {
+			title: __("Opening stock"),
+			open: (result) => show_opening_stock(frm, result),
+			save_method: "save_opening_stock",
+			get_method: "get_opening_stock",
+			where: "opening_stock",
+			has_data: drafts.length,
+			fields: [
+				list_column("item_name", "Data", __("Item"), job_work || batched ? 2 : 3),
+				list_column("warehouse_name", "Data", __("Warehouse"), 2),
+				list_column("qty", "Float", __("Qty"), 1, { onchange: keep_rate_on_qty }),
+				list_column("uom", "Data", __("Unit"), 1),
+				job_work || batched
+					? { fieldname: "rate", fieldtype: "Currency", label: __("Rate") }
+					: list_column("rate", "Currency", __("Rate"), 1),
+				list_column("amount", "Currency", __("Value"), job_work ? 1 : 2, {
+					onchange: set_rate_on_amount,
+				}),
+				job_work
+					? list_column("challan_no", "Data", __("Challan no"), 1)
+					: { fieldname: "challan_no", fieldtype: "Data", label: __("Challan no") },
+				job_work
+					? list_column("challan_date", "Date", __("Challan date"), 1)
+					: { fieldname: "challan_date", fieldtype: "Date", label: __("Challan date") },
+				job_work
+					? list_column("return_due", "Date", __("Return due"), 1)
+					: { fieldname: "return_due", fieldtype: "Date", label: __("Return due") },
+				batched
+					? list_column("batch_no", "Data", __("Batch"), 1)
+					: { fieldname: "batch_no", fieldtype: "Data", label: __("Batch") },
+				batched
+					? list_column("expiry_date", "Date", __("Expiry date"), 1)
+					: { fieldname: "expiry_date", fieldtype: "Date", label: __("Expiry date") },
+				{ fieldname: "serial_no", fieldtype: "Small Text", label: __("Serial No") },
+				{ fieldname: "stock_group", fieldtype: "Data", label: __("Stock group") },
+				{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+				{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
+			],
+			extra_fields: [{ fieldname: "lines", fieldtype: "HTML" }],
+		});
+		this.views.sheet.push("lines");
+		this.checks = checks;
+		this.result = result;
+		this.drafts = drafts.map((row) => ({
+			...Object.fromEntries(STOCK_FIELDS.map((field) => [field, row[field]])),
+			old_qty: row.qty,
+			old_amount: row.amount,
+			doc_idx: row.idx,
+		}));
+	}
+
+	render() {
+		const { checks, frm } = this;
+		const drafts = checks.drafts;
+		const posted = checks.posted;
+		const tb = checks.trial_balance;
+		const lines = Object.keys(tb.lines).length;
+		this.make_head(
+			drafts.rows || !posted.rows
+				? __("One row per item per warehouse, as on {0}. Upload one sheet or several.", [this.day])
+				: __("One row per item per warehouse, as on {0}.", [this.day]),
+			{
+				upload: () =>
+					this.upload(
+						"import_opening_stock",
+						this.get_rows().length &&
+							__(
+								"The sheet replaces draft rows of the same item and warehouse, and its own drafts if it was uploaded before. Other drafts and posted rows stay as they are. Continue?"
+							)
+					),
+				menu: [
+					posted.rows && {
+						label: __("Posted stock"),
+						icon: "list",
+						onclick: () => {
+							this.dialog.hide();
+							show_posted_stock(frm);
+						},
+					},
+					{ label: __("Download sheet"), icon: "download", onclick: () => download_stock(frm) },
+					...[...new Set((frm.doc.undone_stock || []).map((row) => row.source || ""))].map(
+						(source) => ({
+							label: __("Undone rows back to drafts: {0}", [source || __("Typed in")]),
+							icon: "undo-2",
+							onclick: () =>
+								call_method(frm, "restore_undone_stock", { source }).then(() =>
+									this.reopen()
+								),
+						})
+					),
+					...(tb.movable || []).map((account) => ({
+						label: __("Keep {0} as a balance", [short_account(frm, account)]),
+						icon: "undo-2",
+						onclick: () =>
+							frappe.confirm(
+								__(
+									"{0} goes back to Opening balances as a plain balance, and no stock rows post to it. Continue?",
+									[short_account(frm, account)]
+								),
+								() =>
+									call_method(frm, "move_to_opening_balances", { account }).then(() =>
+										this.reopen()
+									)
+							),
+					})),
+				].filter(Boolean),
+			}
+		);
+		const sources = (list) => list.map((source) => source || __("Typed in")).join(", ");
+		const value = (rows, amount) =>
+			__("{0} · {1}", [plural(rows, __("1 row"), __("{0} rows", [rows])), this.money(amount)]);
+		this.set_stats(
+			[
+				drafts.rows &&
+					frappe.ui.stat_card({
+						label: drafts.sources.length > 1 ? __("In draft") : __("On this sheet"),
+						value: value(drafts.rows, drafts.value),
+						caption: [
+							this.result?.read &&
+								plural(
+									this.result.read,
+									__("1 row read"),
+									__("{0} rows read", [this.result.read])
+								),
+							sources(drafts.sources),
+							plural(
+								drafts.warehouses,
+								__("1 warehouse"),
+								__("{0} warehouses", [drafts.warehouses])
+							),
+						]
+							.filter(Boolean)
+							.join(" · "),
+					}),
+				frappe.ui.stat_card({
+					label: __("Posted"),
+					value: posted.rows ? value(posted.rows, posted.value) : __("Nothing yet"),
+					caption: posted.rows
+						? drafts.rows
+							? sources(posted.sources)
+							: [
+									plural(
+										posted.sources.length,
+										__("1 upload"),
+										__("{0} uploads", [posted.sources.length])
+									),
+									plural(
+										posted.warehouses,
+										__("1 warehouse"),
+										__("{0} warehouses", [posted.warehouses])
+									),
+							  ].join(" · ")
+						: null,
+				}),
+				frappe.ui.stat_card({
+					label: __("Your trial balance"),
+					value: this.money(tb.total),
+					caption: lines
+						? plural(
+								lines,
+								__("1 stock line"),
+								__("{0} stock lines, each checked on its own", [lines])
+						  )
+						: __("No stock in your trial balance"),
+				}),
+			].filter(Boolean)
+		);
+		const kept = Object.entries(tb.kept || {}).map(([account, amount]) =>
+			__("{0} {1} is kept in your opening balances, so it is not counted here.", [
+				short_account(frm, account),
+				format_currency(amount, this.currency, 0),
+			])
+		);
+		const upload_lines = [];
+		if (this.result?.replaced) {
+			upload_lines.push(
+				plural(
+					this.result.replaced,
+					__("1 draft row was replaced by the new sheet."),
+					__("{0} draft rows were replaced by the new sheet.", [this.result.replaced])
+				)
+			);
+		}
+		if (this.result?.skipped) {
+			upload_lines.push(
+				plural(
+					this.result.skipped,
+					__("1 row is already posted and is left out."),
+					__("{0} rows are already posted and are left out.", [this.result.skipped])
+				)
+			);
+		}
+		this.set_alerts(this.get_alerts(), [...upload_lines, ...kept]);
+		this.dialog.set_df_property("rows", "hidden", drafts.rows || !posted.rows ? 0 : 1);
+		this.dialog.set_df_property("where_section", "hidden", drafts.rows || !posted.rows ? 0 : 1);
+		this.render_lines();
+		this.refresh_footer();
+	}
+
+	get_alerts() {
+		const { checks, frm } = this;
+		const rows = (idxs) => {
+			const set = new Set(idxs);
+			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
+		};
+		const go = (label, open) => ({
+			label: label,
+			onclick: () => {
+				this.dialog.hide();
+				open();
+			},
+		});
+		const red = (title, buttons = [], description) => ({ theme: "red", title, description, buttons });
+		// the server's reds, in order; a few get a button to the step that fixes them
+		const actions = {
+			posting_blocker: checks.posting_fix ? [fix_button(checks.posting_fix, frm)] : [],
+			perpetual_inventory: [
+				{
+					label: __("Turn it on"),
+					onclick: () => call_method(frm, "turn_on_perpetual_inventory").then(() => this.reopen()),
+				},
+			],
+			missing_warehouses: [go(__("Go to Warehouses"), () => show_warehouses(frm))],
+			wrong_lines: [go(__("Go to Warehouses"), () => show_warehouses(frm))],
+			no_serials: [
+				{
+					label: __("Make serial numbers"),
+					onclick: () =>
+						(this.dirty ? this.save() : Promise.resolve())
+							.then(() => call_method(frm, "make_serial_numbers"))
+							.then(() => this.reopen()),
+				},
+			],
+			untracked: frm.doc.__onload?.serial_batch_off
+				? [
+						{
+							label: __("Turn on batch and serial numbers"),
+							onclick: () =>
+								call_method(frm, "turn_on_serial_and_batch").then(() => this.reopen()),
+						},
+				  ]
+				: [],
+			missing_items: [go(__("Go to Items"), () => open_party_import(frm, "Item"))],
+			in_stock: [go(__("Posted stock"), () => show_posted_stock(frm))],
+			kept: checks.reds.find((red) => red.key === "kept")?.account
+				? [
+						{
+							label: __("Move it to stock"),
+							onclick: () =>
+								call_method(frm, "move_to_opening_stock", {
+									account: checks.reds.find((red) => red.key === "kept").account,
+								}).then(() => this.reopen()),
+						},
+				  ]
+				: [],
+		};
+		const names_of = (idxs) => {
+			const set = new Set(idxs);
+			const names = [
+				...new Set(
+					this.get_rows()
+						.filter((row) => set.has(row.doc_idx))
+						.map((row) => row.item_name)
+				),
+			];
+			return names.slice(0, 5).join(", ") + (names.length > 5 ? ", …" : "");
+		};
+		const alerts = (checks.reds || [])
+			.filter((item) => item.key !== "no_drafts")
+			.map((item) =>
+				red(
+					item.text,
+					[...(actions[item.key] || []), ...(item.rows.length ? [rows(item.rows)] : [])],
+					item.key === "missing_items" ? names_of(item.rows) : undefined
+				)
+			);
+		let red_count = alerts.length;
+		const close = Object.entries(checks.close_items || {});
+		if (close.length) {
+			alerts.push({
+				theme: "yellow",
+				title: plural(
+					close.length,
+					__("1 item has a close match: {0}.", [
+						close.map(([sheet, item]) => `${sheet} → ${item}`)[0],
+					]),
+					__("{0} items have close matches.", [close.length])
+				),
+				description: __("Check them before you use them."),
+				buttons: [
+					{ label: __("Use them"), onclick: () => this.use_close_items(close) },
+					{
+						label: __("Show rows"),
+						variant: "outline",
+						onclick: () => {
+							const names = new Set(close.map(([sheet]) => sheet));
+							this.show_rows((row) => names.has(row.item_name));
+						},
+					},
+				],
+			});
+		}
+		if (checks.expired?.length) {
+			alerts.push({
+				theme: "yellow",
+				title: plural(
+					checks.expired.length,
+					__("1 batch expired by {0}.", [this.day]),
+					__("{0} batches expired by {1}.", [checks.expired.length, this.day])
+				),
+				description: __("They post as stock. Leave them out if you will write them off."),
+				buttons: [rows(checks.expired)],
+			});
+		}
+		if (this.result?.differ) {
+			alerts.push({
+				theme: "yellow",
+				title: plural(
+					this.result.differ,
+					__("1 row left out differs from what was posted."),
+					__("{0} rows left out differ from what was posted.", [this.result.differ])
+				),
+				description: __("Correct them in Posted stock."),
+				buttons: [go(__("Posted stock"), () => show_posted_stock(frm))],
+			});
+		}
+		red_count = alerts.filter((alert) => alert.theme === "red").length;
+		const off = checks.drafts.rows ? checks.off : checks.match?.off ?? checks.off;
+		if (
+			!red_count &&
+			off !== null &&
+			Math.abs(off) >= 1 &&
+			Object.keys(checks.trial_balance.lines).length
+		) {
+			alerts.push({
+				theme: "yellow",
+				title:
+					off > 0
+						? __("{0} less than your trial balance.", [this.money(off)])
+						: __("{0} more than your trial balance.", [this.money(-off)]),
+				buttons:
+					checks.drafts.rows || !checks.posted.rows
+						? []
+						: [
+								{ label: __("Post the difference"), onclick: () => this.show_difference() },
+								{
+									label: __("Show rows"),
+									variant: "outline",
+									onclick: () =>
+										this.dialog
+											.get_field("lines")
+											.$wrapper[0].scrollIntoView({ block: "center" }),
+								},
+						  ],
+			});
+		} else if (!red_count && !checks.drafts.rows && checks.match?.lines_off?.length) {
+			alerts.push({
+				theme: "red",
+				title: __("The total matches, but stock is on the wrong lines."),
+				description: __(
+					"Undo the warehouses on the wrong line, set their stock line in Warehouses, and post them again."
+				),
+				buttons: [
+					go(__("Posted stock"), () => show_posted_stock(frm)),
+					go(__("Go to Warehouses"), () => show_warehouses(frm)),
+				],
+			});
+		}
+		return alerts;
+	}
+
+	// every warehouse posted with its stock line, then each line against the trial balance
+	render_lines() {
+		const $lines = this.dialog.get_field("lines").$wrapper.empty();
+		const match = this.checks.match;
+		if (this.checks.drafts.rows || !match?.warehouses?.length) return;
+		$lines.append(
+			make_read_table(
+				[[__("Warehouse")], [__("Rows"), true], [__("Posted"), true], [__("Stock line")]],
+				match.warehouses.map((warehouse) => [
+					warehouse.warehouse,
+					format_number(warehouse.rows, null, 0),
+					this.money(warehouse.posted),
+					short_account(this.frm, warehouse.account),
+				])
+			).addClass("mb-3"),
+			make_read_table(
+				[
+					[__("Stock line")],
+					[__("Posted"), true],
+					...(match.difference_posted ? [[__("Difference posted"), true]] : []),
+					[__("Trial balance"), true],
+					[__("Still off"), true],
+				],
+				match.lines.map((line) => [
+					short_account(this.frm, line.account) || __("Stock"),
+					this.money(line.books),
+					...(match.difference_posted ? [this.money(line.difference_posted)] : []),
+					this.money(line.line),
+					this.money(line.difference),
+				])
+			)
+		);
+	}
+
+	// the checks were for the saved rows: say so rather than show them stale
+	changed() {
+		if (!this.dirty) {
+			this.set_alerts([], [__("Rows changed. Save draft to check them again.")]);
+			this.dialog.get_field("lines").$wrapper.empty();
+		}
+		super.changed();
+	}
+
+	refresh_footer() {
+		if (this.view !== "sheet") return;
+		const has_drafts = this.get_rows().length;
+		this.dialog.set_primary_action(__("Post to books"), () => this.post());
+		this.dialog.get_primary_btn().toggleClass("hide", !has_drafts);
+		this.dialog.set_secondary_action_label(has_drafts || this.dirty ? __("Save draft") : __("Close"));
+		this.dialog.set_secondary_action(() =>
+			has_drafts || this.dirty ? this.save_draft() : this.dialog.hide()
+		);
+		const blocker = this.checks.blocker;
+		set_footer_reason(
+			this.dialog,
+			this.dirty || !has_drafts
+				? null
+				: !this.checks.perpetual_inventory
+				? __("Turn on perpetual inventory to post.")
+				: blocker && blocker !== __("Upload a sheet or add rows to post.")
+				? __("Clear the reds to post.")
+				: blocker
+		);
+	}
+
+	use_close_items(close) {
+		const map = Object.fromEntries(close);
+		const rows = this.get_rows().map((row) =>
+			map[row.item_name] ? { ...row, item_name: map[row.item_name] } : row
+		);
+		this.save(rows).then(() => this.reopen());
+	}
+
+	confirm_post() {
+		const { checks } = this;
+		const warehouses = [...new Set(this.get_rows().map((row) => row.warehouse_name))];
+		const off = checks.off;
+		const migration = frappe.datetime.str_to_user(this.frm.doc.migration_date);
+		this.show_confirm({
+			title: __("Post opening stock?"),
+			back: __("Back to the stock sheet. Nothing is posted until you confirm."),
+			body: [
+				make_kv_lines(
+					[
+						[
+							__("To post"),
+							[
+								plural(checks.drafts.rows, __("1 row"), __("{0} rows", [checks.drafts.rows])),
+								warehouses.length <= 2
+									? warehouses.join(", ")
+									: __("{0} warehouses", [warehouses.length]),
+								this.money(checks.drafts.value),
+							].join(" · "),
+						],
+						checks.posted.rows && [
+							__("Posted before"),
+							[
+								plural(checks.posted.rows, __("1 row"), __("{0} rows", [checks.posted.rows])),
+								this.money(checks.posted.value),
+								checks.posted.sources.map((source) => source || __("Typed in")).join(", "),
+							].join(" · "),
+						],
+					].filter(Boolean)
+				),
+				off !== null &&
+					Math.abs(off) >= 1 &&
+					grey_line(
+						off > 0
+							? __(
+									"{0} less than your trial balance. Fix rows or post the difference after this.",
+									[this.money(off)]
+							  )
+							: __(
+									"{0} more than your trial balance. Fix rows or post the difference after this.",
+									[this.money(-off)]
+							  )
+					),
+				checks.later_entries &&
+					grey_line(
+						__(
+							"Cost of goods sold and profit since {0} change. ERPNext works out the new costs in the background, usually within the hour.",
+							[migration]
+						)
+					),
+				checks.reposting_timeslot &&
+					grey_line(
+						__("Later entries are valued again between {0} and {1}.", [
+							checks.reposting_timeslot.start_time,
+							checks.reposting_timeslot.end_time,
+						])
+					),
+			].filter(Boolean),
+			primary: __("Post {0}", [
+				plural(checks.drafts.rows, __("1 row"), __("{0} rows", [checks.drafts.rows])),
+			]),
+			on_primary: () =>
+				call_method(this.frm, "post_opening_stock", {}, { freeze: true }).then((r) => {
+					this.dialog.hide();
+					after_run(
+						this.frm,
+						r.message,
+						__("Posting the stock in the background. This page updates when it's done."),
+						() => show_stock_posted(this.frm, checks.drafts.rows)
+					);
+				}),
+		});
+	}
+
+	show_difference() {
+		get_data(this.frm, "get_stock_difference").then((r) => {
+			const difference = r.message;
+			if (difference.blocker) {
+				frappe.ui.toast({ type: "error", message: difference.blocker });
+				return;
+			}
+			const total = difference.lines.reduce((sum, line) => sum + flt(line.difference), 0);
+			const big = difference.lines.find((line) => line.big);
+			let $big = null;
+			let checked = null;
+			if (big) {
+				$big = make_alerts([
+					{
+						theme: "red",
+						title: __("{0} is a big gap on {1}. A warehouse may be missing.", [
+							this.money(Math.abs(big.difference)),
+							short_account(this.frm, big.account) || __("Stock"),
+						]),
+						description: __(
+							"Upload the missing warehouse, or tick below to post the difference."
+						),
+					},
+				]);
+				checked = frappe.ui.form.make_control({
+					df: {
+						fieldtype: "Check",
+						fieldname: "checked",
+						label: __("I checked: no warehouse is missing"),
+					},
+					parent: $big,
+					render_input: true,
+				});
+				checked.$wrapper.addClass("mb-0 mt-2");
+				checked.$input.on("change", () =>
+					this.dialog.get_primary_btn().prop("disabled", !checked.get_value())
+				);
+			}
+			this.show_confirm({
+				title: __("Post {0} to {1}?", [
+					this.money(Math.abs(total)),
+					short_account(this.frm, difference.account),
+				]),
+				back: __("Back to Opening stock. Nothing is posted until you confirm."),
+				body: [
+					make_read_table(
+						[
+							[__("Line")],
+							[__("Posted"), true],
+							[__("Trial balance"), true],
+							[__("Difference"), true],
+						],
+						difference.lines.map((line) => [
+							short_account(this.frm, line.account) || __("Stock"),
+							this.money(line.books),
+							this.money(line.line),
+							this.money(line.difference),
+						])
+					),
+					$big,
+					difference.empty_warehouses?.length &&
+						make_alerts([
+							{
+								theme: "red",
+								title: __("No stock posted in {0}.", [
+									difference.empty_warehouses.join(", "),
+								]),
+								description: __(
+									"Upload their rows first. Post the difference only if they are empty."
+								),
+							},
+						]),
+					grey_line(__("Temporary Opening goes down by {0}.", [this.money(Math.abs(total))])),
+					grey_line(
+						total > 0
+							? __(
+									"Your trial balance has {0} more stock than the rows posted. Your stock stays as posted, and the {0} goes to {1}. Show this to your CA.",
+									[
+										format_currency(total, this.currency, 0),
+										short_account(this.frm, difference.account),
+									]
+							  )
+							: __(
+									"Your trial balance has {0} less stock than the rows posted. Your stock stays as posted, and the {0} goes to {1}. Show this to your CA.",
+									[
+										format_currency(-total, this.currency, 0),
+										short_account(this.frm, difference.account),
+									]
+							  )
+					),
+				].filter(Boolean),
+				primary: __("Post the difference"),
+				on_primary: () =>
+					call_method(
+						this.frm,
+						"post_stock_difference",
+						{ checked: checked?.get_value() ? 1 : 0 },
+						{ freeze: true }
+					).then(() => {
+						this.dialog.hide();
+						reload_fresh(this.frm);
+						frappe.ui.toast({
+							type: "success",
+							message: __("{0} posted to {1}.", [
+								this.money(Math.abs(total)),
+								short_account(this.frm, difference.account),
+							]),
+						});
+					}),
+			});
+			if (big) this.dialog.get_primary_btn().prop("disabled", true);
+		});
+	}
+}
+
+function show_stock_corrected(frm, result) {
+	frappe.ui.toast({
+		type: "success",
+		message: __("{0} corrected · net {1}", [
+			plural(result.rows, __("1 row"), __("{0} rows", [result.rows])),
+			format_currency(result.amount, erpnext.get_currency(frm.doc.company)),
+		]),
+	});
+}
+
+function show_stock_posted(frm, rows) {
+	frappe.ui.toast({
+		type: "success",
+		message: __("{0} posted on {1}.", [
+			plural(rows, __("1 row"), __("{0} rows", [rows])),
+			day_before_text(frm),
+		]),
+	});
+}
+
+// ---------- Posted stock, assets and made orders: by upload, then View, undo ----------
+
+// What was posted from each upload, to view and undo in part or whole. opts says what one row is.
+function show_posted_window(frm, opts) {
+	const live = frm.doc.status === "Live";
+	const can_undo = !live || opts.undo_after_live;
+	const dialog = new frappe.ui.Dialog({
+		title: opts.title,
+		size: "extra-large",
+		fields: [
+			{ fieldname: "body", fieldtype: "HTML" },
+			{
+				fieldname: "rows",
+				fieldtype: "Table",
+				hidden: 1,
+				cannot_add_rows: 1,
+				cannot_delete_rows: 1,
+				in_place_edit: 1,
+				data: [],
+				fields: opts.fields.map((df) => ({ in_list_view: 1, read_only: 1, ...df })),
+			},
+			{ fieldname: "extra", fieldtype: "HTML" },
+		],
+		secondary_action_label: __("Close"),
+		secondary_action: () => dialog.hide(),
+	});
+	const $body = dialog.get_field("body").$wrapper;
+	const grid = dialog.fields_dict.rows.grid;
+	fix_delete_all_rows(grid);
+	const money = (value) => format_currency(value, erpnext.get_currency(frm.doc.company));
+	const line_of = (group) =>
+		[group.posted_on && opts.posted_word(format_time_posted(group.posted_on)), opts.group_line(group)]
+			.filter(Boolean)
+			.join(" · ");
+	const show_grid = (rows) => {
+		dialog.set_df_property("rows", "hidden", rows ? 0 : 1);
+		grid.df.data = rows || [];
+		grid.refresh();
+	};
+	const set_primary = (label, action) => {
+		const $primary = dialog.get_primary_btn();
+		if (!label) return $primary.addClass("hide");
+		dialog.set_primary_action(label, action);
+		$primary.attr("data-theme", "red");
+	};
+	let posted;
+
+	const show_list = () => {
+		dialog.set_title(opts.title);
+		set_primary(null);
+		dialog.set_secondary_action_label(__("Close"));
+		dialog.set_secondary_action(() => dialog.hide());
+		show_grid(null);
+		dialog.get_field("extra").$wrapper.empty();
+		const extra_rows = opts.extra_rows?.(posted, money) || [];
+		const undone = opts.undone?.(posted) || [];
+		$body.empty().append(
+			$(`<div class="flex flex-col gap-3"></div>`).append(
+				grey_line(
+					can_undo
+						? __("You can undo these until you go live.")
+						: __("One row for each sheet or typed-in batch.")
+				),
+				posted.groups.length || extra_rows.length
+					? make_box([
+							...posted.groups.map((group) => [
+								make_title_cell(source_name(group.source), line_of(group)),
+								opts.group_amount
+									? make_text(opts.group_amount(group, money), "text-ink-gray-8 shrink-0")
+									: [],
+								make_view_button(() => show_group(group)),
+							]),
+							...extra_rows,
+					  ])
+					: [],
+				undone.length
+					? [
+							$(`<div class="text-base-medium text-ink-gray-8 mt-2"></div>`).text(__("Undone")),
+							make_box(
+								undone.map((group) => [
+									make_title_cell(source_name(group.source), group.line),
+									group.amount ? make_text(group.amount, "text-ink-gray-8 shrink-0") : [],
+									group.download
+										? frappe.ui.button({
+												label: __("Download"),
+												icon: "download",
+												variant: "ghost",
+												size: "sm",
+												onclick: () => group.download(),
+										  })
+										: [],
+								])
+							),
+					  ]
+					: []
+			)
+		);
+	};
+
+	const show_group = (group, first) => {
+		dialog.set_title(opts.title);
+		set_primary(null);
+		dialog.set_secondary_action_label(__("Close"));
+		dialog.set_secondary_action(() => dialog.hide());
+		const rows = opts.rows(group);
+		show_grid(first ? [...rows.filter(first), ...rows.filter((row) => !first(row))] : rows);
+		const $head = $(`<div class="flex flex-col gap-3 mb-3"></div>`);
+		$body.empty().append($head);
+		const refresh = () => {
+			const selected = grid.get_selected_children();
+			const blocked = (selected.length ? selected : grid.df.data).filter(opts.blocked);
+			const reason = blocked.length && __("Clear the red to undo.");
+			const alert = blocked.length && can_undo && opts.blocked_alert(blocked, group, dialog);
+			$head.empty().append(
+				make_back_header(source_name(group.source), line_of(group), () => show_list(), [
+					...(opts.group_actions?.(group, dialog) || []),
+					...(can_undo
+						? [
+								reason ? grey_line(reason) : [],
+								frappe.ui.button({
+									label: opts.undo_label(selected, group, money),
+									icon: "undo-2",
+									theme: "red",
+									variant: selected.length ? "subtle" : "outline",
+									disabled: Boolean(reason),
+									onclick: () => show_confirm(group, selected.length ? selected : null),
+								}),
+						  ]
+						: []),
+				]),
+				alert
+					? make_alerts([
+							{
+								theme: "red",
+								...alert,
+								buttons: [
+									...(alert.buttons || []),
+									{
+										label: __("Show rows"),
+										variant: "outline",
+										onclick: () => show_group(group, opts.blocked),
+									},
+								],
+							},
+					  ])
+					: [],
+				opts.group_note ? opts.group_note(group) : []
+			);
+		};
+		grid.wrapper.off("change.undo").on("change.undo", ".grid-row-check", () => refresh());
+		refresh();
+	};
+
+	const show_confirm = (group, selected) => {
+		const rows = selected || opts.rows(group);
+		show_grid(null);
+		dialog.set_title(opts.confirm_title(rows, selected));
+		$body.empty().append(
+			$(`<div class="flex flex-col gap-3"></div>`).append(
+				make_back_line(opts.confirm_text(rows, selected), () => show_group(group)),
+				make_box([
+					...opts.confirm_rows(rows, money),
+					...(opts.total
+						? [
+								[
+									make_text(__("Total"), "text-ink-gray-6 grow"),
+									make_text(
+										money(opts.total(rows)),
+										"text-base-medium text-ink-gray-8 shrink-0"
+									),
+								],
+						  ]
+						: []),
+				]),
+				opts.confirm_note?.(rows, selected) || []
+			)
+		);
+		dialog.set_secondary_action_label(__("Back"));
+		dialog.set_secondary_action(() => show_group(group));
+		set_primary(opts.confirm_button(rows, selected), () =>
+			opts.undo(group, selected).then((r) => {
+				dialog.hide();
+				after_run(frm, r.message, UNDOING_TEXT(), (result) => opts.after_undo(result, group));
+			})
+		);
+	};
+
+	opts.load().then((data) => {
+		posted = data;
+		show_list();
+		dialog.show();
+	});
+}
+
+function show_posted_stock(frm) {
+	const match = frm.doc.__onload?.stock_match;
+	const line_of = Object.fromEntries(
+		(match?.warehouses || []).map((row) => [row.warehouse, row.line ?? row.account])
+	);
+	const count_warehouses = (count) => plural(count, __("1 warehouse"), __("{0} warehouses", [count]));
+	let difference;
+	show_posted_window(frm, {
+		title: __("Posted stock"),
+		load: () =>
+			get_data(frm, "get_posted_entries", { kind: "stock" }).then((r) => {
+				difference = r.message.difference;
+				return r.message;
+			}),
+		posted_word: (when) => __("Posted {0}", [when]),
+		group_line: (group) =>
+			[
+				plural(group.rows, __("1 row"), __("{0} rows", [group.rows])),
+				count_warehouses(group.warehouses.length),
+			].join(" · "),
+		group_amount: (group, money) => money(group.value),
+		extra_rows: (posted, money) =>
+			posted.difference
+				? [
+						[
+							make_title_cell(
+								__("Stock difference"),
+								[
+									posted.difference.posted_on &&
+										__("Posted {0}", [
+											frappe.datetime
+												.str_to_user(posted.difference.posted_on)
+												.split(" ")[0],
+										]),
+									[
+										...new Set(
+											Object.keys(posted.difference.lines).map(
+												(account) => short_account(frm, account) || __("Stock")
+											)
+										),
+									].join(", "),
+								]
+									.filter(Boolean)
+									.join(" · "),
+								"text-ink-gray-8"
+							),
+							make_text(money(posted.difference.amount), "text-ink-gray-8 shrink-0"),
+						],
+				  ]
+				: [],
+		undone: (posted) =>
+			posted.undone.map((group) => ({
+				source: group.source,
+				line: __("{0} · removed from ERPNext", [
+					plural(group.rows, __("1 row"), __("{0} rows", [group.rows])),
+				]),
+				download: () => download_stock(frm, group.source),
+			})),
+		fields: [
+			{ fieldname: "warehouse", fieldtype: "Data", label: __("Warehouse"), columns: 4 },
+			{ fieldname: "rows", fieldtype: "Int", label: __("Rows"), columns: 2 },
+			{ fieldname: "value", fieldtype: "Currency", label: __("Value"), columns: 2 },
+			{ fieldname: "later_entries", fieldtype: "Int", label: __("Later stock entries"), columns: 2 },
+		],
+		rows: (group) => group.warehouses.map((row) => ({ ...row })),
+		blocked: (row) => row.later_entries > 0,
+		blocked_alert: (rows, group, dialog) => ({
+			title:
+				rows.length === 1
+					? __("{0} can not be undone.", [rows[0].warehouse])
+					: __("{0} warehouses can not be undone.", [rows.length]),
+			description: __("{0} stock entries came after {1}. Correct the wrong rows instead.", [
+				rows.reduce((sum, row) => sum + row.later_entries, 0),
+				day_before_text(frm),
+			]),
+			buttons: [{ label: __("Correct rows"), onclick: () => show_correct_rows(frm, group, dialog) }],
+		}),
+		group_actions: (group, dialog) =>
+			frm.doc.status === "Live"
+				? []
+				: [
+						frappe.ui.button({
+							label: __("Correct rows"),
+							variant: "ghost",
+							onclick: () => show_correct_rows(frm, group, dialog),
+						}),
+				  ],
+		undo_label: (selected, group, money) =>
+			selected.length
+				? __("Undo {0} · {1}", [
+						count_warehouses(selected.length),
+						money(selected.reduce((sum, row) => sum + flt(row.value), 0)),
+				  ])
+				: __("Undo this upload · {0}", [money(group.value)]),
+		confirm_title: (rows, selected) =>
+			selected ? __("Undo {0}?", [count_warehouses(rows.length)]) : __("Undo this upload?"),
+		confirm_text: () =>
+			__(
+				"Their stock entries are cancelled and deleted in ERPNext. You can download the rows, fix them and upload again."
+			),
+		confirm_rows: (rows, money) =>
+			rows.map((row) => [
+				$(`<span class="text-base text-ink-gray-8 grow truncate"></span>`).text(row.warehouse),
+				$(`<span class="text-base text-ink-gray-5 shrink-0"></span>`).text(
+					plural(row.rows, __("1 row"), __("{0} rows", [row.rows]))
+				),
+				$(`<span class="text-base text-ink-gray-8 shrink-0"></span>`).text(money(row.value)),
+			]),
+		total: (rows) => rows.reduce((sum, row) => sum + flt(row.value), 0),
+		confirm_note: (rows) => {
+			const lines = new Set(Object.keys(difference?.lines || {}));
+			return rows.some((row) => lines.has(line_of[row.warehouse]))
+				? grey_line(
+						__("The posted stock difference of {0} is undone too.", [
+							format_currency(difference.amount, erpnext.get_currency(frm.doc.company)),
+						])
+				  )
+				: [];
+		},
+		confirm_button: (rows, selected) =>
+			selected ? __("Undo {0}", [count_warehouses(rows.length)]) : __("Undo this upload"),
+		undo: (group, selected) =>
+			call_method(frm, "undo_opening_stock", {
+				source: group.source,
+				warehouses: selected ? selected.map((row) => row.warehouse) : null,
+			}),
+		after_undo: (result, group) => show_undo_result(frm, "stock", result, group.source),
+	});
+}
+
+// Change the qty or value of posted rows: one correcting entry per warehouse, after the opening
+function show_correct_rows(frm, group, posted_dialog) {
+	posted_dialog.hide();
+	const posted = (frm.doc.opening_stock || []).filter(
+		(row) => row.status === "Posted" && (row.source || "") === group.source
+	);
+	const originals = Object.fromEntries(
+		posted.map((row) => [row.name, { qty: row.qty, amount: row.amount }])
+	);
+	// a batch or serial column tells rows of one item apart
+	const tracked = posted.some((row) => row.batch_no)
+		? "batch_no"
+		: posted.some((row) => row.serial_no)
+		? "serial_no"
+		: null;
+	const win = new SheetWindow(frm, {
+		title: __("Posted stock"),
+		fields: [
+			{
+				fieldname: "item_name",
+				fieldtype: "Data",
+				label: __("Item"),
+				in_list_view: 1,
+				read_only: 1,
+				columns: tracked ? 2 : 3,
+			},
+			{
+				fieldname: "warehouse",
+				fieldtype: "Data",
+				label: __("Warehouse"),
+				in_list_view: 1,
+				read_only: 1,
+				columns: 2,
+			},
+			{
+				fieldname: "qty",
+				fieldtype: "Float",
+				label: __("Qty"),
+				in_list_view: 1,
+				columns: 1,
+				onchange: keep_rate_on_qty,
+			},
+			{
+				fieldname: "uom",
+				fieldtype: "Data",
+				label: __("Unit"),
+				in_list_view: 1,
+				read_only: 1,
+				columns: 1,
+			},
+			{
+				fieldname: "amount",
+				fieldtype: "Currency",
+				label: __("Value"),
+				in_list_view: 1,
+				columns: 2,
+				onchange: set_rate_on_amount,
+			},
+			{
+				fieldname: "batch_no",
+				fieldtype: "Data",
+				label: __("Batch"),
+				read_only: 1,
+				in_list_view: tracked === "batch_no" ? 1 : 0,
+				columns: 1,
+			},
+			{
+				fieldname: "serial_no",
+				fieldtype: "Small Text",
+				label: __("Serial No"),
+				read_only: 1,
+				in_list_view: tracked === "serial_no" ? 1 : 0,
+				columns: 1,
+			},
+			{ fieldname: "name", fieldtype: "Data", hidden: 1 },
+			{ fieldname: "item_code", fieldtype: "Data", hidden: 1 },
+		],
+	});
+	win.grid.df.cannot_add_rows = 1;
+	win.grid.df.cannot_delete_rows = 1;
+	const changed = () =>
+		win.get_rows().filter((row) => {
+			const old = originals[row.name];
+			return (
+				Math.abs(flt(row.qty) - flt(old.qty)) > 0.0001 ||
+				Math.abs(flt(row.amount) - flt(old.amount)) >= 0.01
+			);
+		});
+	win.render = () => {
+		win.dialog
+			.get_field("head")
+			.$wrapper.empty()
+			.append(
+				make_back_header(
+					__("Correct rows"),
+					__("{0} · Dated {1}, against Temporary Opening.", [
+						group.source || __("Typed in"),
+						day_before_text(frm),
+					]),
+					() => {
+						win.dialog.hide();
+						show_posted_stock(frm);
+					}
+				).addClass("mb-3")
+			);
+		win.refresh_footer();
+	};
+	win.refresh_footer = () => {
+		if (win.view !== "sheet") return;
+		const count = changed().length;
+		win.dialog
+			.get_field("notes")
+			.$wrapper.empty()
+			.append(
+				grey_line(
+					plural(
+						win.get_rows().length,
+						__("{0} changed of 1 row", [count]),
+						__("{0} changed of {1} rows", [count, win.get_rows().length])
+					)
+				).addClass("mt-2 text-right")
+			);
+		win.dialog.set_secondary_action_label(__("Close"));
+		win.dialog.set_secondary_action(() => win.dialog.hide());
+		win.dialog.set_primary_action(
+			plural(count, __("Correct 1 row"), __("Correct {0} rows", [count])),
+			() => check()
+		);
+		set_footer_reason(
+			win.dialog,
+			!count
+				? __("Change a row's qty or value to correct it.")
+				: win.refused
+				? __("Clear the red to correct rows.")
+				: null
+		);
+	};
+	win.changed = () => {
+		win.refused = null;
+		win.set_alerts([]);
+		win.refresh_footer();
+	};
+	// what the server would refuse, said here before the confirm
+	const check = () => {
+		const rows = changed();
+		return get_data(frm, "check_stock_correction", {
+			rows: rows.map((row) => ({ name: row.name, qty: row.qty, amount: row.amount })),
+		}).then((r) => {
+			const result = r.message;
+			if (!result.blocker) return confirm(result.later_entries);
+			win.refused = result;
+			const below = new Set(
+				(result.below_zero || []).map((item) => `${item.item_code}::${item.warehouse}`)
+			);
+			const is_below = (row) => below.has(`${row.item_code}::${row.warehouse}`);
+			win.set_alerts([
+				{
+					theme: "red",
+					title: result.blocker,
+					description: (result.below_zero || []).length
+						? __("Put their quantities back, or ask your CA.")
+						: undefined,
+					buttons: below.size
+						? [{ label: __("Show rows"), onclick: () => win.show_rows(is_below) }]
+						: [],
+				},
+			]);
+			win.refresh_footer();
+		});
+	};
+	const confirm = (later_entries) => {
+		const rows = changed();
+		const net = rows.reduce((sum, row) => sum + flt(row.amount) - flt(originals[row.name].amount), 0);
+		win.show_confirm({
+			title: plural(rows.length, __("Correct 1 row?"), __("Correct {0} rows?", [rows.length])),
+			back: __("Back to the rows. Nothing changes until you confirm."),
+			body: [
+				make_kv_lines([
+					[
+						__("To correct"),
+						__("{0} · net {1}", [
+							plural(rows.length, __("1 row"), __("{0} rows", [rows.length])),
+							(net > 0 ? "+" : "") + win.money(net),
+						]),
+					],
+					[__("Dated"), day_before_text(frm)],
+				]),
+				later_entries &&
+					grey_line(
+						__(
+							"Cost of goods sold and profit since {0} change. ERPNext works out the new costs in the background, usually within the hour.",
+							[frappe.datetime.str_to_user(frm.doc.migration_date)]
+						)
+					),
+			].filter(Boolean),
+			primary: plural(rows.length, __("Correct 1 row"), __("Correct {0} rows", [rows.length])),
+			on_primary: () =>
+				call_method(
+					frm,
+					"correct_opening_stock",
+					{ rows: rows.map((row) => ({ name: row.name, qty: row.qty, amount: row.amount })) },
+					{ freeze: true }
+				).then((r) => {
+					win.dialog.hide();
+					after_run(
+						frm,
+						r.message,
+						__("Correcting the rows in the background. This page updates when it's done."),
+						(result) => show_stock_corrected(frm, result)
+					);
+				}),
+		});
+	};
+	win.set_rows(
+		posted.map((row) => ({
+			name: row.name,
+			item_name: row.item_name,
+			item_code: row.item_code,
+			warehouse: row.warehouse,
+			qty: row.qty,
+			uom: row.uom,
+			amount: row.amount,
+			old_qty: row.qty,
+			old_amount: row.amount,
+			batch_no: row.batch_no,
+			serial_no: row.serial_no,
+		}))
+	);
+	win.show_sheet();
+	win.dialog.show();
+}
+
+// Stock at job workers: the job worker rows of Opening stock, read only
+function show_job_worker_stock(frm) {
+	const job_workers = new Set(
+		(frm.doc.warehouses || [])
+			.filter((row) => row.kind === "Job worker" && row.warehouse)
+			.map((row) => row.warehouse)
+	);
+	const rows = (frm.doc.opening_stock || []).filter((row) => job_workers.has(row.warehouse));
+	const soon = frappe.datetime.add_days(frappe.datetime.get_today(), 30);
+	const due = rows.filter((row) => row.return_due && row.return_due <= soon);
+	const currency = erpnext.get_currency(frm.doc.company);
+	const dialog = new frappe.ui.Dialog({
+		title: __("Stock at job workers"),
+		size: "extra-large",
+		fields: [{ fieldname: "body", fieldtype: "HTML" }],
+		secondary_action_label: __("Close"),
+		secondary_action: () => dialog.hide(),
+	});
+	const draw = (first) => {
+		const sorted = first ? [...rows.filter(first), ...rows.filter((row) => !first(row))] : rows;
+		dialog
+			.get_field("body")
+			.$wrapper.empty()
+			.append(
+				$(`<div class="flex flex-col gap-3"></div>`).append(
+					$(`<div class="flex items-center justify-between gap-3"></div>`).append(
+						$(`<div class="text-p-base text-ink-gray-7"></div>`).text(
+							__("Stock at your job workers on {0}, from Opening stock.", [
+								day_before_text(frm),
+							])
+						),
+						frappe.ui.button({
+							label: __("Open in Opening stock"),
+							onclick: () => {
+								dialog.hide();
+								show_tab(frm, "stock_tab");
+								show_opening_stock(frm);
+							},
+						})
+					),
+					due.length
+						? make_alerts([
+								{
+									theme: "yellow",
+									title: plural(
+										due.length,
+										__("1 row is due back within 30 days."),
+										__("{0} rows are due back within 30 days.", [due.length])
+									),
+									buttons: [
+										{
+											label: __("Show rows"),
+											onclick: () => draw((row) => due.includes(row)),
+										},
+									],
+								},
+						  ])
+						: [],
+					rows.length
+						? make_read_table(
+								[
+									[__("Item")],
+									[__("Job worker")],
+									[__("Qty"), true],
+									[__("Value"), true],
+									[__("Challan no")],
+									[__("Challan date")],
+									[__("Return due")],
+								],
+								sorted.map((row) => [
+									row.item_name,
+									row.warehouse_name || row.warehouse,
+									format_qty(row.qty),
+									format_currency(row.amount, currency),
+									row.challan_no || "",
+									row.challan_date ? frappe.datetime.str_to_user(row.challan_date) : "",
+									row.return_due ? frappe.datetime.str_to_user(row.return_due) : "",
+								])
+						  )
+						: grey_line(__("No stock at job workers in Opening stock yet."))
+				)
+			);
+	};
+	draw();
+	dialog.show();
+}
+
+// ---------- BOMs ----------
+
+// The items made here that have no BOM; BOMs come in through Data Import
+function show_boms(frm) {
+	get_data(frm, "get_boms").then((r) => {
+		const status = r.message;
+		if (!status.without_bom.length) return open_party_import(frm, "BOM");
+		const dialog = new frappe.ui.Dialog({
+			title: __("BOMs"),
+			size: "large",
+			fields: [{ fieldname: "body", fieldtype: "HTML" }],
+			primary_action_label: __("Import BOMs"),
+			primary_action: () => {
+				dialog.hide();
+				open_party_import(frm, "BOM");
+			},
+			secondary_action_label: __("Close"),
+			secondary_action: () => dialog.hide(),
+		});
+		dialog.get_field("body").$wrapper.append(
+			$(`<div class="flex flex-col gap-3"></div>`).append(
+				grey_line(
+					plural(
+						status.without_bom.length,
+						__("1 item you make has no BOM. Add it before its first work order."),
+						__("{0} items you make have no BOM. Add them before their first work order.", [
+							status.without_bom.length,
+						])
+					)
+				),
+				make_read_table(
+					[[__("Item")], [__("Item group")], [__("Unit")]],
+					status.without_bom.map((item) => [
+						item.item_name || item.name,
+						item.item_group,
+						item.stock_uom,
+					])
+				)
+			)
+		);
+		dialog.show();
+	});
+}
+
+// ---------- Open orders ----------
+
+const ORDER_TEXT = {
+	"Sales Order": {
+		title: __("Open sales orders"),
+		intro: __(
+			"Sales orders open on {0}. Enter only the qty not yet delivered; do not add advances again."
+		),
+		party: __("Customer"),
+		note: __("Advances are not added again."),
+	},
+	"Purchase Order": {
+		title: __("Open purchase orders"),
+		intro: __(
+			"Purchase orders open on {0}. Enter only the qty not yet received; do not add advances again."
+		),
+		party: __("Supplier"),
+		note: __("Advances are not added again."),
+	},
+	"Work Order": {
+		title: __("Open work orders"),
+		intro: __("Work orders running on {0}. Enter the qty still to make."),
+		note: __(
+			"A job with its material in the work in progress warehouse makes from there. The others transfer material first, as usual."
+		),
+	},
+	"Subcontracting Order": {
+		title: __("Open subcontracting orders"),
+		intro: __("Orders with goods still at the job worker on {0}."),
+		party: __("Job worker"),
+		note: __("The material is already at the job worker from Opening stock, so nothing is sent again."),
+	},
+};
+
+function format_quantities(quantities) {
+	return quantities.map(([qty, unit]) => [format_qty(qty), unit].filter(Boolean).join(" ")).join(", ");
+}
+
+function count_orders(order_type, count) {
+	return order_type === "Work Order"
+		? plural(count, __("1 work order"), __("{0} work orders", [count]))
+		: plural(count, __("1 order"), __("{0} orders", [count]));
+}
+
+function show_open_orders(frm, order_type, result) {
+	get_data(frm, "get_open_orders", { order_type: order_type }).then((r) =>
+		new OpenOrdersWindow(frm, order_type, r.message, result).show()
+	);
+}
+
+class OpenOrdersWindow extends SheetWindow {
+	constructor(frm, order_type, checks, result) {
+		const text = ORDER_TEXT[order_type];
+		const warehouse = (fieldname, label, columns) =>
+			list_column(fieldname, "Link", label, columns, {
+				options: "Warehouse",
+				get_query: () => ({ filters: { company: frm.doc.company, is_group: 0 } }),
+			});
+		const fields = {
+			"Work Order": [
+				list_column("order_no", "Data", __("Job card no"), 1),
+				list_column("item_name", "Data", __("Item to make"), 2),
+				list_column("bom", "Link", __("BOM"), 2, { options: "BOM" }),
+				list_column("qty", "Float", __("Qty left"), 1),
+				list_column("uom", "Data", __("Unit"), 1),
+				warehouse("wip_warehouse", __("WIP warehouse"), 1),
+				warehouse("warehouse", __("Finished goods to"), 2),
+			],
+			"Subcontracting Order": [
+				list_column("order_no", "Data", __("Purchase order"), 1),
+				list_column("party_name", "Data", __("Job worker"), 2),
+				list_column("item_name", "Data", __("Item to receive"), 2),
+				list_column("qty", "Float", __("Qty left"), 1),
+				list_column("uom", "Data", __("Unit"), 1),
+				list_column("rate", "Currency", __("Job work rate"), 1),
+				warehouse("warehouse", __("Receive into"), 2),
+				{ fieldname: "order_date", fieldtype: "Date", label: __("Order date") },
+				{ fieldname: "delivery_date", fieldtype: "Date", label: __("Required by") },
+				{ fieldname: "service_item", fieldtype: "Link", options: "Item", label: __("Service item") },
+				{ fieldname: "bom", fieldtype: "Link", options: "BOM", label: __("BOM") },
+				{ fieldname: "material", fieldtype: "Data", label: __("Material at the job worker") },
+			],
+		}[order_type] || [
+			list_column("order_no", "Data", __("Order no"), 1),
+			list_column("party_name", "Data", text.party, 2),
+			list_column("item_name", "Data", __("Item"), 2),
+			list_column("qty", "Float", __("Qty left"), 1),
+			list_column("uom", "Data", __("Unit"), 1),
+			list_column("rate", "Currency", __("Rate"), 1),
+			list_column(
+				"delivery_date",
+				"Date",
+				order_type === "Sales Order" ? __("Delivery date") : __("Required by"),
+				1
+			),
+			warehouse("warehouse", order_type === "Sales Order" ? __("Deliver from") : __("Receive into"), 1),
+			{ fieldname: "order_date", fieldtype: "Date", label: __("Order date") },
+		];
+		super(frm, {
+			title: text.title,
+			open: (result) => show_open_orders(frm, order_type, result),
+			save_method: "save_open_orders",
+			get_method: "get_open_orders",
+			args: { order_type: order_type },
+			fields: [
+				...fields,
+				{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+				{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
+			],
+		});
+		this.order_type = order_type;
+		this.text = text;
+		this.checks = checks;
+		this.result = result;
+		const fieldnames = [...fields.map((df) => df.fieldname), "source"];
+		this.drafts = order_rows(frm, order_type, false).map((row) => ({
+			...Object.fromEntries(fieldnames.map((field) => [field, row[field]])),
+			doc_idx: row.idx,
+		}));
+	}
+
+	render() {
+		const { checks, frm, order_type } = this;
+		this.make_head(this.text.intro.replace("{0}", this.day), {
+			upload: () => this.upload("import_open_orders", null),
+			menu: [
+				checks.made && {
+					label: made_orders_title(order_type),
+					icon: "list",
+					onclick: () => {
+						this.dialog.hide();
+						show_made_orders(frm, order_type);
+					},
+				},
+				{
+					label: __("Download sheet"),
+					icon: "download",
+					onclick: () => download_orders(frm, order_type),
+				},
+			].filter(Boolean),
+		});
+		this.set_stats(
+			checks.drafts
+				? [
+						frappe.ui.stat_card({
+							label: __("On your sheet"),
+							value: count_orders(order_type, checks.orders),
+							caption: __("{0} left", [format_quantities(checks.quantities)]),
+						}),
+						frappe.ui.stat_card({
+							label: __("Made"),
+							value: checks.made ? count_orders(order_type, checks.made) : __("Nothing yet"),
+						}),
+				  ]
+				: []
+		);
+		const rows = (idxs) => {
+			const set = new Set(idxs);
+			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
+		};
+		const go = (label, open) => ({
+			label,
+			onclick: () => {
+				this.dialog.hide();
+				open();
+			},
+		});
+		const customer = order_type === "Sales Order";
+		const actions = {
+			missing_parties: [
+				go(customer ? __("Go to Customers") : __("Go to Suppliers"), () =>
+					open_party_import(frm, customer ? "Customer" : "Supplier")
+				),
+			],
+			missing_items: [go(__("Go to Items"), () => open_party_import(frm, "Item"))],
+			no_bom: [go(__("Import BOMs"), () => open_party_import(frm, "BOM"))],
+			no_job_worker: [go(__("Go to Warehouses"), () => show_warehouses(frm, { job_workers: true }))],
+			not_subcontracted: [
+				{
+					label: __("Mark them subcontracted"),
+					onclick: () =>
+						(this.dirty ? this.save() : Promise.resolve())
+							.then(() => call_method(frm, "mark_items_subcontracted", {}, { freeze: true }))
+							.then(() => this.reopen()),
+				},
+			],
+		};
+		// the names the rows carry, for reds about parties or items
+		const field = { missing_parties: "party_name", missing_items: "item_name", no_bom: "item_name" };
+		const names_of = (key, idxs) => {
+			if (!field[key]) return undefined;
+			const set = new Set(idxs);
+			const names = [
+				...new Set(
+					this.get_rows()
+						.filter((row) => set.has(row.doc_idx))
+						.map((row) => row[field[key]])
+						.filter(Boolean)
+				),
+			];
+			return names.slice(0, 5).join(", ") + (names.length > 5 ? ", …" : "");
+		};
+		const alerts = (checks.reds || []).map((item) => ({
+			theme: "red",
+			title: item.text,
+			description: names_of(item.key, item.rows),
+			buttons: [
+				...(actions[item.key] || []),
+				...(item.key === "no_service_item"
+					? [
+							go(__("Add Subcontracting BOM"), () =>
+								frappe.new_doc("Subcontracting BOM", { finished_good: item.items[0] })
+							),
+					  ]
+					: []),
+				...(item.rows.length ? [rows(item.rows)] : []),
+			],
+		}));
+		this.set_alerts(alerts, [
+			this.result &&
+				plural(
+					this.result.added,
+					__("1 row read from the sheet."),
+					__("{0} rows read from the sheet.", [this.result.added])
+				),
+			this.result?.skipped &&
+				plural(
+					this.result.skipped,
+					__("1 row is already made and is left out."),
+					__("{0} rows are already made and are left out.", [this.result.skipped])
+				),
+			this.result?.replaced &&
+				plural(
+					this.result.replaced,
+					__("1 draft row with the same order number was replaced."),
+					__("{0} draft rows with the same order number were replaced.", [this.result.replaced])
+				),
+			order_type === "Subcontracting Order" && __("Receive goods back with a Subcontracting Receipt."),
+		]);
+		this.refresh_footer();
+	}
+
+	refresh_footer() {
+		if (this.view !== "sheet") return;
+		const { checks } = this;
+		this.dialog.set_primary_action(order_type_make_label(this.order_type, checks.orders), () =>
+			this.post()
+		);
+		this.dialog.set_secondary_action_label(__("Save draft"));
+		this.dialog.set_secondary_action(() => this.save_draft());
+		const empty = !this.get_rows().length;
+		set_footer_reason(
+			this.dialog,
+			empty
+				? __("Upload a sheet or add rows to make orders.")
+				: this.dirty
+				? null
+				: checks.blocker
+				? __("Clear the reds to make orders.")
+				: null
+		);
+	}
+
+	confirm_post() {
+		const { frm, order_type } = this;
+		this.show_confirm({
+			title: __("{0}?", [order_type_make_label(order_type, this.checks.orders)]),
+			back: __("Back to the orders. Nothing is made until you confirm."),
+			body: [
+				make_kv_lines([
+					[
+						__("To make"),
+						__("{0} · {1} left", [
+							count_orders(order_type, this.checks.orders),
+							format_quantities(this.checks.quantities),
+						]),
+					],
+				]),
+				grey_line(__("No money moves: orders post nothing to your books.")),
+				grey_line(this.text.note),
+				this.checks.unnumbered &&
+					grey_line(
+						plural(
+							this.checks.unnumbered,
+							order_type === "Sales Order"
+								? __("1 row has no order number: it becomes an order of its own customer.")
+								: __("1 row has no order number: it becomes an order of its own supplier."),
+							order_type === "Sales Order"
+								? __("{0} rows have no order number: they become one order per customer.", [
+										this.checks.unnumbered,
+								  ])
+								: __("{0} rows have no order number: they become one order per supplier.", [
+										this.checks.unnumbered,
+								  ])
+						)
+					),
+			].filter(Boolean),
+			primary: order_type_make_label(order_type, this.checks.orders),
+			on_primary: () =>
+				call_method(frm, "make_open_orders", { order_type: order_type }, { freeze: true }).then(
+					(r) => {
+						this.dialog.hide();
+						after_run(
+							frm,
+							r.message,
+							__("Making the orders in the background. This page updates when it's done."),
+							(result) =>
+								frappe.ui.toast({
+									type: "success",
+									message: __("{0} made.", [count_orders(order_type, result.length)]),
+									action: {
+										label: __("View"),
+										onclick: () => show_made_orders(frm, order_type),
+									},
+								})
+						);
+					}
+				),
+		});
+	}
+}
+
+function order_type_make_label(order_type, count) {
+	return order_type === "Work Order"
+		? plural(count, __("Make 1 work order"), __("Make {0} work orders", [count]))
+		: order_type === "Subcontracting Order"
+		? plural(count, __("Make 1 subcontracting order"), __("Make {0} subcontracting orders", [count]))
+		: plural(count, __("Make 1 order"), __("Make {0} orders", [count]));
+}
+
+function show_made_orders(frm, order_type) {
+	const party = ORDER_TEXT[order_type].party;
+	const unique = (rows) => [...new Set(rows.map((row) => row.document))];
+	show_posted_window(frm, {
+		title: made_orders_title(order_type),
+		load: () => get_data(frm, "get_made_orders", { order_type: order_type }).then((r) => r.message),
+		posted_word: (when) => __("Made {0}", [when]),
+		group_line: (group) => count_orders(order_type, group.orders),
+		undone: (made) =>
+			(made.undone || []).map((group) => ({
+				source: group.source,
+				line: __("{0} · removed from ERPNext", [
+					plural(group.count, __("1 row"), __("{0} rows", [group.count])),
+				]),
+				download: () => download_orders(frm, order_type, group.source),
+			})),
+		fields: [
+			{
+				fieldname: "document",
+				fieldtype: "Link",
+				options: order_type,
+				label: __(order_type),
+				columns: 2,
+			},
+			{
+				fieldname: "order_no",
+				fieldtype: "Data",
+				label: order_type === "Work Order" ? __("Job card no") : __("Order no"),
+				columns: party ? 1 : 2,
+			},
+			...(party ? [{ fieldname: "party_name", fieldtype: "Data", label: party, columns: 2 }] : []),
+			{
+				fieldname: "item_code",
+				fieldtype: "Data",
+				label: order_type === "Work Order" ? __("Item to make") : __("Item"),
+				columns: party ? 2 : 3,
+			},
+			{ fieldname: "qty", fieldtype: "Float", label: __("Qty left"), columns: 1 },
+			{ fieldname: "uom", fieldtype: "Data", label: __("Unit"), columns: 1 },
+			{
+				fieldname: "done_since",
+				fieldtype: "Float",
+				label: order_type === "Work Order" ? __("Produced since") : __("Done since"),
+				columns: 1,
+			},
+		],
+		rows: (group) => group.rows.map((row) => ({ ...row })),
+		blocked: (row) => flt(row.done_since) > 0,
+		blocked_alert: (rows) => ({
+			title: __("{0} already have deliveries, receipts or production.", [
+				count_orders(order_type, unique(rows).length),
+			]),
+			description: __("Cancel those first."),
+		}),
+		undo_label: (selected) =>
+			selected.length ? __("Undo {0} selected", [unique(selected).length]) : __("Undo this upload"),
+		confirm_title: (rows) => __("Undo {0}?", [count_orders(order_type, unique(rows).length)]),
+		confirm_text: (rows) =>
+			plural(
+				unique(rows).length,
+				__(
+					"This {0} will be cancelled and deleted in ERPNext. Its rows are kept, so you can fix it and make it again.",
+					[count_orders(order_type, 1)]
+				),
+				__(
+					"These {0} will be cancelled and deleted in ERPNext. Their rows are kept, so you can fix them and make them again.",
+					[count_orders(order_type, unique(rows).length)]
+				)
+			),
+		confirm_rows: (rows) =>
+			rows.map((row) => [
+				$(`<span class="text-base text-ink-gray-8 shrink-0"></span>`).text(row.document),
+				$(`<span class="text-base text-ink-gray-5 grow truncate"></span>`).text(
+					[row.party_name, row.item_code].filter(Boolean).join(" · ")
+				),
+				$(`<span class="text-base text-ink-gray-8 shrink-0"></span>`).text(
+					[format_qty(row.qty), row.uom].filter(Boolean).join(" ")
+				),
+			]),
+		confirm_button: (rows) => __("Undo {0}", [count_orders(order_type, unique(rows).length)]),
+		undo: (group, selected) =>
+			call_method(frm, "undo_open_orders", {
+				order_type: order_type,
+				source: group.source,
+				documents: selected ? unique(selected) : null,
+			}),
+		after_undo: (result) =>
+			frappe.ui.toast({
+				type: "success",
+				message: __("{0} undone", [count_orders(order_type, result.removed)]),
+				description: [__("They're cancelled and deleted in ERPNext."), kept_cancelled_line(result)]
+					.filter(Boolean)
+					.join(" "),
+			}),
+	});
+}
+
+// ---------- Fixed assets ----------
+
+const ASSET_FIELDS = [
+	"asset_name",
+	"asset_account_name",
+	"asset_account",
+	"purchase_date",
+	"gross",
+	"opening_depreciation",
+	"hand_booked",
+	"qty",
+	"salvage",
+	"method",
+	"life",
+	"rate",
+	"source",
+];
+
+function show_fixed_assets(frm) {
+	get_data(frm, "get_fixed_assets").then((r) => new FixedAssetsWindow(frm, r.message).show());
+}
+
+class FixedAssetsWindow extends SheetWindow {
+	constructor(frm, checks) {
+		const drafts = (frm.doc.fixed_assets || []).filter((row) => row.status !== "Posted");
+		super(frm, {
+			title: __("Fixed assets"),
+			open: () => show_fixed_assets(frm),
+			save_method: "save_fixed_assets",
+			get_method: "get_fixed_assets",
+			where: "fixed_assets",
+			has_data: drafts.length,
+			row_form: true,
+			fields: [
+				list_column("asset_name", "Data", __("Asset name"), 2),
+				list_column("asset_account", "Link", __("Asset account"), 2, {
+					options: "Account",
+					get_query: () => ({
+						filters: { company: frm.doc.company, root_type: "Asset", is_group: 0 },
+					}),
+				}),
+				list_column("purchase_date", "Date", __("Purchase date"), 1),
+				list_column("gross", "Currency", __("Cost"), 2),
+				list_column("opening_depreciation", "Currency", __("Depreciation till date"), 2),
+				{ fieldname: "asset_account_name", fieldtype: "Data", label: __("Account on sheet") },
+				{ fieldname: "qty", fieldtype: "Int", label: __("Qty") },
+				{ fieldname: "salvage", fieldtype: "Currency", label: __("Salvage value") },
+				{
+					fieldname: "method",
+					fieldtype: "Select",
+					options: ["", "Straight Line", "Written Down Value"],
+					label: __("Method"),
+				},
+				list_column("life", "Int", __("Life (years)"), 1),
+				{ fieldname: "rate", fieldtype: "Float", label: __("Rate %") },
+				{ fieldname: "hand_booked", fieldtype: "Currency", label: __("Booked by hand since") },
+				{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+				{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
+			],
+			extra_fields: [
+				{
+					fieldname: "depreciation_booked",
+					fieldtype: "Select",
+					options: [
+						{ value: "", label: "" },
+						{ value: "Every month", label: __("Every month") },
+						{ value: "Only at year end", label: __("Only at year end") },
+					],
+					hidden: 1,
+				},
+				{ fieldname: "categories_head", fieldtype: "HTML", hidden: 1 },
+				{
+					fieldname: "categories",
+					fieldtype: "Table",
+					hidden: 1,
+					cannot_add_rows: 1,
+					cannot_delete_rows: 1,
+					in_place_edit: 1,
+					data: [],
+					fields: [
+						list_column("asset_category", "Data", __("Category"), 2),
+						list_column("method", "Select", __("Method"), 2, {
+							options: ["", "Straight Line", "Written Down Value"],
+						}),
+						list_column("life", "Int", __("Life (years)"), 1),
+						list_column("rate", "Float", __("Rate %"), 1),
+						list_column("accumulated_account", "Link", __("Accumulated depreciation"), 2, {
+							options: "Account",
+							read_only_depends_on: "eval:doc.net_value",
+							get_query: () => ({
+								filters: {
+									company: frm.doc.company,
+									root_type: "Asset",
+									account_type: ["in", ["Accumulated Depreciation", ""]],
+									is_group: 0,
+								},
+							}),
+						}),
+						list_column("depreciation_account", "Link", __("Depreciation expense"), 2, {
+							options: "Account",
+							get_query: () => ({
+								filters: {
+									company: frm.doc.company,
+									root_type: "Expense",
+									account_type: ["in", ["Depreciation", ""]],
+									is_group: 0,
+								},
+							}),
+						}),
+						checks.hsn_label && list_column("hsn_code", "Data", checks.hsn_label, 1),
+						{ fieldname: "asset_account", fieldtype: "Data", hidden: 1 },
+						{ fieldname: "net_value", fieldtype: "Check", hidden: 1 },
+					].filter(Boolean),
+				},
+			],
+		});
+		this.views.sheet.push("depreciation_booked");
+		this.views.categories = ["categories_head", "categories"];
+		this.checks = checks;
+		this.drafts = drafts.map((row) => ({
+			...Object.fromEntries(ASSET_FIELDS.map((field) => [field, row[field]])),
+			doc_idx: row.idx,
+		}));
+	}
+
+	render() {
+		const { checks, frm } = this;
+		const sheet = checks.sheet;
+		const books = checks.books;
+		this.make_head(__("One row per asset, as on {0}, with depreciation till that day.", [this.day]), {
+			upload: () =>
+				this.upload(
+					"import_fixed_assets",
+					this.get_rows().length &&
+						__(
+							"The sheet replaces draft rows of the same asset name, and its own if it was uploaded before. Posted assets stay. Continue?"
+						),
+					(result) => {
+						show_fixed_assets(frm);
+						show_assets_uploaded(result);
+					}
+				),
+			menu: [
+				(has_rows(frm.doc.fixed_assets, true) || (frm.doc.undone_assets || []).length) && {
+					label: __("Posted assets"),
+					icon: "list",
+					onclick: () => {
+						this.dialog.hide();
+						show_posted_assets(frm);
+					},
+				},
+				{ label: __("Download sheet"), icon: "download", onclick: () => download_assets(frm) },
+				...[...new Set((frm.doc.undone_assets || []).map((row) => row.source || ""))].map(
+					(source) => ({
+						label: __("Undone rows back to drafts: {0}", [source || __("Typed in")]),
+						icon: "undo-2",
+						onclick: () =>
+							call_method(frm, "restore_undone_assets", { source }).then((r) =>
+								this.reopen().then(() => show_assets_uploaded(r.message))
+							),
+					})
+				),
+				sheet.categories && {
+					label: __("Depreciation by category"),
+					icon: "settings",
+					onclick: () => this.show_categories(),
+				},
+			].filter(Boolean),
+		});
+		const net = books.fixed_assets - books.depreciation;
+		const hand = checks.hand;
+		this.set_stats(
+			sheet.assets
+				? [
+						make_lines_card(
+							__("On your sheet"),
+							[
+								[
+									__("{0} · cost", [
+										plural(sheet.assets, __("1 asset"), __("{0} assets", [sheet.assets])),
+									]),
+									this.money(sheet.cost),
+								],
+								[__("Depreciation till date"), this.money(sheet.depreciation)],
+							],
+							[
+								plural(
+									sheet.categories,
+									__("1 category"),
+									__("{0} categories", [sheet.categories])
+								),
+								__("on {0}", [this.day]),
+							].join(" · ")
+						),
+						make_lines_card(
+							__("Your books today"),
+							[
+								[__("Fixed assets"), this.money(books.fixed_assets)],
+								[__("Depreciation"), this.money(books.depreciation)],
+							],
+							[
+								__("Net {0}", [format_currency(net, this.currency, 0)]),
+								hand.amount &&
+									(hand.amount - hand.counted >= 1
+										? __("{0} booked by hand since {1} still to count", [
+												format_currency(hand.amount - hand.counted, this.currency, 0),
+												frappe.datetime.str_to_user(frm.doc.migration_date),
+										  ])
+										: __("{0} booked by hand since {1}, counted on the rows", [
+												format_currency(hand.amount, this.currency, 0),
+												frappe.datetime.str_to_user(frm.doc.migration_date),
+										  ])),
+							]
+								.filter(Boolean)
+								.join(" · ")
+						),
+				  ]
+				: []
+		);
+		this.render_question();
+		this.set_alerts(this.get_alerts(), this.get_greys());
+		this.refresh_footer();
+	}
+
+	// a migration date in the middle of the year: how the old books booked this year's depreciation
+	render_question() {
+		const { checks, frm } = this;
+		const ask = checks.mid_year && this.view === "sheet";
+		const field = this.dialog.get_field("depreciation_booked");
+		this.dialog.set_df_property("depreciation_booked", "hidden", ask ? 0 : 1);
+		if (!ask) return;
+		const months = `${moment(checks.year_start).format("MMM")}–${moment(checks.day_before).format(
+			"MMM YYYY"
+		)}`;
+		field.df.label = __("Did your old books book depreciation for {0}?", [months]);
+		field.refresh();
+		field.set_input(frm.doc.depreciation_booked || "");
+		field.df.change = () => {
+			const value = field.get_value();
+			if ((value || "") === (frm.doc.depreciation_booked || "")) return;
+			this.save(undefined, { depreciation_booked: value }).then(() => this.reopen());
+		};
+	}
+
+	get_alerts() {
+		const { checks, frm } = this;
+		const rows = (idxs) => {
+			const set = new Set(idxs);
+			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
+		};
+		const reload = () => this.reopen();
+		const set_up = [{ label: __("Set up"), onclick: () => this.show_categories() }];
+		// reds about accounts or categories name them; the others are about rows
+		const actions = {
+			posting: checks.posting_fix ? [fix_button(checks.posting_fix, frm)] : [],
+			untyped: [
+				{
+					label: __("Mark them"),
+					onclick: () => call_method(frm, "mark_asset_accounts").then(reload),
+				},
+			],
+			categories: set_up,
+			hsn_code: set_up,
+			wrong_type: set_up,
+			accounts: set_up,
+			hand: [
+				{
+					label: __("Spread by schedule"),
+					onclick: () => call_method(frm, "spread_hand_booked", {}, { freeze: true }).then(reload),
+				},
+				{ label: __("Download sheet"), variant: "outline", onclick: () => download_assets(frm) },
+			],
+		};
+		const named = { untyped: true, wrong_type: true, hsn_code: true, accounts: true };
+		const alerts = (checks.reds || [])
+			.filter((item) => !["empty", "answer"].includes(item.key))
+			.map((item) => ({
+				theme: "red",
+				title: item.text,
+				description: named[item.key]
+					? item.rows.map((name) => short_account(frm, name)).join(", ")
+					: undefined,
+				buttons: [
+					...(actions[item.key] || []),
+					...(!named[item.key] && item.rows.length ? [rows(item.rows)] : []),
+				],
+			}));
+		alerts.unshift(...get_hand_after_alerts(frm));
+		const yellows = checks.yellows || {};
+		const yellow = (title, description, buttons = []) =>
+			alerts.push({ theme: "yellow", title, description, buttons });
+		for (const [account, amount] of Object.entries(checks.off || {})) {
+			yellow(
+				__("{0} is off by {1} from its line.", [
+					short_account(frm, account),
+					format_currency(Math.abs(amount), this.currency, 0),
+				]),
+				__("Check the cost on the sheet, or the line in your trial balance.")
+			);
+		}
+		for (const [account, amount] of Object.entries(checks.depreciation_off || {})) {
+			yellow(
+				__("{0} is off by {1} from the depreciation on the sheet.", [
+					short_account(frm, account),
+					format_currency(Math.abs(amount), this.currency, 0),
+				]),
+				__("Check the depreciation till date on the sheet, or the line in your trial balance.")
+			);
+		}
+		if (yellows.no_depreciation?.length) {
+			yellow(
+				plural(
+					yellows.no_depreciation.length,
+					__("1 asset bought before this year has no depreciation till date."),
+					__("{0} assets bought before this year have no depreciation till date.", [
+						yellows.no_depreciation.length,
+					])
+				),
+				__("Check the sheet: ERPNext books their depreciation from the start."),
+				[rows(yellows.no_depreciation)]
+			);
+		}
+		if (yellows.ending?.length) {
+			yellow(
+				plural(
+					yellows.ending.length,
+					__("1 asset reaches the end of its life with the first depreciation: {0}.", [
+						this.money(yellows.ending_amount),
+					]),
+					__("{0} assets reach the end of their life with the first depreciation: {1}.", [
+						yellows.ending.length,
+						this.money(yellows.ending_amount),
+					])
+				),
+				undefined,
+				[rows(yellows.ending)]
+			);
+		}
+		if (yellows.year_end_with_hand) {
+			yellow(
+				__(
+					"Your old books book depreciation only at year end, but some was booked by hand this year."
+				),
+				__("Check the answer to the question above.")
+			);
+		}
+		if (yellows.defaults?.length) {
+			yellow(
+				__("The company has no default {0} account.", [yellows.defaults.join(", ")]),
+				__("Set it in the Company before you buy or scrap an asset.")
+			);
+		}
+		return alerts;
+	}
+
+	// what the grey lines under the messages say
+	get_greys() {
+		const greys = this.checks.greys || {};
+		return [
+			greys.life_from_rate &&
+				plural(
+					greys.life_from_rate,
+					__("1 Written Down Value asset has no life: it runs until its value is small."),
+					__("{0} Written Down Value assets have no life: they run until their value is small.", [
+						greys.life_from_rate,
+					])
+				),
+			greys.existing_categories?.length &&
+				__("Posting sets the accounts of {0}, made before, to the ones here.", [
+					greys.existing_categories.join(", "),
+				]),
+		];
+	}
+
+	refresh_footer() {
+		if (this.view !== "sheet") return;
+		const { checks } = this;
+		this.dialog.set_primary_action(__("Post to books"), () => this.post());
+		this.dialog.set_secondary_action_label(__("Save draft"));
+		this.dialog.set_secondary_action(() => this.save_draft());
+		const first = (checks.reds || [])[0]?.key;
+		set_footer_reason(
+			this.dialog,
+			!this.get_rows().length
+				? __("Upload a sheet or add rows to post.")
+				: this.dirty || !first
+				? null
+				: first === "answer"
+				? __("Answer the question to post.")
+				: first === "hand"
+				? __("Spread or download the hand-booked depreciation to post.")
+				: __("Clear the reds to post.")
+		);
+	}
+
+	// Depreciation by category: one row each, applied to all its assets
+	show_categories() {
+		const accounts = new Set(this.get_rows().map((row) => row.asset_account));
+		const net_value = this.checks.net_value_accounts || {};
+		const categories = (this.frm.doc.asset_categories || [])
+			.filter((row) => accounts.has(row.asset_account))
+			.map((row) => ({
+				asset_account: row.asset_account,
+				asset_category: row.asset_category,
+				method: row.method,
+				life: row.life,
+				rate: row.rate,
+				accumulated_account: net_value[row.asset_account] || row.accumulated_account,
+				depreciation_account: row.depreciation_account,
+				hsn_code: row.hsn_code,
+				net_value: net_value[row.asset_account] ? 1 : 0,
+			}));
+		this.set_view("categories");
+		const grid = this.dialog.fields_dict.categories.grid;
+		fix_delete_all_rows(grid);
+		grid.df.data = categories;
+		grid.refresh();
+		this.dialog
+			.get_field("categories_head")
+			.$wrapper.empty()
+			.append(
+				make_back_header(
+					__("Depreciation by category"),
+					__("Rows with a life or rate of their own keep it."),
+					() => this.show_sheet()
+				).addClass("mb-3"),
+				grey_line(__("Written Down Value uses the rate; Straight Line uses the life.")).addClass(
+					"mb-3"
+				)
+			);
+		set_footer_reason(this.dialog, null);
+		this.dialog.set_secondary_action_label(__("Back"));
+		this.dialog.set_secondary_action(() => this.show_sheet());
+		const count = this.get_rows().length;
+		this.dialog.set_primary_action(
+			plural(count, __("Apply to 1 row"), __("Apply to {0} rows", [count])),
+			() =>
+				this.save()
+					.then(() =>
+						call_method(this.frm, "save_asset_categories", {
+							rows: (grid.df.data || []).map(({ net_value, ...row }) =>
+								net_value ? { ...row, accumulated_account: undefined } : row
+							),
+						})
+					)
+					.then(() => this.reopen())
+		);
+	}
+
+	confirm_post() {
+		const { checks, frm } = this;
+		const count = checks.sheet.assets;
+		const categories = Object.fromEntries(
+			(frm.doc.asset_categories || []).map((row) => [row.asset_account, row])
+		);
+		const net_value = Object.entries(checks.net_value || {});
+		const first = checks.first_depreciation;
+		this.show_confirm({
+			title: plural(count, __("Post 1 asset?"), __("Post {0} assets?", [count])),
+			back: __("Back to the asset list. Nothing is posted until you confirm."),
+			body: [
+				make_kv_lines([
+					[
+						__("To post"),
+						[
+							plural(count, __("1 asset"), __("{0} assets", [count])),
+							__("cost {0}", [this.money(checks.sheet.cost)]),
+							__("depreciation {0}", [this.money(checks.sheet.depreciation)]),
+						].join(" · "),
+					],
+				]),
+				checks.hand.counted &&
+					grey_line(
+						__("{0} booked by hand since {1} is counted. Monthly from {2}.", [
+							this.money(checks.hand.counted),
+							frappe.datetime.str_to_user(frm.doc.migration_date),
+							frappe.datetime.str_to_user(first.date),
+						])
+					),
+				...net_value.map(([account, amount]) =>
+					grey_line(
+						__(
+							"Your balances do not change. Only the depreciation of {0} moves to its own line: {1} to {2}, dated {3}.",
+							[
+								categories[account]?.asset_category || short_account(frm, account),
+								this.money(amount),
+								short_account(frm, checks.net_value_accounts?.[account]) ||
+									__("its accumulated depreciation line"),
+								frappe.datetime.str_to_user(checks.net_value_date),
+							]
+						)
+					)
+				),
+				checks.wdv_gap &&
+					grey_line(
+						__("{0} less depreciation this year; ERPNext catches it up over the asset's life.", [
+							this.money(checks.wdv_gap),
+						])
+					),
+				checks.fully_depreciated &&
+					grey_line(
+						plural(
+							checks.fully_depreciated,
+							__("1 asset is fully depreciated: it is posted with no schedule."),
+							__("{0} assets are fully depreciated: they are posted with no schedule.", [
+								checks.fully_depreciated,
+							])
+						)
+					),
+				make_kv_lines([
+					[
+						__("First depreciation"),
+						[frappe.datetime.str_to_user(first.date), this.money(first.amount)].join(" · "),
+					],
+				]),
+				checks.year_missing &&
+					grey_line(
+						__("The financial year starting {0} is added when you post.", [
+							frappe.datetime.str_to_user(checks.year_start),
+						])
+					),
+				!checks.auto_depreciation &&
+					grey_line(
+						__("Depreciation is not booked by itself on this site. Book it from each asset.")
+					),
+			].filter(Boolean),
+			primary: plural(count, __("Post 1 asset"), __("Post {0} assets", [count])),
+			on_primary: () =>
+				call_method(frm, "post_fixed_assets", {}, { freeze: true }).then((r) => {
+					this.dialog.hide();
+					after_run(
+						frm,
+						r.message,
+						__("Posting the assets in the background. This page updates when it's done."),
+						() =>
+							frappe.ui.toast({
+								type: "success",
+								message: __("{0} posted.", [
+									plural(count, __("1 asset"), __("{0} assets", [count])),
+								]),
+							})
+					);
+				}),
+		});
+	}
+}
+
+// depreciation booked by hand after the assets were posted: ERPNext's schedule books it too
+const HAND_AFTER_TEXT = () =>
+	__(
+		"This depreciation was booked by hand after the assets were added. ERPNext's schedule books it too, so it would count twice. Cancel the entry."
+	);
+
+function get_hand_after_alerts(frm) {
+	const currency = erpnext.get_currency(frm.doc.company);
+	return (frm.doc.__onload?.asset_match?.hand_after_entries || []).map((entry) => ({
+		theme: "red",
+		title: HAND_AFTER_TEXT(),
+		description: [
+			entry.name,
+			frappe.datetime.str_to_user(entry.posting_date),
+			format_currency(entry.amount, currency),
+			entry.accounts.map((account) => short_account(frm, account)).join(", "),
+		].join(" · "),
+		buttons: [
+			{
+				label: __("Open entry"),
+				onclick: () => frappe.set_route("Form", "Journal Entry", entry.name),
+			},
+		],
+	}));
+}
+
+function show_assets_uploaded(result) {
+	const parts = [
+		result?.replaced &&
+			plural(
+				result.replaced,
+				__("1 draft row was replaced by the new sheet."),
+				__("{0} draft rows were replaced by the new sheet.", [result.replaced])
+			),
+		result?.posted &&
+			plural(
+				result.posted,
+				__("1 asset is posted already and was left out."),
+				__("{0} assets are posted already and were left out.", [result.posted])
+			),
+	].filter(Boolean);
+	if (parts.length) frappe.ui.toast({ type: "info", message: parts.join(" "), duration: 10000 });
+}
+
+function show_posted_assets(frm) {
+	const count_assets = (count) => plural(count, __("1 asset"), __("{0} assets", [count]));
+	show_posted_window(frm, {
+		title: __("Posted assets"),
+		undo_after_live: true,
+		load: () => get_data(frm, "get_posted_entries", { kind: "assets" }).then((r) => r.message),
+		posted_word: (when) => __("Posted {0}", [when]),
+		group_line: (group) => count_assets(group.assets),
+		group_amount: (group, money) => money(group.cost),
+		undone: (posted) =>
+			(posted.undone || []).map((group) => ({
+				source: group.source,
+				line: __("{0} · {1} · removed from ERPNext", [
+					count_assets(group.count),
+					format_currency(group.cost, erpnext.get_currency(frm.doc.company)),
+				]),
+				download: () => download_assets(frm, group.source),
+			})),
+		fields: [
+			{ fieldname: "asset", fieldtype: "Link", options: "Asset", label: __("Asset"), columns: 2 },
+			{ fieldname: "asset_name", fieldtype: "Data", label: __("Asset name"), columns: 2 },
+			{ fieldname: "asset_account", fieldtype: "Data", label: __("Asset account"), columns: 2 },
+			{ fieldname: "purchase_date", fieldtype: "Date", label: __("Purchase date"), columns: 1 },
+			{ fieldname: "gross", fieldtype: "Currency", label: __("Cost"), columns: 2 },
+			{
+				fieldname: "depreciated_text",
+				fieldtype: "Data",
+				label: __("Depreciation posted"),
+				columns: 1,
+			},
+		],
+		rows: (group) =>
+			group.rows.map((row) => ({
+				...row,
+				depreciated_text: row.depreciated ? __("Yes") : "",
+			})),
+		blocked: (row) => row.depreciated,
+		blocked_alert: (rows) => ({
+			title: plural(
+				rows.length,
+				__("1 asset already has depreciation posted."),
+				__("{0} assets already have depreciation posted.", [rows.length])
+			),
+			description: __("Cancel those depreciation entries first. Ask your CA."),
+		}),
+		undo_label: (selected, group, money) =>
+			selected.length
+				? __("Undo {0} selected · {1}", [
+						selected.length,
+						money(selected.reduce((sum, row) => sum + flt(row.gross), 0)),
+				  ])
+				: __("Undo this upload · {0}", [money(group.cost)]),
+		confirm_title: (rows) => __("Undo {0}?", [count_assets(rows.length)]),
+		confirm_text: (rows) =>
+			plural(
+				rows.length,
+				__(
+					"This {0} will be cancelled and deleted in ERPNext. You can download it, fix it and upload again.",
+					[count_assets(1)]
+				),
+				__(
+					"These {0} will be cancelled and deleted in ERPNext. You can download them, fix them and upload again.",
+					[count_assets(rows.length)]
+				)
+			),
+		confirm_rows: (rows, money) =>
+			rows.map((row) => [
+				$(`<span class="text-base text-ink-gray-8 grow truncate"></span>`).text(row.asset_name),
+				$(`<span class="text-base text-ink-gray-5 shrink-0"></span>`).text(
+					short_account(frm, row.asset_account)
+				),
+				$(`<span class="text-base text-ink-gray-8 shrink-0"></span>`).text(money(row.gross)),
+			]),
+		total: (rows) => rows.reduce((sum, row) => sum + flt(row.gross), 0),
+		confirm_button: (rows) => __("Undo {0}", [count_assets(rows.length)]),
+		undo: (group, selected) =>
+			call_method(frm, "undo_fixed_assets", {
+				source: group.source,
+				asset_names: selected ? selected.map((row) => row.asset) : null,
+			}),
+		after_undo: (result, group) => show_undo_result(frm, "assets", result, group.source),
+	});
+}
+
+// ---------- Opening balances: stock in the trial balance ----------
+
+// Work in progress or job worker lines kept as balances: move them to Opening stock, or keep them
+function make_balance_yellows(frm, dialog) {
+	const currency = erpnext.get_currency(frm.doc.company);
+	const reopen = () => {
+		dialog.hide();
+		reload_fresh(frm).then(() => show_opening_balances(frm));
+	};
+	const alerts = [];
+	for (const line of frm.doc.__onload?.stock_like_lines || []) {
+		alerts.push({
+			theme: "yellow",
+			title: __("Move {0} of {1} into Opening stock?", [
+				format_currency(line.amount, currency, 0),
+				short_account(frm, line.account),
+			]),
+			description: __(
+				"Move it if you count this as stock, by item, in a warehouse: it posts with Opening stock. Keep it if it is only a balance. You can change this later in Opening stock."
+			),
+			buttons: [
+				{
+					label: __("Move it"),
+					onclick: () =>
+						call_method(frm, "move_to_opening_stock", { account: line.account }).then(reopen),
+				},
+				{
+					label: __("Keep as a balance"),
+					variant: "outline",
+					onclick: () =>
+						call_method(frm, "keep_as_balance", { account: line.account }).then(reopen),
+				},
+			],
+		});
+	}
+	return make_alerts(alerts).addClass("mb-3");
+}
+
+// ---------- realtime ----------
+
+// the realtime event can be missed: while stock posts in the background, look again now and then
+function watch_stock_posting(frm) {
+	if (!(frm.doc.__onload?.posting || []).includes("Stock")) return;
+	watch_stock_job(frm, "stock_watch", 15000, {}, (status) => status.posting);
+}
+
+// Ask for the light stock status every ms while running(status), then reload the form once
+function watch_stock_job(frm, timer, ms, args, running) {
+	if (frm[timer]) return;
+	frm[timer] = setTimeout(() => {
+		get_data(frm, "get_stock_status", args).then((r) => {
+			frm[timer] = null;
+			if (cur_frm !== frm) return;
+			if (running(r.message)) return watch_stock_job(frm, timer, ms, args, running);
+			if (!frm.is_dirty()) frm.reload_doc();
+		});
+	}, ms);
+}
+
+function listen_for_postings(frm) {
+	for (const [event, done] of [
+		[
+			"company_setup_stock",
+			() => frappe.ui.toast({ type: "success", message: __("Opening stock posted.") }),
+		],
+		[
+			"company_setup_assets",
+			() => frappe.ui.toast({ type: "success", message: __("Fixed assets posted.") }),
+		],
+		["company_setup_stock_correction", (data) => show_stock_corrected(frm, data.result)],
+		[
+			"company_setup_orders",
+			(data) =>
+				frappe.ui.toast({
+					type: "success",
+					message: __("{0} made.", [count_orders(data.order_type, data.made)]),
+				}),
+		],
+	]) {
+		frappe.realtime.off(event);
+		frappe.realtime.on(event, (data) => {
+			if (data.company !== frm.doc.company) return;
+			if (data.error) {
+				frappe.msgprint({ title: __("Not done"), message: data.error, indicator: "red" });
+			}
+			reload_fresh(frm).then(() => !data.error && done(data));
+		});
+	}
 }

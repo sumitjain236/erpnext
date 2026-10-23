@@ -1,0 +1,97 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-10-22 16:16:47.896484",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "asset_account",
+  "asset_category",
+  "method",
+  "life",
+  "rate",
+  "column_break_accounts",
+  "accumulated_account",
+  "depreciation_account",
+  "hsn_code"
+ ],
+ "fields": [
+  {
+   "columns": 2,
+   "fieldname": "asset_account",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Asset Account",
+   "options": "Account",
+   "reqd": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "asset_category",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Category",
+   "reqd": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "method",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Method",
+   "options": "\nStraight Line\nWritten Down Value"
+  },
+  {
+   "columns": 1,
+   "fieldname": "life",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Life (Years)"
+  },
+  {
+   "columns": 1,
+   "fieldname": "rate",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Rate %"
+  },
+  {
+   "fieldname": "column_break_accounts",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "accumulated_account",
+   "fieldtype": "Link",
+   "label": "Accumulated Depreciation Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "depreciation_account",
+   "fieldtype": "Link",
+   "label": "Depreciation Account",
+   "options": "Account"
+  },
+  {
+   "description": "Set on the fixed asset item made for this category.",
+   "fieldname": "hsn_code",
+   "fieldtype": "Data",
+   "label": "HSN/SAC Code"
+  }
+ ],
+ "grid_page_length": 50,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-22 20:35:52.354030",
+ "modified_by": "Administrator",
+ "module": "Setup",
+ "name": "Company Setup Asset Category",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

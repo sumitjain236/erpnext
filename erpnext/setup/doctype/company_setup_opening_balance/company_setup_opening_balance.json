@@ -86,7 +86,8 @@
    "fieldtype": "Link",
    "label": "Journal Entry",
    "options": "Journal Entry",
-   "read_only": 1
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "columns": 1,
@@ -108,7 +109,7 @@
  "grid_page_length": 50,
  "istable": 1,
  "links": [],
- "modified": "2026-10-21 16:08:01.035909",
+ "modified": "2026-10-23 12:45:37.514641",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup Opening Balance",

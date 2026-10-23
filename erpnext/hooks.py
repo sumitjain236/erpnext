@@ -92,15 +92,27 @@ setup_wizard_requires = "assets/erpnext/js/setup_wizard.js"
 setup_wizard_stages = "erpnext.setup.setup_wizard.setup_wizard.get_setup_stages"
 
 # Steps on Company Setup. Every app lists its steps here the same way, with "before" or
-# "after" to place them; see company_setup_steps.py for the rules.
+# "replaces" to place them; see company_setup_steps.py for the rules.
 company_setup_steps = [
 	"erpnext.setup.doctype.company_setup.company_setup_steps.migration_date",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.chart_of_accounts",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.taxes",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.opening_balances",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.bank_accounts",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.customers",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.opening_sales_invoices",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.open_sales_orders",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.suppliers",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.opening_purchase_invoices",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.open_purchase_orders",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.items",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.warehouses",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.opening_stock",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.fixed_assets",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.boms",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.open_work_orders",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.job_workers",
+	"erpnext.setup.doctype.company_setup.company_setup_steps.open_subcontracting_orders",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.check_books",
 	"erpnext.setup.doctype.company_setup.company_setup_steps.go_live",
 ]

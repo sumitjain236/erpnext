@@ -705,10 +705,24 @@ body[data-route="pos"] {
 	grid-template-columns: 6rem minmax(0, 1fr);
 }
 
+// Company Setup: a debit or credit column of a trial balance
+.company-setup-amount {
+	flex-shrink: 0;
+	width: 9rem;
+	text-align: right;
+}
+
+// Company Setup: the company card's details in two columns; a long one takes both
+.company-setup-two-columns {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.company-setup-full-row {
+	grid-column: 1 / -1;
+}
+
 // Company Setup: each checklist row opens its task
 .company-setup-step {
-	cursor: pointer;
-
 	&:hover,
 	&:focus-visible {
 		background-color: var(--surface-gray-2);

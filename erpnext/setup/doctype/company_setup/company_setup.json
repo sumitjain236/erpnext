@@ -29,6 +29,15 @@
   "opening_balances_section",
   "sheet_accounts",
   "opening_balances",
+  "bank_accounts_section",
+  "has_uncleared_cheques",
+  "bank_accounts",
+  "uncleared_cheques_section",
+  "uncleared_cheques",
+  "undone_cheques",
+  "taxes_section",
+  "taxes_saved",
+  "tax_templates",
   "selling_tab",
   "selling_section",
   "selling_html",
@@ -40,7 +49,35 @@
   "buying_html",
   "opening_purchase_invoices_section",
   "opening_purchase_invoices",
-  "undone_purchase_invoices"
+  "undone_purchase_invoices",
+  "stock_tab",
+  "stock_section",
+  "stock_html",
+  "warehouses_section",
+  "warehouses",
+  "opening_stock_section",
+  "opening_stock",
+  "undone_stock",
+  "open_orders_section",
+  "open_orders",
+  "undone_orders",
+  "fixed_assets_section",
+  "depreciation_booked",
+  "asset_categories",
+  "fixed_assets",
+  "undone_assets",
+  "stock_difference",
+  "stock_like_kept",
+  "stock_difference_entry",
+  "assets_tab",
+  "assets_section",
+  "assets_html",
+  "manufacturing_tab",
+  "manufacturing_section",
+  "manufacturing_html",
+  "subcontracting_tab",
+  "subcontracting_section",
+  "subcontracting_html"
  ],
  "fields": [
   {
@@ -198,7 +235,7 @@
    "fieldtype": "Select",
    "hidden": 1,
    "label": "Accounts From",
-   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
   },
   {
    "description": "The software the unpaid customer invoices come from.",
@@ -206,7 +243,7 @@
    "fieldtype": "Select",
    "hidden": 1,
    "label": "Receivables From",
-   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
   },
   {
    "description": "The software the unpaid supplier bills come from.",
@@ -214,7 +251,7 @@
    "fieldtype": "Select",
    "hidden": 1,
    "label": "Payables From",
-   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nMarg\nExcel / other"
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
   },
   {
    "description": "What customers owe as per the uploaded trial balance.",
@@ -261,12 +298,248 @@
    "hidden": 1,
    "label": "Undone Purchase Invoices",
    "options": "Company Setup Opening Invoice"
+  },
+  {
+   "fieldname": "bank_accounts_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Bank Accounts"
+  },
+  {
+   "description": "Any cheques or deposits not cleared by the bank on the day before migration.",
+   "fieldname": "has_uncleared_cheques",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Uncleared Cheques",
+   "options": "\nNo\nYes"
+  },
+  {
+   "fieldname": "bank_accounts",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Bank Accounts",
+   "options": "Company Setup Bank Account"
+  },
+  {
+   "fieldname": "uncleared_cheques_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Uncleared Cheques and Deposits"
+  },
+  {
+   "fieldname": "uncleared_cheques",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Uncleared Cheques",
+   "options": "Company Setup Uncleared Cheque"
+  },
+  {
+   "fieldname": "undone_cheques",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Cheques",
+   "options": "Company Setup Uncleared Cheque"
+  },
+  {
+   "depends_on": "eval:!doc.__islocal",
+   "fieldname": "stock_tab",
+   "fieldtype": "Tab Break",
+   "label": "Stock"
+  },
+  {
+   "fieldname": "stock_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "stock_html",
+   "fieldtype": "HTML",
+   "label": "Stock"
+  },
+  {
+   "depends_on": "eval:!doc.__islocal",
+   "fieldname": "assets_tab",
+   "fieldtype": "Tab Break",
+   "label": "Assets"
+  },
+  {
+   "fieldname": "assets_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "assets_html",
+   "fieldtype": "HTML",
+   "label": "Assets"
+  },
+  {
+   "depends_on": "eval:!doc.__islocal",
+   "fieldname": "manufacturing_tab",
+   "fieldtype": "Tab Break",
+   "label": "Manufacturing"
+  },
+  {
+   "fieldname": "manufacturing_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "manufacturing_html",
+   "fieldtype": "HTML",
+   "label": "Manufacturing"
+  },
+  {
+   "depends_on": "eval:!doc.__islocal",
+   "fieldname": "subcontracting_tab",
+   "fieldtype": "Tab Break",
+   "label": "Subcontracting"
+  },
+  {
+   "fieldname": "subcontracting_section",
+   "fieldtype": "Section Break",
+   "hide_border": 1
+  },
+  {
+   "fieldname": "subcontracting_html",
+   "fieldtype": "HTML",
+   "label": "Subcontracting"
+  },
+  {
+   "fieldname": "warehouses_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Warehouses"
+  },
+  {
+   "fieldname": "warehouses",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Warehouses",
+   "options": "Company Setup Warehouse"
+  },
+  {
+   "fieldname": "opening_stock_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Opening Stock"
+  },
+  {
+   "fieldname": "opening_stock",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Opening Stock",
+   "options": "Company Setup Opening Stock"
+  },
+  {
+   "fieldname": "undone_stock",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Stock",
+   "options": "Company Setup Opening Stock"
+  },
+  {
+   "description": "The difference posted for each stock line, by account.",
+   "fieldname": "stock_difference",
+   "fieldtype": "JSON",
+   "hidden": 1,
+   "label": "Stock Difference",
+   "read_only": 1
+  },
+  {
+   "fieldname": "stock_difference_entry",
+   "fieldtype": "Link",
+   "hidden": 1,
+   "label": "Stock Difference Entry",
+   "options": "Journal Entry",
+   "read_only": 1
+  },
+  {
+   "fieldname": "open_orders_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Open Orders"
+  },
+  {
+   "fieldname": "open_orders",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Open Orders",
+   "options": "Company Setup Open Order"
+  },
+  {
+   "fieldname": "undone_orders",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Orders",
+   "options": "Company Setup Open Order"
+  },
+  {
+   "fieldname": "taxes_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Taxes"
+  },
+  {
+   "default": "0",
+   "description": "Set when the Taxes step is saved, with rows or none.",
+   "fieldname": "taxes_saved",
+   "fieldtype": "Check",
+   "label": "Taxes Saved",
+   "read_only": 1
+  },
+  {
+   "fieldname": "tax_templates",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Tax Templates",
+   "options": "Company Setup Tax Template"
+  },
+  {
+   "fieldname": "fixed_assets_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Fixed Assets"
+  },
+  {
+   "description": "For a migration date in the middle of the year: how the old books booked depreciation this year.",
+   "fieldname": "depreciation_booked",
+   "fieldtype": "Select",
+   "label": "Old Books Booked Depreciation",
+   "options": "\nEvery month\nOnly at year end"
+  },
+  {
+   "fieldname": "asset_categories",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Asset Categories",
+   "options": "Company Setup Asset Category"
+  },
+  {
+   "fieldname": "fixed_assets",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Fixed Assets",
+   "options": "Company Setup Fixed Asset"
+  },
+  {
+   "fieldname": "undone_assets",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Undone Assets",
+   "options": "Company Setup Fixed Asset"
+  },
+  {
+   "description": "Work in progress or job worker lines the user keeps in Opening balances.",
+   "fieldname": "stock_like_kept",
+   "fieldtype": "JSON",
+   "hidden": 1,
+   "label": "Stock-like Lines Kept as Balances"
   }
  ],
  "grid_page_length": 50,
  "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-21 18:58:19.381173",
+ "modified": "2026-10-22 22:06:35.613557",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",

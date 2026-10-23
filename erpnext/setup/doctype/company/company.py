@@ -777,8 +777,10 @@ class Company(NestedSet):
 					"account_name": ("in", [_("Sales"), _("Sales Account")]),
 					"account_type": "Income Account",
 				},
-				pluck="name",
+				fields=["name", "account_currency"],
 			)
+			income_account = sorted(income_account, key=lambda a: a.account_currency != self.default_currency)
+			income_account = [a.name for a in income_account]
 
 			if income_account:
 				income_account = income_account[0]
@@ -837,9 +839,10 @@ class Company(NestedSet):
 		if self.get(fieldname):
 			return
 
+		filters = {"account_type": account_type, "is_group": 0, "company": self.name}
 		account = frappe.db.get_value(
-			"Account", {"account_type": account_type, "is_group": 0, "company": self.name}
-		)
+			"Account", {**filters, "account_currency": self.default_currency}
+		) or frappe.db.get_value("Account", filters)
 
 		if account:
 			self.db_set(fieldname, account)
@@ -898,7 +901,11 @@ class Company(NestedSet):
 		clear_defaults_cache()
 
 		if frappe.db.exists("Company Setup", olddn):
-			frappe.rename_doc("Company Setup", olddn, newdn, force=True, show_alert=False)
+			# merged into a company with its own setup: that one stays
+			if merge and frappe.db.exists("Company Setup", newdn):
+				frappe.delete_doc("Company Setup", olddn, force=True, ignore_permissions=True)
+			else:
+				frappe.rename_doc("Company Setup", olddn, newdn, force=True, show_alert=False)
 
 	def abbreviate(self):
 		self.abbr = "".join(c[0].upper() for c in self.company_name.split())

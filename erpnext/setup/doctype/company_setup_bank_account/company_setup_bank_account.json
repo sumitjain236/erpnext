@@ -1,0 +1,108 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-10-22 14:38:30.963899",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "account",
+  "bank",
+  "bank_account_no",
+  "branch_code",
+  "column_break_balance",
+  "statement_balance",
+  "has_statement_balance",
+  "is_default",
+  "is_credit_card",
+  "bank_account"
+ ],
+ "fields": [
+  {
+   "columns": 3,
+   "fieldname": "account",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Account",
+   "options": "Account",
+   "reqd": 1
+  },
+  {
+   "columns": 2,
+   "description": "The Bank's name. A name that is not a Bank yet is made one when the bank details are saved.",
+   "fieldname": "bank",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Bank"
+  },
+  {
+   "columns": 2,
+   "fieldname": "bank_account_no",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Account Number"
+  },
+  {
+   "columns": 1,
+   "fieldname": "branch_code",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "IFSC or Branch Code"
+  },
+  {
+   "fieldname": "column_break_balance",
+   "fieldtype": "Column Break"
+  },
+  {
+   "columns": 1,
+   "description": "The bank statement's balance on the day before migration.",
+   "fieldname": "statement_balance",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Statement Balance"
+  },
+  {
+   "columns": 1,
+   "default": "0",
+   "fieldname": "is_default",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Default"
+  },
+  {
+   "fieldname": "bank_account",
+   "fieldtype": "Link",
+   "label": "Bank Account",
+   "options": "Bank Account",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "has_statement_balance",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Statement Balance Typed"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_credit_card",
+   "fieldtype": "Check",
+   "label": "Credit Card"
+  }
+ ],
+ "grid_page_length": 50,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-23 12:48:25.657146",
+ "modified_by": "Administrator",
+ "module": "Setup",
+ "name": "Company Setup Bank Account",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

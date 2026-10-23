@@ -11,6 +11,7 @@ from frappe import _
 from frappe.core.doctype.file.utils import find_file_by_url
 from frappe.desk.form.linked_with import get_linked_fields
 from frappe.model.document import Document
+from frappe.model.rename_doc import get_link_fields
 from frappe.utils import cint, cstr
 from frappe.utils.csvutils import UnicodeWriter
 from frappe.utils.xlsxutils import (
@@ -84,9 +85,6 @@ def validate_company(company: str):
 
 @frappe.whitelist()
 def import_coa(file_name: str, company: str):
-	frappe.only_for("Accounts Manager")
-	frappe.has_permission("Company", "write", company, throw=True)
-
 	# create accounts
 	file_doc, extension = get_file(file_name)
 	validate_accounts(file_doc, extension)
@@ -103,8 +101,6 @@ def replace_chart(data: list, company: str, refill_defaults: bool = False):
 	"""Delete the company's accounts and create them again from rows in the template's columns.
 	With refill_defaults, the company's cash, bank, stock and other defaults are set from the new chart."""
 	frappe.only_for("Accounts Manager")
-
-	# delete existing data for accounts
 	frappe.has_permission("Company", "write", company, throw=True)
 
 	validate_columns(data)
@@ -504,21 +500,18 @@ def unset_existing_data(company):
 
 
 def clear_removed_accounts(accounts: set):
-	"""Empty every link to these accounts. A child row that needs the account is removed."""
+	"""Empty the links to these accounts in masters and settings, like a Mode of Payment's default
+	account; a child row that needs the account is removed. Submittable documents keep theirs: they
+	record what was done."""
 	if not accounts:
 		return
 
 	accounts = list(accounts)
-	links = frappe.get_all(
-		"DocField", {"fieldtype": "Link", "options": "Account"}, ["parent", "fieldname", "reqd"]
-	) + frappe.get_all(
-		"Custom Field", {"fieldtype": "Link", "options": "Account"}, ["dt as parent", "fieldname", "reqd"]
-	)
-	for link in links:
+	for link in get_link_fields("Account"):
 		meta = frappe.get_meta(link.parent)
-		if link.parent in ("Account", "Company") or meta.is_virtual:
+		if link.parent in ("Account", "Company") or meta.is_submittable:
 			continue
-		if meta.issingle:
+		if link.issingle:
 			frappe.db.delete(
 				"Singles", {"doctype": link.parent, "field": link.fieldname, "value": ("in", accounts)}
 			)
@@ -534,12 +527,17 @@ def clear_removed_accounts(accounts: set):
 			.distinct()
 			.run(pluck=True)
 		)
+		if meta.istable:
+			changed = [parent for parent in changed if not frappe.get_meta(parent).is_submittable]
 		if not changed:
 			continue
-		if meta.istable and link.reqd:
-			frappe.qb.from_(table).delete().where(field.isin(accounts)).run()
+		rows = field.isin(accounts)
+		if meta.istable:
+			rows &= table.parenttype.isin(changed)
+		if meta.istable and getattr(meta.get_field(link.fieldname), "reqd", 0):
+			frappe.qb.from_(table).delete().where(rows).run()
 		else:
-			frappe.qb.update(table).set(field, None).where(field.isin(accounts)).run()
+			frappe.qb.update(table).set(field, None).where(rows).run()
 		for doctype in changed if meta.istable else [link.parent]:
 			frappe.clear_document_cache(doctype)
 
@@ -565,18 +563,19 @@ def set_default_accounts(company, refill_defaults=False):
 	from erpnext.setup.doctype.company.company import install_country_fixtures
 
 	company = frappe.get_doc("Company", company)
+
+	def get_ledger(account_type):
+		# one in the company's currency when there is one
+		ledger = {"company": company.name, "is_group": 0, "account_type": account_type}
+		return frappe.db.get_value(
+			"Account", {**ledger, "account_currency": company.default_currency}
+		) or frappe.db.get_value("Account", ledger)
+
 	company.update(
 		{
-			"default_receivable_account": frappe.db.get_value(
-				"Account", {"company": company.name, "account_type": "Receivable", "is_group": 0}
-			),
-			"default_payable_account": frappe.db.get_value(
-				"Account", {"company": company.name, "account_type": "Payable", "is_group": 0}
-			),
-			"default_provisional_account": frappe.db.get_value(
-				"Account",
-				{"company": company.name, "account_type": "Service Received But Not Billed", "is_group": 0},
-			),
+			"default_receivable_account": get_ledger("Receivable"),
+			"default_payable_account": get_ledger("Payable"),
+			"default_provisional_account": get_ledger("Service Received But Not Billed"),
 		}
 	)
 	if refill_defaults:
@@ -586,4 +585,6 @@ def set_default_accounts(company, refill_defaults=False):
 
 	company.save()
 	install_country_fixtures(company.name, company.country)
-	company.create_default_tax_template()
+	if not refill_defaults:
+		# Company Setup's Taxes step makes the templates for its chart
+		company.create_default_tax_template()

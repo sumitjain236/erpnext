@@ -81,6 +81,24 @@ class TestChartofAccountsImporter(ERPNextTestSuite):
 				],
 			}
 		).insert()
+		# a document that records what was done keeps its accounts, even a draft
+		cash = frappe.db.get_value(
+			"Account", {"company": company.name, "account_type": "Cash", "is_group": 0}
+		)
+		capital = frappe.db.get_value(
+			"Account", {"company": company.name, "root_type": "Equity", "is_group": 0}
+		)
+		entry = frappe.get_doc(
+			{
+				"doctype": "Journal Entry",
+				"company": company.name,
+				"posting_date": "2026-01-01",
+				"accounts": [
+					{"account": cash, "debit_in_account_currency": 10},
+					{"account": capital, "credit_in_account_currency": 10},
+				],
+			}
+		).insert()
 
 		replace_chart(
 			[
@@ -102,3 +120,7 @@ class TestChartofAccountsImporter(ERPNextTestSuite):
 
 		self.assertIsNone(frappe.db.get_value("Warehouse", warehouse, "account"))
 		self.assertFalse(frappe.get_doc("Asset Category", category.name).accounts)
+		self.assertEqual(
+			frappe.get_all("Journal Entry Account", {"parent": entry.name}, pluck="account", order_by="idx"),
+			[cash, capital],
+		)

@@ -13,6 +13,7 @@ from io import BytesIO, StringIO
 
 import frappe
 from frappe import _
+from frappe.desk.utils import provide_binary_file
 from frappe.utils import cint, cstr, flt
 from frappe.utils.csvutils import read_csv_content
 from frappe.utils.xlsxutils import make_xlsx, read_xls_file_from_attached_file
@@ -31,6 +32,70 @@ from erpnext.accounts.doctype.chart_of_accounts_importer.chart_of_accounts_impor
 IMPORTER_COLUMNS = 8
 # the importer's columns a chart sheet must have
 CHART_HEADERS = ("Account Name", "Parent Account", "Account Number", "Is Group", "Account Type", "Root Type")
+IMPORTER_KEYS = (
+	"account_name",
+	"parent_account",
+	"account_number",
+	"parent_account_number",
+	"is_group",
+	"account_type",
+	"root_type",
+	"account_currency",
+)
+# a QuickBooks account type: its top-level account, root type, group and ERPNext account type
+ACCOUNT_LIST_TYPES = {
+	"bank": ("Assets", "Asset", "Bank Accounts", "Bank"),
+	"accounts receivable (a/r)": ("Assets", "Asset", "Accounts Receivable", "Receivable"),
+	"other current assets": ("Assets", "Asset", "Other Current Assets", None),
+	"fixed assets": ("Assets", "Asset", "Fixed Assets", "Fixed Asset"),
+	"other assets": ("Assets", "Asset", "Other Assets", None),
+	"accounts payable (a/p)": ("Liabilities", "Liability", "Accounts Payable", "Payable"),
+	"credit card": ("Liabilities", "Liability", "Credit Cards", "Bank"),
+	"other current liabilities": ("Liabilities", "Liability", "Other Current Liabilities", None),
+	"long term liabilities": ("Liabilities", "Liability", "Long Term Liabilities", None),
+	"equity": ("Equity", "Equity", None, "Equity"),
+	"income": ("Income", "Income", None, "Income Account"),
+	"other income": ("Income", "Income", "Other Income", "Income Account"),
+	"cost of goods sold": ("Expenses", "Expense", "Cost of Goods Sold", "Cost of Goods Sold"),
+	"expenses": ("Expenses", "Expense", None, "Expense Account"),
+	"other expense": ("Expenses", "Expense", "Other Expense", "Expense Account"),
+}
+# Busy's own groups, by their name tidied: the name the chart gives it, the group above, root type
+# and account type
+BUSY_GROUPS = {
+	"assets": ("Assets", None, "Asset", None),
+	"liabilities": ("Liabilities", None, "Liability", None),
+	"income": ("Income", None, "Income", None),
+	"expenses": ("Expenses", None, "Expense", None),
+	"capital account": ("Capital Account", None, "Equity", None),
+	"reserves surplus": ("Reserves & Surplus", "capital account", "Equity", None),
+	"loans liability": ("Loans (Liability)", "liabilities", "Liability", None),
+	"secured loans": ("Secured Loans", "loans liability", "Liability", None),
+	"unsecured loans": ("Unsecured Loans", "loans liability", "Liability", None),
+	"bank o d account": ("Bank O/D Account", "loans liability", "Liability", "Bank"),
+	"current liabilities": ("Current Liabilities", "liabilities", "Liability", None),
+	"duties taxes": ("Duties & Taxes", "current liabilities", "Liability", "Tax"),
+	"provisions expenses payable": ("Provisions/Expenses Payable", "current liabilities", "Liability", None),
+	"sundry creditors": ("Sundry Creditors", "current liabilities", "Liability", None),
+	"suspense account": ("Suspense Account", "current liabilities", "Liability", None),
+	"fixed assets": ("Fixed Assets", "assets", "Asset", None),
+	"investments": ("Investments", "assets", "Asset", None),
+	"current assets": ("Current Assets", "assets", "Asset", None),
+	"bank accounts": ("Bank Accounts", "current assets", "Asset", "Bank"),
+	"cash in hand": ("Cash-in-hand", "current assets", "Asset", "Cash"),
+	"loans advances asset": ("Loans & Advances (Asset)", "current assets", "Asset", None),
+	"securities deposits asset": ("Securities & Deposits (Asset)", "current assets", "Asset", None),
+	"sundry debtors": ("Sundry Debtors", "current assets", "Asset", None),
+	"stock in hand": ("Stock-in-hand", "current assets", "Asset", "Stock"),
+	"sale": ("Sales Accounts", "income", "Income", None),
+	"sales": ("Sales Accounts", "income", "Income", None),
+	"income direct opr": ("Income (Direct/Opr.)", "income", "Income", None),
+	"income indirect": ("Income (Indirect)", "income", "Income", None),
+	"purchase": ("Purchase Accounts", "expenses", "Expense", None),
+	"purchases": ("Purchase Accounts", "expenses", "Expense", None),
+	"expenses direct mfg": ("Expenses (Direct/Mfg.)", "expenses", "Expense", None),
+	"expenses indirect admn": ("Expenses (Indirect/Admn.)", "expenses", "Expense", None),
+}
 BALANCE_COLUMNS = ("Opening Debit", "Opening Credit")
 # the charts made at setup have no Equity root, so the importer's rule for all five root types is too strict
 REQUIRED_ROOT_TYPES = ("Asset", "Liability", "Income", "Expense")
@@ -44,6 +109,10 @@ NAME_COLUMNS = ("account_name", "account", "particulars", "ledger", "ledger_name
 HEADING_ROWS = 15
 # a report's own lines that add up the others
 TOTAL_LINE = re.compile(r"^(grand\s+)?total(\s+for\s.*)?:?$", re.IGNORECASE)
+# a side written after an amount, like "30,000.00 Cr."
+DR_CR = re.compile(r"\b(cr|dr)\.?\s*$", re.IGNORECASE)
+# a quantity and the unit Tally writes after it, like "2,450 Kg"
+QTY_WITH_UNIT = re.compile(r"^\s*(-?[\d,]*\.?\d+)\s*([^\d\s].*)?$")
 # the groups other software keeps customers, suppliers and stock under (Tally, Busy, QuickBooks)
 PARTY_GROUPS = {
 	"Receivable": (
@@ -64,18 +133,176 @@ PARTY_GROUPS = {
 }
 
 
-def read_chart_sheet(file_url: str) -> frappe._dict:
+def read_chart_sheet(file_url: str, group_kinds: dict | None = None) -> frappe._dict:
 	"""The importer's rows of the sheet, its accounts as a tree, and its opening balances."""
 	file_doc, extension = get_file(file_url)
-	validate_chart_headers(read_rows(file_doc, extension, as_dict=True))
-	rows = [row[:IMPORTER_COLUMNS] for row in read_rows(file_doc, extension)]
+	unknown_groups = []
+	rows = get_account_list_rows(file_url)
+	if not rows:
+		rows, unknown_groups = get_busy_list_rows(file_url, group_kinds) or (None, [])
+	if rows:
+		dict_rows = [dict(zip(IMPORTER_KEYS, row, strict=False)) for row in rows]
+	else:
+		dict_rows = read_rows(file_doc, extension, as_dict=True)
+		validate_chart_headers(dict_rows)
+		rows = [row[:IMPORTER_COLUMNS] for row in read_rows(file_doc, extension)]
+	renamed = rename_repeated_accounts(rows, dict_rows)
 	validate_columns(rows)
 	validate_roots(rows)
 	return frappe._dict(
 		rows=rows,
 		forest=build_forest(rows),
-		balances=get_balances(read_rows(file_doc, extension, as_dict=True)),
+		balances=get_sheet_balances(dict_rows),
+		renamed=renamed,
+		unknown_groups=unknown_groups,
 	)
+
+
+def rename_repeated_accounts(rows: list[list], dict_rows: list[dict]) -> list[str]:
+	"""A ledger name used under two parents, like QuickBooks' "Original Cost" under each asset, gets
+	its parent's name added: ERPNext keeps one account per name. Returns the new names."""
+	counts = {}
+	for row in rows:
+		if row and row[0] and not cstr(row[2]).strip():
+			counts[row[0]] = counts.get(row[0], 0) + 1
+	renamed = []
+	for row, values in zip(rows, dict_rows, strict=True):
+		if not row or counts.get(row[0], 0) < 2 or cstr(row[2]).strip():
+			continue
+		if cint(row[4]) or row[1] == row[0]:
+			frappe.throw(
+				_("{0} is in the chart more than once. Give each its own name, or an account number.").format(
+					frappe.bold(row[0])
+				),
+				title=_("Same account twice"),
+			)
+		row[0] = f"{row[0]} ({row[1]})"
+		values["account_name"] = row[0]
+		renamed.append(row[0])
+	if len(set(renamed)) < len(renamed):
+		name = next(name for name in renamed if renamed.count(name) > 1)
+		frappe.throw(
+			_("{0} is in the chart more than once. Give each its own name, or an account number.").format(
+				frappe.bold(name)
+			),
+			title=_("Same account twice"),
+		)
+	return renamed
+
+
+def get_account_list_rows(file_url: str) -> list[list] | None:
+	"""A QuickBooks Account List in the importer's columns: each account under a group for its
+	QuickBooks type, and a sub-account ("Parent:Child") under its parent. None for any other sheet."""
+	report, keys = read_sheet(file_url)
+	heading = find_heading(
+		keys, lambda row: {"type", "detail_type"} <= set(row) and {"account", "full_name"} & set(row)
+	)
+	if heading is None:
+		return None
+	columns = keys[heading]
+	name_column = find_column(columns, ("account", "full_name"))
+	type_column, detail_column = columns.index("type"), columns.index("detail_type")
+
+	rows, added = [], set()
+
+	def add(name, parent, is_group, account_type, root_type):
+		# a ledger name may repeat under other parents: rename_repeated_accounts tells them apart
+		key = name if is_group else (name, parent)
+		if key not in added:
+			added.add(key)
+			rows.append([name, parent or name, None, None, is_group, account_type, root_type, None])
+
+	accounts = []
+	for row in report[heading + 1 :]:
+		name = cstr(get_cell(row.cells, name_column)).strip()
+		kind = ACCOUNT_LIST_TYPES.get(cstr(get_cell(row.cells, type_column)).strip().lower())
+		if name and kind:
+			parts = [part.strip() for part in name.split(":")]
+			accounts.append((parts, kind, cstr(get_cell(row.cells, detail_column)).strip().lower()))
+	parents = {part for parts, _kind, _detail in accounts for part in parts[:-1]}
+	for parts, (root_name, root_type, group, account_type), detail in accounts:
+		add(root_name, None, 1, None, root_type)
+		under = root_name
+		if group:
+			add(group, root_name, 1, "Bank" if account_type == "Bank" else None, root_type)
+			under = group
+		for part in parts[:-1]:
+			add(part, under, 1, None, root_type)
+			under = part
+		if parts[-1] in parents:
+			add(parts[-1], under, 1, None, root_type)
+		elif "accumulated" in detail:
+			add(parts[-1], under, 0, "Accumulated Depreciation", root_type)
+		elif detail == "depreciation":
+			add(parts[-1], under, 0, "Depreciation", root_type)
+		elif "tax payable" in detail and "payroll" not in detail:
+			add(parts[-1], under, 0, "Tax", root_type)
+		else:
+			add(parts[-1], under, 0, account_type, root_type)
+	return rows
+
+
+def get_busy_list_rows(file_url: str, group_kinds: dict | None = None) -> tuple[list[list], list[str]] | None:
+	"""A Busy List of Accounts in the importer's columns: each account under its Busy group, placed
+	where Busy keeps that group. Customers and suppliers become one Debtors and one Creditors account,
+	as they come in as parties. A group Busy doesn't ship, like "Insurance & TPA", is what group_kinds
+	says it holds: "Customers" or "Suppliers" make it one receivable or payable ledger of its name,
+	else it is a group under Current Assets. Those groups are returned too, to ask about. None for
+	any other sheet."""
+	group_kinds = group_kinds or {}
+	report, keys = read_sheet(file_url)
+	heading = find_heading(
+		keys,
+		lambda row: "group" in row
+		and {"name", "account_name"} & set(row)
+		and "parent_account" not in row
+		and not get_amount_columns([row]),
+	)
+	if heading is None:
+		return None
+	columns = keys[heading]
+	name_column = find_column(columns, ("name", "account_name"))
+	group_column = columns.index("group")
+	rows, added, unknown = [], set(), []
+
+	def add(name, parent, is_group, account_type, root_type):
+		if name not in added:
+			added.add(name)
+			rows.append([name, parent or name, None, None, is_group, account_type, root_type, None])
+
+	def add_group(key) -> str:
+		name, parent, root_type, account_type = BUSY_GROUPS[key]
+		add(_(name), parent and add_group(parent), 1, account_type, root_type)
+		return _(name)
+
+	for key in ("assets", "liabilities", "income", "expenses"):
+		add_group(key)
+	for row in report[heading + 1 :]:
+		name = cstr(get_cell(row.cells, name_column)).strip()
+		group = cstr(get_cell(row.cells, group_column)).strip()
+		if not name or not group or is_total_row(row.cells, name_column):
+			continue
+		key = get_group_key(group)
+		if key not in BUSY_GROUPS:
+			if group not in unknown:
+				unknown.append(group)
+			if group_kinds.get(group) == "Customers":
+				add(group, add_group("sundry debtors"), 0, "Receivable", "Asset")
+			elif group_kinds.get(group) == "Suppliers":
+				add(group, add_group("sundry creditors"), 0, "Payable", "Liability")
+			else:
+				add(group, add_group("current assets"), 1, None, "Asset")
+				add(name, group, 0, None, "Asset")
+		elif key == "sundry debtors":
+			add(_("Debtors"), add_group(key), 0, "Receivable", "Asset")
+		elif key == "sundry creditors":
+			add(_("Creditors"), add_group(key), 0, "Payable", "Liability")
+		else:
+			_name, _parent, root_type, account_type = BUSY_GROUPS[key]
+			if key == "fixed assets":
+				account_type = "Accumulated Depreciation" if "depreciation" in name.lower() else "Fixed Asset"
+			add(name, add_group(key), 0, account_type, root_type)
+	return rows, unknown
 
 
 def validate_chart_headers(rows: list[dict]):
@@ -99,12 +326,16 @@ def validate_roots(rows: list[list]):
 			frappe.throw(
 				_(
 					"{0} is a top-level account, so its Root Type must be Asset, Liability, Equity, Income or Expense."
-				).format(frappe.bold(row[0]))
+				).format(frappe.bold(row[0])),
+				title=_("Wrong root type"),
 			)
 
 	missing = set(REQUIRED_ROOT_TYPES) - {row[6] for row in roots}
 	if missing:
-		frappe.throw(_("Add a top-level account for: {0}").format(", ".join(sorted(missing))))
+		frappe.throw(
+			_("Add a top-level account for: {0}").format(", ".join(sorted(missing))),
+			title=_("Top-level account missing"),
+		)
 
 
 def read_rows(file_doc, extension: str, as_dict: bool = False) -> list:
@@ -117,46 +348,59 @@ def read_balance_sheet(file_url: str) -> list[frappe._dict]:
 	"""The lines of a balances sheet or trial balance, as exported from other software: under a few
 	title rows, with group lines that total the lines indented under them, and a total at the end.
 	Each line knows the groups it is under; group lines are marked, totals left out."""
-	rows = read_report(file_url)
-	keys = [[get_column_key(value) for value in row.cells] for row in rows]
-	heading, amounts = next(
-		(
-			(i, get_amount_columns(keys[max(i - 3, 0) : i + 1]))
-			for i in range(min(len(keys), HEADING_ROWS))
-			if get_amount_columns(keys[max(i - 3, 0) : i + 1])
-		),
-		(None, None),
-	)
+	rows, keys = read_sheet(file_url)
+	heading = find_heading(keys, get_amount_columns, above=3)
+	amounts = balance_column = None
+	if heading is None:
+		# one balance column, its side in the amount: "25,00,000.00 Cr" or a minus
+		heading = find_heading(keys, lambda row: get_balance_column(row) is not None)
+		if heading is not None:
+			balance_column = get_balance_column(keys[heading])
+	else:
+		amounts = get_amount_columns(keys[max(heading - 3, 0) : heading + 1])
 	if heading is None:
 		frappe.throw(
 			_(
-				"The sheet needs an Account Name column and Debit and Credit columns (or Closing Debit and Closing Credit)."
-			)
+				"The sheet needs an Account Name column and Debit and Credit columns (or Closing Debit and Closing Credit), or one Closing Balance column with Dr and Cr."
+			),
+			title=_("Columns not found"),
 		)
-	debit_column, credit_column = amounts
+	debit_column, credit_column = amounts or (None, None)
 	# the name heading may sit rows above the amounts, like Tally's "Particulars"
 	name_column = next(
 		(row.index(key) for row in reversed(keys[: heading + 1]) for key in NAME_COLUMNS if key in row), 0
 	)
-	number_column = keys[heading].index("account_number") if "account_number" in keys[heading] else None
+	number_column = find_column(keys[heading], ("account_number",))
 	# a report may name each account's group in a column, as Busy does, instead of indenting
-	group_column = next((keys[heading].index(key) for key in GROUP_COLUMNS if key in keys[heading]), None)
+	group_column = find_column(keys[heading], GROUP_COLUMNS)
 
 	lines = []
 	for row in rows[heading + 1 :]:
 		name = cstr(get_cell(row.cells, name_column)).strip()
-		if not name or TOTAL_LINE.match(name):
+		if not name or is_total_row(row.cells, name_column):
 			continue
 		number = cstr(get_cell(row.cells, number_column)).strip()
+		if balance_column is None:
+			debit = get_amount(get_cell(row.cells, debit_column))
+			credit = get_amount(get_cell(row.cells, credit_column))
+		else:
+			balance = get_signed_amount(get_cell(row.cells, balance_column))
+			debit, credit = max(balance, 0), max(-balance, 0)
+		# QuickBooks names a sub-account "Parent:Child"
+		*sheet_parents, leaf = (part.strip() for part in name.split(":"))
+		if not leaf or not all(sheet_parents):
+			sheet_parents, leaf = [], name
 		lines.append(
 			frappe._dict(
-				account_name=name,
+				account_name=leaf,
 				account_number=number,
 				label=f"{number} - {name}" if number else name,
-				debit=get_amount(get_cell(row.cells, debit_column)),
-				credit=get_amount(get_cell(row.cells, credit_column)),
+				debit=debit,
+				credit=credit,
 				indent=get_cell(row.indents, name_column) or 0,
 				group=cstr(get_cell(row.cells, group_column)).strip(),
+				parent=sheet_parents[-1] if sheet_parents else None,
+				sheet_parents=sheet_parents,
 			)
 		)
 
@@ -164,7 +408,11 @@ def read_balance_sheet(file_url: str) -> list[frappe._dict]:
 	for line, after in zip(lines, [*lines[1:], None], strict=True):
 		while parents and parents[-1].indent >= line.indent:
 			parents.pop()
-		line.groups = [parent.account_name for parent in parents] + ([line.group] if line.group else [])
+		line.groups = (
+			[parent.account_name for parent in parents]
+			+ ([line.group] if line.group else [])
+			+ line.pop("sheet_parents")
+		)
 		# a line with lines indented under it is a group, and its amount only totals theirs
 		line.is_group = bool(after and after.indent > line.indent)
 		if line.is_group:
@@ -186,7 +434,11 @@ def read_report(file_url: str) -> list[frappe._dict]:
 			frappe._dict(cells=[cell.value for cell in row], indents=[get_indent(cell) for cell in row])
 			for row in sheet.iter_rows()
 		]
-	rows = read_csv_content(content) if extension == "csv" else read_xls_file_from_attached_file(content)
+	rows = (
+		read_csv_content(content, use_sniffer=True)
+		if extension == "csv"
+		else read_xls_file_from_attached_file(content)
+	)
 	return [frappe._dict(cells=row, indents=[get_indent(value) for value in row]) for row in rows]
 
 
@@ -202,14 +454,7 @@ def get_amount_columns(heading_rows: list[list[str]]) -> tuple[int, int] | None:
 	"""The debit and credit columns of the last heading row, the closing ones first: they are the
 	balances on the day. Any heading with debit or Dr in it counts, like Busy's "Dr. Amount (Rs.)",
 	and a label like "Closing Balance" in a row above counts for the columns under it."""
-	width = max(len(row) for row in heading_rows)
-	above = [set() for _ in range(width)]
-	for row in heading_rows:
-		label = ""
-		for index in range(width):
-			# a merged label is in its first cell only, and covers the empty ones after it
-			label = get_cell(row, index) or label
-			above[index] |= set(label.split("_"))
+	above = get_labels_above(heading_rows, max(len(row) for row in heading_rows))
 	found = {}
 	for index, key in enumerate(heading_rows[-1]):
 		words = set(key.split("_"))
@@ -230,18 +475,116 @@ def get_amount_columns(heading_rows: list[list[str]]) -> tuple[int, int] | None:
 
 def get_amount(value) -> float:
 	"""A number cell, or the number in a text cell past a currency like "Rs." or "$"; brackets or a
-	minus before it make it negative."""
+	minus before it make it negative. The decimal mark is the last of "." and ",", so "1.200,50" is
+	1200.5; a lone "," before three digits groups thousands, like "1,20,000"."""
 	if not isinstance(value, str):
 		return flt(value)
-	number = re.search(r"\d[\d,]*(\.\d+)?", value)
+	number = re.search(r"\d[\d.,]*", value)
 	if not number:
 		return 0
-	amount = flt(number.group().replace(",", ""))
+	text = number.group().rstrip(".,")
+	if "," in text and "." in text:
+		decimal = "," if text.rfind(",") > text.rfind(".") else "."
+	elif "," in text:
+		decimal = None if len(text.rsplit(",", 1)[1]) == 3 else ","
+	else:
+		decimal = None if text.count(".") > 1 else "."
+	other = "." if decimal == "," else ","
+	text = text.replace(other, "")
+	text = text.replace(",", ".") if decimal == "," else text.replace(".", "") if decimal is None else text
+	amount = flt(text)
 	return -amount if value.strip().startswith("(") or "-" in value[: number.start()] else amount
+
+
+def get_balance_column(keys: list[str]) -> int | None:
+	"""The one closing balance column of a heading row that names the accounts too."""
+	if not set(keys) & set(NAME_COLUMNS):
+		return None
+	return next(
+		(
+			index
+			for index, key in enumerate(keys)
+			if {"balance", "closing"} & set(key.split("_")) and "opening" not in key.split("_")
+		),
+		None,
+	)
+
+
+def get_signed_amount(value) -> float:
+	"""A balance as debit minus credit: "1,200.00 Cr" and -1200 are credits."""
+	amount = get_amount(value)
+	side = get_dr_cr(value)
+	if side:
+		return -abs(amount) if side == "cr" else abs(amount)
+	return amount
+
+
+def get_dr_cr(value) -> str | None:
+	"""The side a cell names, "dr" or "cr": a Dr/Cr cell, or an amount ending in one, like "30,000.00 Cr."."""
+	match = DR_CR.search(value.strip()) if isinstance(value, str) else None
+	return match.group(1).lower() if match else None
+
+
+def get_qty(value) -> tuple[float, str | None]:
+	"""A quantity cell and the unit written in it, like 2,450 and "Kg" from "2,450 Kg"."""
+	if not isinstance(value, str):
+		return flt(value), None
+	match = QTY_WITH_UNIT.match(value)
+	if not match:
+		return 0, None
+	return flt(match.group(1).replace(",", "")), (match.group(2) or "").strip() or None
+
+
+def read_sheet(file_url: str, get_key=None) -> tuple[list[frappe._dict], list[list[str]]]:
+	"""The rows of a sheet as read_report reads them, and the cells of each as column keys."""
+	rows = read_report(file_url)
+	get_key = get_key or get_column_key
+	return rows, [[get_key(value) for value in row.cells] for row in rows]
+
+
+def find_heading(keys: list[list[str]], is_heading, above: int = 0) -> int | None:
+	"""The first row among the title rows that is_heading takes for the headings. With above, it is
+	given the row with up to that many rows over it, for headings written across rows."""
+	return next(
+		(
+			i
+			for i in range(min(len(keys), HEADING_ROWS))
+			if is_heading(keys[max(i - above, 0) : i + 1] if above else keys[i])
+		),
+		None,
+	)
+
+
+def find_column(headers: list[str], names: tuple[str, ...]) -> int | None:
+	"""The column with the first of these names."""
+	return next((headers.index(name) for name in names if name in headers), None)
+
+
+def get_labels_above(heading_rows: list[list[str]], width: int) -> list[set[str]]:
+	"""The words over each column in these heading rows: a merged label is in its first cell only,
+	and covers the empty ones after it."""
+	above = [set() for _ in range(width)]
+	for row in heading_rows:
+		label = ""
+		for index in range(width):
+			label = get_cell(row, index) or label
+			above[index] |= set(label.split("_"))
+	return above
+
+
+def is_total_row(cells: list, column: int | None = None) -> bool:
+	"""A report's own line that adds up the others: any text cell, or the one in column, says so."""
+	values = cells if column is None else [get_cell(cells, column)]
+	return any(TOTAL_LINE.match(value.strip()) for value in values if isinstance(value, str))
 
 
 def get_column_key(value) -> str:
 	return re.sub(r"[^a-z0-9]+", "_", cstr(value).lower()).strip("_")
+
+
+def get_group_key(name) -> str:
+	"""A group's name as BUSY_GROUPS and PARTY_GROUPS keep it: "Duties & Taxes" is "duties taxes"."""
+	return get_column_key(name).replace("_", " ")
 
 
 def get_cell(cells: list, index: int | None):
@@ -251,8 +594,13 @@ def get_cell(cells: list, index: int | None):
 def get_party_group_type(names: list[str]) -> str | None:
 	"""Receivable, Payable or Stock when one of these names is the group other software keeps
 	customers, suppliers or stock under."""
-	keys = {get_column_key(name).replace("_", " ") for name in names}
+	keys = {get_group_key(name) for name in names}
 	return next((account_type for account_type, groups in PARTY_GROUPS.items() if keys & set(groups)), None)
+
+
+def download_sheet(file_name: str, rows: list[list], sheet_name: str):
+	"""Send these rows to the browser as an Excel file."""
+	provide_binary_file(file_name, "xlsx", make_xlsx(rows, sheet_name).getvalue())
 
 
 @frappe.whitelist()
@@ -277,9 +625,11 @@ def download_opening_balances(company: str):
 		debit, credit = drafts.get(account.name, (0, 0))
 		rows.append([account.account_number, account.account_name, debit or None, credit or None])
 
-	frappe.response["filename"] = f"{frappe.scrub(company)}_opening_balances.xlsx"
-	frappe.response["filecontent"] = make_xlsx(rows, "Opening Balances").getvalue()
-	frappe.response["type"] = "binary"
+	download_sheet(
+		f"{frappe.scrub(company)}_opening_balances",
+		rows,
+		"Opening Balances",
+	)
 
 
 def get_draft_balances(onboarding) -> dict[str, tuple[float, float]]:
@@ -292,7 +642,7 @@ def get_draft_balances(onboarding) -> dict[str, tuple[float, float]]:
 	return balances
 
 
-def get_balances(rows: list[dict]) -> list[frappe._dict]:
+def get_sheet_balances(rows: list[dict]) -> list[frappe._dict]:
 	"""The rows with an opening debit or credit. Only accounts without sub-accounts can have one."""
 	parents = {
 		(cstr(row.get("parent_account_number")).strip(), cstr(row.get("parent_account")).strip())
@@ -329,13 +679,15 @@ def download_chart_template(company: str, template: str):
 	if template == "Current Chart":
 		rows = [rows[0], *get_current_chart_rows(onboarding)]
 
-	frappe.response["filename"] = (
-		f"{frappe.scrub(company)}_chart_of_accounts.xlsx"
-		if template == "Current Chart"
-		else "sample_chart_of_accounts.xlsx"
+	download_sheet(
+		(
+			f"{frappe.scrub(company)}_chart_of_accounts"
+			if template == "Current Chart"
+			else "sample_chart_of_accounts"
+		),
+		rows,
+		"Chart of Accounts",
 	)
-	frappe.response["filecontent"] = make_xlsx(rows, "Chart of Accounts").getvalue()
-	frappe.response["type"] = "binary"
 
 
 def get_sample_rows(company: str) -> list[list]:
@@ -383,3 +735,38 @@ def get_current_chart_rows(onboarding) -> list[list]:
 			]
 		)
 	return rows
+
+
+def strip_title_rows(doctype: str, file_url: str) -> str:
+	"""The sheet as Data Import reads it, as a new file: without the title rows other software puts
+	above its headings (the first row of more than one cell is the headings), its Total lines, and with
+	a heading naming the doctype, like QuickBooks' "Customer", read as its name field. The same file
+	when there is nothing to change."""
+	rows = [list(row.cells) for row in read_report(file_url)]
+	start = find_heading(rows, lambda row: sum(1 for value in row if cstr(value).strip()) > 1) or 0
+	heading = rows[start] if rows else []
+	title_field = frappe.get_meta(doctype).get_title_field()
+	names = {get_column_key(doctype), "vendor" if doctype == "Supplier" else None} - {None}
+	renamed = [
+		frappe.get_meta(doctype).get_label(title_field)
+		if isinstance(value, str) and get_column_key(value) in names and title_field != "name"
+		else value
+		for value in heading
+	]
+	body = [row for row in rows[start + 1 :] if not is_total_row(row)]
+	if not start and renamed == heading and len(body) == len(rows) - 1:
+		return file_url
+	rows = [renamed, *body]
+	content = make_xlsx(rows, _("Sheet1")).getvalue()
+	return (
+		frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"{frappe.scrub(doctype)}_import.xlsx",
+				"content": content,
+				"is_private": 1,
+			}
+		)
+		.insert()
+		.file_url
+	)

@@ -11,30 +11,61 @@ It becomes an opening journal entry marked as an advance, to be set against a la
 
 import re
 import unicodedata
+from contextlib import contextmanager
+from datetime import date
 from difflib import get_close_matches
 
 import frappe
 from frappe import _
 from frappe.core.doctype.data_import.exporter import Exporter
 from frappe.model import table_fields
-from frappe.utils import add_days, add_years, cstr, flt, get_user_date_format, getdate, strip_html
-from frappe.utils.xlsxutils import build_xlsx_response, make_xlsx
+from frappe.utils import (
+	add_days,
+	add_years,
+	cstr,
+	flt,
+	fmt_money,
+	formatdate,
+	get_user_date_format,
+	getdate,
+	strip_html,
+)
+from frappe.utils.xlsxutils import build_xlsx_response
 
-from erpnext.accounts.party import get_party_account
+from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
+	get_checks_for_pl_and_bs_accounts,
+	get_dimensions,
+)
+from erpnext.accounts.party import get_due_date, get_party_account
 from erpnext.accounts.utils import get_fiscal_year
 from erpnext.setup.doctype.company_setup.chart_sheet import (
-	HEADING_ROWS,
-	TOTAL_LINE,
+	download_sheet,
+	find_column,
+	find_heading,
 	get_amount,
 	get_cell,
-	get_column_key,
-	read_report,
+	get_dr_cr,
+	get_signed_amount,
+	is_total_row,
+	read_sheet,
 )
+from erpnext.setup.setup_wizard.operations.install_fixtures import get_fy_details
 
 TABLES = {"Customer": "opening_sales_invoices", "Supplier": "opening_purchase_invoices"}
 # the posted rows undone one by one, kept to download and upload again
 UNDONE_TABLES = {"Customer": "undone_sales_invoices", "Supplier": "undone_purchase_invoices"}
 INVOICE_TYPES = {"Customer": "Sales", "Supplier": "Purchase"}
+# what a row keeps when it is undone, or made again from an undone one
+INVOICE_ROW_FIELDS = (
+	"party_type",
+	"party",
+	"party_name",
+	"invoice_number",
+	"invoice_date",
+	"due_date",
+	"outstanding_amount",
+	"source",
+)
 PARTY_NAME_FIELDS = {"Customer": "customer_name", "Supplier": "supplier_name"}
 PARTY_ACCOUNT_FIELDS = {"Customer": "debit_to", "Supplier": "credit_to"}
 INVOICE_ACCOUNT_TYPES = {"Customer": ("Receivable", "Asset"), "Supplier": ("Payable", "Liability")}
@@ -71,12 +102,14 @@ COLUMN_NAMES = {
 		"invoice",
 		"bill_no",
 		"bill_number",
+		"bill",
+		"inv_no",
 		"voucher_no",
 		"ref_no",
 		"num",
 	),
-	"invoice_date": ("invoice_date", "date", "bill_date", "voucher_date"),
-	"due_date": ("due_date", "due_on"),
+	"invoice_date": ("invoice_date", "date", "bill_date", "voucher_date", "inv_date", "bill_dt", "inv_dt"),
+	"due_date": ("due_date", "due_on", "due_dt"),
 	"outstanding_amount": (
 		"outstanding",
 		"outstanding_amount",
@@ -106,6 +139,7 @@ COLUMN_WORDS_EXCLUDED = {
 	"outstanding_amount": {"bill", "fc", "foreign", "rate"},
 }
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+# "30,000.00 Cr" or "30,000.00 Dr." after an amount
 # only Latin accents: marks in other scripts, like Hindi vowel signs, change the name
 ACCENTS = re.compile("[\u0300-\u036f]")
 # how alike two names must be to look like one spelt two ways
@@ -118,11 +152,16 @@ LEGAL_WORDS = re.compile(r"\b(private|pvt|limited|ltd|llp|inc)\b")
 BACKGROUND_FROM = 50
 # how often, in rows, a background posting tells the form how far it is
 PROGRESS_EVERY = 10
+# how often, in rows, a background posting saves what it posted (each invoice is posted on its own)
+COMMIT_EVERY = 100
 
 
 def get_table(party_type: str) -> str:
 	if party_type not in TABLES:
-		frappe.throw(_("Opening invoices are for customers or suppliers, not {0}.").format(party_type))
+		frappe.throw(
+			_("Opening invoices are for customers or suppliers, not {0}.").format(party_type),
+			title=_("Not a customer or supplier"),
+		)
 	return TABLES[party_type]
 
 
@@ -131,7 +170,8 @@ def get_parties(party_type: str) -> frappe._dict:
 	matches, and the disabled IDs."""
 	name_field = PARTY_NAME_FIELDS[party_type]
 	parties = frappe._dict(names={}, exact={}, similar={}, disabled=set())
-	for party in frappe.get_all(party_type, fields=["name", name_field, "disabled"]):
+	# only those the user may see: a name matched or suggested is one they can open
+	for party in frappe.get_list(party_type, fields=["name", name_field, "disabled"], limit=0):
 		parties.names[party.name] = party.get(name_field) or party.name
 		for name in {party.name, party.get(name_field)}:
 			if name:
@@ -154,6 +194,34 @@ def get_similar_key(name: str) -> str:
 	return INITIALS.sub(r"\1", LEADING_MS.sub("", key))
 
 
+def normalize_account_name(name: str) -> str:
+	"""A name as people mean it: case, punctuation and "&" set aside, and a trailing "A/c" or
+	"Account" dropped, so "Furniture & Fixtures A/c" is "furniture and fixtures"."""
+	words = re.sub(r"[^a-z0-9 ]", " ", cstr(name).lower().replace("&", " and ")).split()
+	if words[-2:] == ["a", "c"]:
+		words = words[:-2]
+	elif words[-1:] in (["ac"], ["account"]):
+		words = words[:-1]
+	return " ".join(words)
+
+
+def get_singular_key(name: str) -> str:
+	"""A name as normalize_account_name has it, each word in the singular: "Plants and Machineries" is
+	"plant and machinery"."""
+	return " ".join(stem(word) for word in normalize_account_name(name).split())
+
+
+def stem(word: str) -> str:
+	"""A word in the singular: "salaries" is "salary", "taxes" is "tax"."""
+	if len(word) > 4 and word.endswith("ies"):
+		return word[:-3] + "y"
+	if len(word) > 4 and word.endswith(("ses", "xes", "ches", "shes")):
+		return word[:-2]
+	if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+		return word[:-1]
+	return word
+
+
 def find_party(parties: frappe._dict, name: str) -> str | None:
 	"""The one customer or supplier a name means: the same name ignoring case and spaces, else also
 	ignoring accents, punctuation and words like Pvt Ltd. None when none or more than one match."""
@@ -166,11 +234,13 @@ def find_party(parties: frappe._dict, name: str) -> str | None:
 
 def get_posted_names(onboarding, party_type: str) -> dict[str, str]:
 	"""The customer or supplier each name on an earlier sheet went to, by its name key, so the next
-	office's sheet links the same spelling without asking again."""
+	office's sheet, or the same one after an undo, links the same spelling without asking again."""
+	undone = onboarding.get(UNDONE_TABLES[party_type])
+	posted = [row for row in onboarding.get(get_table(party_type)) if row.status == "Created"]
 	return {
 		get_similar_key(row.party_name): row.party
-		for row in onboarding.get(get_table(party_type))
-		if row.status == "Created" and row.party and row.party_name
+		for row in [*undone, *posted]
+		if row.party and row.party_name
 	}
 
 
@@ -246,19 +316,26 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 	were not used. Reports from other software are read as exported: headings under title rows,
 	totals and subtotals anywhere, an amount split into Dr and Cr columns (Tally), and bills grouped
 	under a line naming their customer or supplier (QuickBooks, Busy)."""
-	rows = [row.cells for row in read_report(file_url)]
-	keys = [[get_column_key(value) for value in row] for row in rows]
-	start = next((i for i, row in enumerate(keys[:HEADING_ROWS]) if is_heading_row(row)), None)
+	report, keys = read_sheet(file_url)
+	rows = [row.cells for row in report]
+	start = find_heading(keys, is_heading_row)
 	sheet = get_sheet_columns(
 		keys[start] if start is not None else [],
 		keys[start + 1] if start is not None and start + 1 < len(keys) else [],
 	)
 	if sheet.columns["party_name"] is None:
-		frappe.throw(_("The sheet needs a Name column and an Outstanding column."))
+		frappe.throw(
+			_("The sheet needs a Name column and an Outstanding column."), title=_("Columns not found")
+		)
 
 	invoices, advances, party = [], 0, None
-	for row in rows[start + 1 + sheet.sub_heading :]:
-		if any(TOTAL_LINE.match(value.strip()) for value in row if isinstance(value, str)):
+	body = rows[start + 1 + sheet.sub_heading :]
+	day_first = {
+		field: get_day_first(get_cell(row, sheet.columns[field]) for row in body)
+		for field in ("invoice_date", "due_date")
+	}
+	for row in body:
+		if is_total_row(row):
 			party = None
 			continue
 		name = cstr(get_cell(row, sheet.columns["party_name"])).strip()
@@ -281,8 +358,10 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 				"party_name": name,
 				# Tally's mark for an amount set against no bill
 				"invoice_number": None if invoice_number.lower() in ("", "on account") else invoice_number,
-				"invoice_date": get_sheet_date(get_cell(row, sheet.columns["invoice_date"])),
-				"due_date": get_sheet_date(get_cell(row, sheet.columns["due_date"])),
+				"invoice_date": get_sheet_date(
+					get_cell(row, sheet.columns["invoice_date"]), day_first["invoice_date"]
+				),
+				"due_date": get_sheet_date(get_cell(row, sheet.columns["due_date"]), day_first["due_date"]),
 				"outstanding_amount": amount,
 				"ledger": cstr(get_cell(row, sheet.columns["ledger"])).strip(),
 			}
@@ -292,18 +371,21 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 		for index, label in enumerate(rows[start])
 		if index not in sheet.used and cstr(label).strip()
 	]
-	return frappe._dict(invoices=invoices, advances=advances, unused_columns=unused)
+	titles = [
+		value for row in rows[: start or 0] for value in row if isinstance(value, str) and value.strip()
+	]
+	return frappe._dict(invoices=invoices, advances=advances, unused_columns=unused, titles=titles)
 
 
 def is_heading_row(keys: list[str]) -> bool:
 	"""A row of column headings with an amount among them, not a title like "Debtors outstanding"."""
-	return sum(1 for key in keys if key) > 1 and find_column(keys, "outstanding_amount") is not None
+	return sum(1 for key in keys if key) > 1 and find_invoice_column(keys, "outstanding_amount") is not None
 
 
 def get_sheet_columns(headers: list[str], below: list[str]) -> frappe._dict:
 	"""Which column holds what in a receivables or payables report, from its heading row and the
 	row under it."""
-	columns = {field: find_column(headers, field) for field in COLUMN_NAMES}
+	columns = {field: find_invoice_column(headers, field) for field in COLUMN_NAMES}
 	sheet = frappe._dict(columns=columns, grouped=False, party_and_bill=False, credit=None, sub_heading=0)
 	# Busy's bill-wise report: "Party / Bill No.", a party's line, then its bills
 	mixed = next((i for i, key in enumerate(headers) if {"party", "bill"} <= set(key.split("_"))), None)
@@ -324,12 +406,12 @@ def get_sheet_columns(headers: list[str], below: list[str]) -> frappe._dict:
 	return sheet
 
 
-def find_column(headers: list[str], field: str) -> int | None:
+def find_invoice_column(headers: list[str], field: str) -> int | None:
 	"""The column of a field: by one of its usual headings, else by the words in a heading, like
 	"Outstanding (INR)" or "Their Bill No"."""
-	for name in COLUMN_NAMES[field]:
-		if name in headers:
-			return headers.index(name)
+	column = find_column(headers, COLUMN_NAMES[field])
+	if column is not None:
+		return column
 	for words in COLUMN_WORDS.get(field, ()):
 		for index, key in enumerate(headers):
 			found = set(key.split("_"))
@@ -352,27 +434,51 @@ def get_row_amount(row: list, sheet: frappe._dict, party_type: str) -> float:
 def get_sheet_amount(value, party_type: str, side=None) -> float:
 	"""An amount cell; text like Tally's "30,000.00 Cr", or a Dr/Cr column beside it, is an advance
 	when it is on the other side from what the customer owes us, or we owe the supplier."""
-	text = cstr(value).strip()
-	side = cstr(side).strip().lower() or text[-2:].lower()
-	if side in ("dr", "cr") and text[-2:].lower() == side:
-		text = text[:-2]
-	amount = get_amount(text if isinstance(value, str) else value)
-	if side not in ("dr", "cr"):
-		return amount
 	usual = "dr" if party_type == "Customer" else "cr"
-	return amount if side == usual else -amount
+	side = get_dr_cr(side)
+	if side:
+		amount = get_amount(value)
+		return amount if side == usual else -amount
+	if get_dr_cr(value):
+		# debit minus credit, as a trial balance reads it: a supplier's usual side is the credit
+		signed = get_signed_amount(value)
+		return signed if usual == "dr" else -signed
+	return get_amount(value)
 
 
-def get_sheet_date(value) -> str | None:
-	"""A date cell, or text in the yyyy-mm-dd form or in the order the site writes dates."""
+def get_sheet_date(value, day_first: bool | None = None) -> str | None:
+	"""A date cell, or text in the yyyy-mm-dd form or with the day first or not: as day_first says, the
+	way the whole column writes dates (get_day_first), else as the site writes them."""
 	if not value:
 		return None
 	text = cstr(value).strip()
-	day_first = not ISO_DATE.match(text) and get_user_date_format().startswith("dd")
+	if day_first is None:
+		day_first = get_user_date_format().startswith("dd")
+	day_first = day_first and not ISO_DATE.match(text)
 	try:
 		return str(getdate(text if isinstance(value, str) else value, parse_day_first=day_first))
 	except Exception:
 		return None
+
+
+def get_day_first(values) -> bool | None:
+	"""Whether a column's text dates put the day first, from a value that can only be read one way,
+	like 25/03/2026 (day first) or 03/25/2026 (month first). None when every value fits both: the
+	site's format decides then."""
+	for value in values:
+		parts = (
+			re.match(r"^\s*(\d{1,2})[/.-](\d{1,2})[/.-]\d{2,4}\s*$", value)
+			if isinstance(value, str)
+			else None
+		)
+		if not parts:
+			continue
+		first, second = int(parts.group(1)), int(parts.group(2))
+		if first > 12 >= second:
+			return True
+		if second > 12 >= first:
+			return False
+	return None
 
 
 @frappe.whitelist()
@@ -396,11 +502,11 @@ def download_opening_invoices(company: str, party_type: str, undone_from: str | 
 						row.account,
 					]
 				)
-		frappe.response[
-			"filename"
-		] = f"{frappe.scrub(company)}_undone_{frappe.scrub(party_type)}_invoices.xlsx"
-		frappe.response["filecontent"] = make_xlsx(rows, _("Opening Invoices")).getvalue()
-		frappe.response["type"] = "binary"
+		download_sheet(
+			f"{frappe.scrub(company)}_undone_{frappe.scrub(party_type)}_invoices",
+			rows,
+			_("Opening Invoices"),
+		)
 		return
 	rows = [list(SHEET_COLUMNS)]
 	for row in onboarding.get(table):
@@ -409,44 +515,26 @@ def download_opening_invoices(company: str, party_type: str, undone_from: str | 
 				[row.party_name, row.invoice_number, row.invoice_date, row.due_date, row.outstanding_amount]
 			)
 
-	frappe.response["filename"] = f"{frappe.scrub(company)}_opening_{frappe.scrub(party_type)}_invoices.xlsx"
-	frappe.response["filecontent"] = make_xlsx(rows, _("Opening Invoices")).getvalue()
-	frappe.response["type"] = "binary"
-
-
-def create_invoices(company: str, party_type: str, keep_old_dates: bool = False):
-	"""Post every draft row as an opening invoice, one posting at a time."""
-	# a second posting waits here, then finds the rows posted
-	frappe.db.get_value("Company Setup", company, "name", for_update=True)
-	post_invoices(frappe.get_doc("Company Setup", company), party_type, keep_old_dates)
-
-
-def create_invoices_in_background(company: str, party_type: str, keep_old_dates: bool = False):
-	"""create_invoices as a background job, telling the open form when done or why not."""
-	event = {"company": company, "party_type": party_type}
-	try:
-		create_invoices(company, party_type, keep_old_dates)
-	except Exception as e:
-		frappe.db.rollback()
-		# shown by the form, which may be waiting for a background job
-		frappe.publish_realtime(
-			"company_setup_invoices",
-			{**event, "error": strip_html(cstr(e)) or e.__class__.__name__},
-			doctype="Company Setup",
-			docname=company,
-		)
-		raise
-	frappe.publish_realtime(
-		"company_setup_invoices", event, doctype="Company Setup", docname=company, after_commit=True
+	download_sheet(
+		f"{frappe.scrub(company)}_opening_{frappe.scrub(party_type)}_invoices",
+		rows,
+		_("Opening Invoices"),
 	)
 
 
-def post_invoices(onboarding, party_type: str, keep_old_dates: bool = False):
+def post_invoices(
+	onboarding,
+	party_type: str,
+	keep_old_dates: bool = False,
+	progress: bool = False,
+	disabled_parties: list[str] | None = None,
+):
 	"""Each draft row whose customer or supplier exists and is enabled becomes an opening invoice in
-	its own savepoint, so a failed row is undone alone and noted on the row. The names confirmed as new
-	are added first."""
+	its own savepoint, so a failed row is undone alone and noted on the row. A disabled or
+	other-currency one stays a draft, but for the disabled ones named in disabled_parties: they are
+	enabled for the posting and disabled again after it. The names confirmed as new are added first."""
 	company = onboarding.company
-	day_before = add_days(onboarding.migration_date, -1)
+	day_before = get_day_before(onboarding)
 	ensure_fiscal_year(day_before, company)
 	if keep_old_dates:
 		# the years the old invoices fall in, added once and outside the rows' savepoints, so each one
@@ -466,98 +554,117 @@ def post_invoices(onboarding, party_type: str, keep_old_dates: bool = False):
 	if not_added is not None:
 		parties = get_parties(party_type)
 	not_added = not_added or {}
+	enabled = sorted(set(disabled_parties or []) & parties.disabled)
+	with parties_enabled(party_type, enabled):
+		parties.disabled -= set(enabled)
 
-	tool = frappe.new_doc("Opening Invoice Creation Tool")
-	tool.company = company
-	tool.invoice_type = INVOICE_TYPES[party_type]
-	drafts = [row for row in onboarding.get(get_table(party_type)) if row.status != "Created"]
-	for done, row in enumerate(drafts):
-		# the open form shows how far the posting is
-		if not done % PROGRESS_EVERY:
-			frappe.publish_realtime(
-				"company_setup_invoices_progress",
-				{"company": company, "party_type": party_type, "done": done, "total": len(drafts)},
-				doctype="Company Setup",
-				docname=company,
-			)
-		row.party = row.party if row.party in parties.names else find_party(parties, row.party_name)
-		if not row.party:
-			error = (
-				_("{0} could not be added: {1}").format(row.party_name, not_added[row.party_name])
-				if row.party_name in not_added
-				else _("{0} is not in ERPNext yet.").format(row.party_name)
-			)
-			row.update({"status": "Failed", "error": error})
-			continue
-		if row.party in parties.disabled:
-			row.update(
-				{"status": "Failed", "error": _("{0} is disabled. Enable it first.").format(row.party)}
-			)
-			continue
-		account = row.account or get_party_account(party_type, row.party, company)
-		party_currency = frappe.get_cached_value("Account", account, "account_currency")
-		if party_currency != currency:
-			row.update(
-				{
-					"status": "Failed",
-					"error": _(
-						"{0}'s account is in {1}. Opening invoices in another currency can't be posted here yet."
-					).format(row.party, party_currency),
-				}
-			)
-			continue
-		# dated as in the old books when the books have that year, so ageing stays right
-		posting_date = row.invoice_date if has_fiscal_year(row.invoice_date, company) else day_before
-		savepoint = f"opening_invoice_{row.idx}"
-		frappe.db.savepoint(savepoint)
-		try:
-			if account != get_party_account(party_type, row.party, company):
-				keep_party_account(company, party_type, row.party, account)
-			if flt(row.outstanding_amount) < 0:
-				voucher = post_advance(company, party_type, row.party, row, posting_date, temporary)
-				row.update({"status": "Created", "invoice": voucher, "error": None})
+		tool = frappe.new_doc("Opening Invoice Creation Tool")
+		tool.company = company
+		tool.invoice_type = INVOICE_TYPES[party_type]
+		dimensions = get_default_dimensions(company)
+		hand_posted = {row.name for row in get_hand_posted(onboarding, party_type)}
+		# whether ERPNext has the year of each invoice date, looked up once per date
+		has_year = {}
+		drafts = [
+			row
+			for row in onboarding.get(get_table(party_type))
+			if row.status != "Created" and row.name not in hand_posted
+		]
+		for done, row in enumerate(drafts):
+			# the open form shows how far a background posting is
+			# a background posting keeps what it posted so far: a job stopped later loses only the rest
+			if progress and done and not done % COMMIT_EVERY and not frappe.in_test:
+				onboarding.flags.posting = True
+				onboarding.save()
+				frappe.db.commit()
+			if progress and not done % PROGRESS_EVERY:
+				frappe.publish_realtime(
+					"company_setup_invoices_progress",
+					{"company": company, "party_type": party_type, "done": done, "total": len(drafts)},
+					doctype="Company Setup",
+					docname=company,
+				)
+			row.party = row.party if row.party in parties.names else find_party(parties, row.party_name)
+			if not row.party:
+				error = (
+					_("{0} could not be added: {1}").format(row.party_name, not_added[row.party_name])
+					if row.party_name in not_added
+					else _("{0} is not in ERPNext yet.").format(row.party_name)
+				)
+				row.update({"status": "Failed", "error": error})
 				continue
-			tool.set(
-				"invoices",
-				[
-					{
-						"party": row.party,
-						"party_name": row.party_name,
-						"posting_date": posting_date,
-						"due_date": max(getdate(row.due_date or posting_date), getdate(posting_date)),
-						"outstanding_amount": row.outstanding_amount,
-						"invoice_number": row.invoice_number,
-						"supplier_invoice_date": row.invoice_date if party_type == "Supplier" else None,
-						"temporary_opening_account": temporary,
-					}
-				],
-			)
-			invoice = tool.get_invoices()[0]
-			invoice[PARTY_ACCOUNT_FIELDS[party_type]] = account
-			# the amounts are in the company's currency, whatever the party usually uses
-			invoice.currency = currency
-			if party_type == "Supplier":
-				# a supplier's invoice number is theirs, not a name for our purchase invoice
-				invoice.bill_no = invoice.pop("invoice_number", None)
-			doc = frappe.get_doc(invoice)
-			doc.flags.ignore_mandatory = True
-			doc.flags.dont_auto_add_taxes = True
-			number = invoice.get("invoice_number")
-			if number and frappe.db.get_value(doc.doctype, number, "company") not in (None, company):
-				# another company's invoice on this site has the number: told apart by this one's abbreviation
-				number = f"{number}-{frappe.get_cached_value('Company', company, 'abbr')}"
-			if number and frappe.db.get_value(doc.doctype, number, "docstatus") == 2:
-				# posted again after a cancel: ERPNext's amended name, like "INV-1-1"
-				doc.amended_from = number
-				doc.insert()
-			else:
-				doc.insert(set_name=number)
-			doc.submit()
-			row.update({"status": "Created", "invoice": doc.name, "error": None})
-		except Exception as e:
-			frappe.db.rollback(save_point=savepoint)
-			frappe.clear_messages()
-			row.update({"status": "Failed", "error": strip_html(cstr(e)) or e.__class__.__name__})
+			account = row.account or get_party_account(party_type, row.party, company)
+			if (
+				row.party in parties.disabled
+				or get_party_currency(party_type, row.party, company, account) != currency
+			):
+				row.update({"status": "Draft", "error": None})
+				continue
+			# dated as in the old books when the books have that year, so ageing stays right
+			if row.invoice_date not in has_year:
+				has_year[row.invoice_date] = has_fiscal_year(row.invoice_date, company)
+			posting_date = row.invoice_date if has_year[row.invoice_date] else day_before
+			savepoint = f"opening_invoice_{row.idx}"
+			frappe.db.savepoint(savepoint)
+			try:
+				if flt(row.outstanding_amount) < 0:
+					voucher = post_advance(
+						company, party_type, row.party, row, posting_date, temporary, dimensions
+					)
+					row.update({"status": "Created", "invoice": voucher, "error": None})
+					continue
+				tool.set(
+					"invoices",
+					[
+						{
+							"party": row.party,
+							"party_name": row.party_name,
+							"posting_date": posting_date,
+							# without one on the sheet, from the party's payment terms, as on a new invoice
+							"due_date": max(
+								getdate(
+									row.due_date
+									or get_due_date(
+										posting_date, party_type, row.party, company, row.invoice_date
+									)
+								),
+								getdate(posting_date),
+							),
+							"outstanding_amount": row.outstanding_amount,
+							"invoice_number": row.invoice_number,
+							"supplier_invoice_date": row.invoice_date if party_type == "Supplier" else None,
+							"temporary_opening_account": temporary,
+							**dimensions,
+						}
+					],
+				)
+				invoice = tool.get_invoices()[0]
+				invoice[PARTY_ACCOUNT_FIELDS[party_type]] = account
+				# the amounts are in the company's currency, whatever the party usually uses
+				invoice.currency = currency
+				if party_type == "Supplier":
+					# a supplier's invoice number is theirs, not a name for our purchase invoice
+					invoice.bill_no = invoice.pop("invoice_number", None)
+				doc = frappe.get_doc(invoice)
+				doc.flags.ignore_mandatory = True
+				doc.flags.dont_auto_add_taxes = True
+				number = invoice.get("invoice_number")
+				if number and frappe.db.get_value(doc.doctype, number, "company") not in (None, company):
+					# another company's invoice on this site has the number: told apart by this one's abbreviation
+					number = f"{number}-{frappe.get_cached_value('Company', company, 'abbr')}"
+				if number and frappe.db.get_value(doc.doctype, number, "docstatus") == 2:
+					# posted again beside a cancelled one kept: amends the last of them, named like
+					# "INV-1-1" whatever the site's amend naming, so the number stays
+					doc.amended_from = get_last_amendment(doc.doctype, number)
+					doc.insert(set_name=get_amended_name(doc.doctype, number))
+				else:
+					doc.insert(set_name=number)
+				doc.submit()
+				row.update({"status": "Created", "invoice": doc.name, "error": None})
+			except Exception as e:
+				frappe.db.rollback(save_point=savepoint)
+				frappe.clear_messages()
+				row.update({"status": "Failed", "error": get_error_text(e)})
 
 	# an undone invoice posted again leaves the undone ones
 	posted = {
@@ -586,23 +693,32 @@ def get_sheet_match(onboarding, party_type: str) -> dict | None:
 		return None
 	# the sheet keeps the ledger's side: a supplier's balance is a credit
 	sign = 1 if party_type == "Customer" else -1
-	default = frappe.get_cached_value(
-		"Company",
-		onboarding.company,
-		"default_receivable_account" if party_type == "Customer" else "default_payable_account",
-	)
-	rows = onboarding.get(get_table(party_type))
-	posted_accounts = get_posted_accounts(party_type, rows)
-	party_accounts = get_party_accounts(party_type, [row.party for row in rows], onboarding.company)[0]
+	default = get_party_account(party_type, None, onboarding.company)
+	# a draft an invoice made by hand stands for counts once, as that invoice
+	hand = get_hand_posted(onboarding, party_type)
+	hand_posted = {row.name for row in hand}
+	rows = [row for row in onboarding.get(get_table(party_type)) if row.name not in hand_posted]
+	accounts = get_row_accounts(onboarding, party_type, rows)
 	entered = {}
 	for row in rows:
-		account = posted_accounts.get(row.invoice) or row.account or party_accounts.get(row.party) or default
+		account = accounts[row.name]
 		line = entered.setdefault(account, {"amount": 0, "count": 0, "draft": 0})
 		line["amount"] += flt(row.outstanding_amount)
 		line["count"] += 1
 		if row.status != "Created":
 			line["draft"] += flt(row.outstanding_amount)
-	# a line no account stands for, like customers listed by name, can only be matched in total
+	outside = get_outside_invoices(onboarding, party_type)
+	for invoice in outside:
+		line = entered.setdefault(invoice.account, {"amount": 0, "count": 0, "draft": 0})
+		line["amount"] += flt(invoice.amount)
+		line["count"] += 1
+	# a line no account stands for, like Busy's Sundry Debtors beside its sub-groups, is the only other
+	# ledger's, else the default ledger's when that has no line; else it can only match in total
+	if "" in sheet and len(sheet) > 1:
+		others = [a for a in get_invoice_accounts(onboarding.company, party_type) if a not in sheet]
+		line = others[0] if len(others) == 1 else default if default not in sheet else None
+		if line:
+			sheet = {(line if account == "" else account): amount for account, amount in sheet.items()}
 	by_account = "" not in sheet
 	accounts = sorted(set(sheet) | set(entered)) if by_account else [None]
 	return {
@@ -621,7 +737,136 @@ def get_sheet_match(onboarding, party_type: str) -> dict | None:
 		]
 		if by_account
 		else [],
+		"outside": {"count": len(outside), "amount": sum(flt(invoice.amount) for invoice in outside)},
+		"hand_posted": {"count": len(hand), "amount": sum(flt(row.outstanding_amount) for row in hand)},
 	}
+
+
+def get_hand_posted(onboarding, party_type: str) -> list:
+	"""The draft rows an opening invoice made by hand stands for: same customer or supplier, and its
+	number, or else its amount in the company's currency when only one invoice of theirs has it."""
+	drafts = [row for row in onboarding.get(get_table(party_type)) if row.status != "Created" and row.party]
+	if not drafts:
+		return []
+	parties = {row.party for row in drafts}
+	outside = [doc for doc in get_outside_invoices(onboarding, party_type) if doc.party in parties]
+	matched, used = [], set()
+	for row in drafts:
+		theirs = [doc for doc in outside if doc.party == row.party and doc.name not in used]
+		number = cstr(row.invoice_number).strip()
+		found = [doc for doc in theirs if number and number in (doc.name, doc.get("bill_no"))]
+		if not found:
+			found = [doc for doc in theirs if abs(flt(doc.amount) - flt(row.outstanding_amount)) < 1]
+		if len(found) == 1:
+			used.add(found[0].name)
+			row.hand_invoice = found[0].name
+			matched.append(row)
+	return matched
+
+
+def get_cached(onboarding, key: str, method):
+	"""What method gives for the onboarding as last saved or loaded: the steps, onload and checks ask
+	for it several times in one request."""
+	stored = onboarding.flags.get(key)
+	if not stored or stored[0] != onboarding.modified:
+		stored = onboarding.flags[key] = (onboarding.modified, method(onboarding))
+	return stored[1]
+
+
+def get_outside_invoices(onboarding, party_type: str) -> list[frappe._dict]:
+	"""The opening invoices made outside Company Setup, by hand or Data Import, with their party,
+	account and amount in the company's currency, whatever currency they were billed in. Read once
+	per save of the setup: the form asks several times on each open."""
+	party = "customer" if party_type == "Customer" else "supplier"
+	invoices = get_cached(
+		onboarding,
+		f"outside_invoices_{party_type}",
+		lambda onboarding: frappe.get_all(
+			"Sales Invoice" if party_type == "Customer" else "Purchase Invoice",
+			filters={"company": onboarding.company, "is_opening": "Yes", "docstatus": 1},
+			fields=[
+				"name",
+				f"{party} as party",
+				f"{PARTY_ACCOUNT_FIELDS[party_type]} as account",
+				"base_grand_total as amount",
+				*(["bill_no"] if party_type == "Supplier" else []),
+			],
+		),
+	)
+	own = {row.invoice for row in onboarding.get(get_table(party_type)) if row.invoice}
+	return [invoice for invoice in invoices if invoice.name not in own]
+
+
+def get_ledger_overs(onboarding, party_type: str) -> list[dict]:
+	"""The receivable or payable ledgers the drafts would put above their trial balance line while
+	another ledger is short of its own: money going to the wrong ledger. Empty when the trial balance
+	doesn't say by ledger, or none is short."""
+	match = get_sheet_match(onboarding, party_type)
+	if not match or not match["by_account"]:
+		return []
+	lines = match["lines"]
+	short = [line for line in lines if line["sheet"] is not None and line["sheet"] - line["entered"] >= 1]
+	if not short:
+		return []
+	return [
+		{
+			"account": line["account"],
+			"account_name": get_account_name(line["account"]),
+			"sheet": flt(line["sheet"]),
+			"entered": flt(line["entered"], 2),
+			"over": flt(line["entered"] - flt(line["sheet"]), 2),
+			"short": [
+				{
+					"account": other["account"],
+					"account_name": get_account_name(other["account"]),
+					"short": flt(other["sheet"] - other["entered"], 2),
+				}
+				for other in short
+			],
+		}
+		for line in lines
+		if abs(flt(line["draft"])) >= 0.005 and line["entered"] - flt(line["sheet"]) >= 1
+	]
+
+
+def get_ledger_over_message(over: dict, currency: str) -> str:
+	short = over["short"][0]
+	return _(
+		"These rows would put {0} on {1}, {2} more than its trial balance line, while {3} is {4} short. Pick the ledger this sheet is for in Post to, or fix the rows."
+	).format(
+		fmt_money(over["entered"], currency=currency),
+		over["account_name"],
+		fmt_money(over["over"], currency=currency),
+		short["account_name"],
+		fmt_money(short["short"], currency=currency),
+	)
+
+
+def get_account_name(account: str) -> str:
+	return frappe.get_cached_value("Account", account, "account_name") or account
+
+
+def get_title_account(company: str, party_type: str, titles: list[str]) -> str | None:
+	"""The receivable or payable ledger a report's title rows name, like Tally's "Ledger: Debtors -
+	Retainers", when the company has several and one name is found whole: the longest, when only one
+	is that long."""
+	accounts = get_invoice_accounts(company, party_type)
+	if len(accounts) < 2 or not titles:
+		return None
+	keys = [f" {get_similar_key(title)} " for title in titles]
+	found = sorted(
+		(
+			(len(key), account.name)
+			for account in frappe.get_all(
+				"Account", filters={"name": ("in", accounts)}, fields=["name", "account_name"]
+			)
+			if (key := get_similar_key(account.account_name)) and any(f" {key} " in title for title in keys)
+		),
+		reverse=True,
+	)
+	if not found or (len(found) > 1 and found[0][0] == found[1][0]):
+		return None
+	return found[0][1]
 
 
 def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, dict]:
@@ -656,11 +901,7 @@ def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, di
 			as_list=True,
 		)
 	)
-	default = frappe.get_cached_value(
-		"Company",
-		company,
-		"default_receivable_account" if party_type == "Customer" else "default_payable_account",
-	)
+	default = get_party_account(party_type, None, company)
 	return {
 		party: saved.get(party) or group_accounts.get(groups.get(party)) or default for party in parties
 	}, saved
@@ -697,12 +938,24 @@ def get_account_clashes(onboarding, party_type: str) -> list[dict]:
 	"""Customers or suppliers whose invoices about to be posted and whose earlier ones, or the account
 	saved on them, are on different accounts, where something the user said picks one (a sheet's or a
 	typed account, or the saved account) and the trial balance is short on that one and over on the
-	other. "posted" when the earlier invoices are the odd ones, "draft" when these are."""
+	other. "posted" when the earlier invoices are the odd ones, "draft" when these are, and "split"
+	for an earlier sheet's invoices posted apart from the rest of that sheet (get_split_clashes)."""
 	match = get_sheet_match(onboarding, party_type)
 	if not match or not match["by_account"]:
 		return []
 	gap = {line["account"]: flt(line["sheet"]) - flt(line["entered"]) for line in match["lines"]}
 	in_sheet = {line["account"] for line in match["lines"] if line["sheet"] is not None}
+	stray_drafts = get_stray_drafts(
+		onboarding.get(get_table(party_type)),
+		get_row_accounts(onboarding, party_type, onboarding.get(get_table(party_type))),
+	)
+
+	def caused_by_posted(account, posted_rows, target):
+		"""Whether the posted rows, not this upload's strays, put the account over, and moving them
+		keeps the target within its line."""
+		if account in in_sheet and stray_drafts.get(account, 0) >= -gap.get(account, 0) - 0.005:
+			return False
+		return sum(flt(row.outstanding_amount) for row in posted_rows) <= gap.get(target, 0) + 0.005
 
 	def is_short(account):
 		return gap.get(account, 0) > 0.005
@@ -737,7 +990,12 @@ def get_account_clashes(onboarding, party_type: str) -> list[dict]:
 			for other in (set(posted) | {saved}) - {account, None}:
 				if not (said or other == saved or any(row.account for row in posted.get(other, []))):
 					continue
-				if is_short(account) and is_over(other) and posted.get(other):
+				if (
+					is_short(account)
+					and is_over(other)
+					and posted.get(other)
+					and caused_by_posted(other, posted[other], account)
+				):
 					kind, target, moving = "posted", account, posted[other]
 				elif is_short(other) and is_over(account):
 					kind, target, moving = "draft", other, these
@@ -769,16 +1027,105 @@ def get_account_clashes(onboarding, party_type: str) -> list[dict]:
 						"amount": sum(flt(row.outstanding_amount) for row in moving),
 					}
 				)
-	for clash in clashes.values():
+	splits = get_split_clashes(onboarding, party_type, match)
+	# an over ledger an earlier sheet's strays explain: those move, not this sheet's rows
+	split_from = {clash["from_account"] for clash in splits}
+	clashes = [
+		clash
+		for clash in clashes.values()
+		if not (clash["kind"] == "draft" and clash["from_account"] in split_from)
+	]
+	for clash in clashes + splits:
 		for key in ("account", "from_account"):
 			clash[f"{key}_name"] = frappe.get_cached_value("Account", clash[key], "account_name")
+	return clashes + splits
+
+
+def get_split_clashes(onboarding, party_type: str, match: dict) -> list[dict]:
+	"""Posted invoices on a ledger over its trial balance line, from a sheet whose other rows are on a
+	ledger short of its line: that sheet's strays, like names confirmed in Review names that went to
+	the default ledger. One clash per sheet ledger and stray ledger."""
+	gap = {line["account"]: flt(line["sheet"]) - flt(line["entered"]) for line in match["lines"]}
+	in_sheet = {line["account"] for line in match["lines"] if line["sheet"] is not None}
+	rows = onboarding.get(get_table(party_type))
+	accounts = get_row_accounts(onboarding, party_type, rows)
+	by_source = {}
+	for row in rows:
+		by_source.setdefault(row.source or "", {}).setdefault(accounts[row.name], []).append(row)
+	stray_drafts = get_stray_drafts(rows, accounts)
+	clashes = {}
+	for source, on in by_source.items():
+		if not source or len(on) < 2:
+			continue
+		# the sheet's ledger is where most of its rows are
+		home = max(on, key=lambda account: len(on[account]))
+		if gap.get(home, 0) <= 0.005:
+			continue
+		for account, these in on.items():
+			strays = [row for row in these if row.status == "Created"]
+			if account == home or not strays or (account in in_sheet and gap[account] >= -0.005):
+				continue
+			# this upload's own strays there explain the gap: those are the rows to look at
+			if account in in_sheet and stray_drafts.get(account, 0) >= -gap[account] - 0.005:
+				continue
+			# moving them must not put the sheet's ledger over its own line
+			if sum(flt(row.outstanding_amount) for row in strays) > gap[home] + 0.005:
+				continue
+			clash = clashes.setdefault(
+				(home, account),
+				{
+					"kind": "split",
+					"account": home,
+					"from_account": account,
+					"short": gap[home],
+					"parties": [],
+				},
+			)
+			for party in sorted({row.party for row in strays}):
+				mine = [row for row in strays if row.party == party]
+				clash["parties"].append(
+					{
+						"party": party,
+						"sources": [source],
+						"count": len(mine),
+						"amount": sum(flt(row.outstanding_amount) for row in mine),
+						"invoices": [row.invoice for row in mine],
+					}
+				)
 	return list(clashes.values())
+
+
+def get_stray_drafts(rows, accounts: dict[str, str]) -> dict[str, float]:
+	"""By account, the draft amount going there from sheets whose rows mostly go elsewhere, like a row
+	moved by hand: the ones that can put a ledger over, rather than what was posted."""
+	by_source = {}
+	for row in rows:
+		on = by_source.setdefault(row.source or "", {})
+		on[accounts[row.name]] = on.get(accounts[row.name], 0) + 1
+	homes = {source: max(on, key=on.get) for source, on in by_source.items()}
+	stray = {}
+	for row in rows:
+		account = accounts[row.name]
+		if row.status != "Created" and account != homes[row.source or ""]:
+			stray[account] = stray.get(account, 0) + flt(row.outstanding_amount)
+	return stray
+
+
+def get_row_accounts(onboarding, party_type: str, rows) -> dict[str, str]:
+	"""The account each row is on, or will go to, by row name, as get_sheet_match counts it."""
+	default = get_party_account(party_type, None, onboarding.company)
+	posted_accounts = get_posted_accounts(party_type, rows)
+	party_accounts = get_party_accounts(party_type, [row.party for row in rows], onboarding.company)[0]
+	return {
+		row.name: posted_accounts.get(row.invoice) or row.account or party_accounts.get(row.party) or default
+		for row in rows
+	}
 
 
 def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
 	"""Do what the user ticked on the clashes found now, and nothing else: put these drafts on the
 	other account, or cancel the earlier invoices and add them back as drafts on this sheet's account."""
-	from erpnext.setup.doctype.company_setup.posted_entries import check_undo, undo_invoices
+	from erpnext.setup.doctype.company_setup.posted_entries import check_undo
 
 	wanted = {(fix.get("kind"), fix.get("account"), fix.get("from_account")) for fix in fixes}
 	rows = onboarding.get(get_table(party_type))
@@ -788,6 +1135,14 @@ def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
 		if (clash["kind"], clash["account"], clash["from_account"]) not in wanted:
 			continue
 		parties = {party["party"] for party in clash["parties"]}
+		if clash["kind"] == "split":
+			check_undo(onboarding)
+			by_source = {}
+			for party in clash["parties"]:
+				by_source.setdefault(party["sources"][0], []).extend(party["invoices"])
+			move_posted(onboarding, party_type, by_source, clash["account"])
+			rows = onboarding.get(get_table(party_type))
+			continue
 		if clash["kind"] == "draft":
 			for row in rows:
 				if (
@@ -795,7 +1150,7 @@ def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
 					and row.status != "Created"
 					and (row.account or party_accounts[row.party]) == clash["from_account"]
 				):
-					row.account = clash["account"]
+					row.update({"account": clash["account"], "account_by_hand": 1})
 			continue
 		check_undo(onboarding)
 		by_source = {}
@@ -806,30 +1161,25 @@ def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
 				and posted_accounts.get(row.invoice) == clash["from_account"]
 			):
 				by_source.setdefault(row.source or "", []).append(row.invoice)
-		for source, invoices in by_source.items():
-			undo_invoices(onboarding, party_type, source, invoices)
-			for undone in onboarding.get(UNDONE_TABLES[party_type]):
-				if undone.invoice in invoices:
-					onboarding.append(
-						get_table(party_type),
-						{
-							field: undone.get(field)
-							for field in (
-								"party_type",
-								"party",
-								"party_name",
-								"invoice_number",
-								"invoice_date",
-								"due_date",
-								"outstanding_amount",
-								"source",
-							)
-						}
-						| {"account": clash["account"], "status": "Draft"},
-					)
-			rows = onboarding.get(get_table(party_type))
+		move_posted(onboarding, party_type, by_source, clash["account"])
+		rows = onboarding.get(get_table(party_type))
 	onboarding.flags.posting = True
 	onboarding.save()
+
+
+def move_posted(onboarding, party_type: str, by_source: dict[str, list[str]], account: str):
+	"""Undo these posted invoices and add them back as drafts on the account, to post again."""
+	from erpnext.setup.doctype.company_setup.posted_entries import undo_invoices
+
+	for source, invoices in by_source.items():
+		undo_invoices(onboarding, party_type, source, invoices)
+		for undone in onboarding.get(UNDONE_TABLES[party_type]):
+			if undone.invoice in invoices:
+				onboarding.append(
+					get_table(party_type),
+					{field: undone.get(field) for field in INVOICE_ROW_FIELDS}
+					| {"account": account, "account_by_hand": 1, "status": "Draft"},
+				)
 
 
 def set_ledger_accounts(company: str, party_type: str, invoices: list[dict]) -> list[str]:
@@ -853,7 +1203,8 @@ def set_ledger_accounts(company: str, party_type: str, invoices: list[dict]) -> 
 		if not ledger:
 			continue
 		if ledger.lower() in by_name:
-			invoice["account"] = by_name[ledger.lower()]
+			# the sheet names the ledger: as if picked on the row
+			invoice.update({"account": by_name[ledger.lower()], "account_by_hand": 1})
 		else:
 			unknown.add(ledger)
 	return sorted(unknown)
@@ -878,20 +1229,43 @@ def get_invoice_accounts(company: str, party_type: str) -> list[str]:
 	)
 
 
-def keep_party_account(company: str, party_type: str, party: str, account: str):
-	"""Save the account picked in the table on the customer or supplier, so later invoices go there."""
-	doc = frappe.get_doc(party_type, party)
-	row = next((row for row in doc.accounts if row.company == company), None) or doc.append(
-		"accounts", {"company": company}
+def get_missing_default_account(onboarding, party_type: str) -> str | None:
+	"""Why the draft rows can't post: the company has no default receivable or payable account and a
+	row needs it, having no account of its own. A chart with such accounts only in another currency
+	leaves the default empty."""
+	if get_party_account(party_type, None, onboarding.company):
+		return None
+	with_account = set(
+		frappe.get_all(
+			"Party Account",
+			filters={"company": onboarding.company, "parenttype": party_type},
+			pluck="parent",
+		)
 	)
-	row.account = account
-	doc.save()
+	if not any(
+		not row.account and row.party not in with_account
+		for row in onboarding.get(get_table(party_type))
+		if row.status != "Created"
+	):
+		return None
+	currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
+	if party_type == "Customer":
+		return _(
+			"{0} has no default receivable account in {1}. Set Default Receivable Account on the company first."
+		).format(onboarding.company, currency)
+	return _(
+		"{0} has no default payable account in {1}. Set Default Payable Account on the company first."
+	).format(onboarding.company, currency)
 
 
-def get_party_currency(party_type: str, party: str, company: str) -> str:
-	"""The currency of the receivable or payable account a customer's or supplier's invoices go to."""
-	account = get_party_account(party_type, party, company)
-	return frappe.get_cached_value("Account", account, "account_currency")
+def get_party_currency(party_type: str, party: str, company: str, account: str | None = None) -> str:
+	"""The currency of the receivable or payable account a customer's or supplier's invoices go to,
+	or else the one it is billed in, like a USD customer on the company's own receivable account."""
+	account = account or get_party_account(party_type, party, company)
+	currency = frappe.get_cached_value("Account", account, "account_currency")
+	if currency != frappe.get_cached_value("Company", company, "default_currency"):
+		return currency
+	return frappe.db.get_value(party_type, party, "default_currency") or currency
 
 
 def get_new_names(onboarding, party_type: str, parties: frappe._dict, confirmed: bool = False) -> list[str]:
@@ -962,7 +1336,7 @@ def add_parties(onboarding, party_type: str, parties: frappe._dict) -> dict[str,
 			# what the save showed, like which mandatory field is empty; the error only names fields
 			shown = [strip_html(cstr(m.get("message"))) for m in frappe.local.message_log[shown_before:]]
 			frappe.local.message_log = frappe.local.message_log[:shown_before]
-			not_added[name] = "; ".join(filter(None, shown)) or strip_html(cstr(e)) or e.__class__.__name__
+			not_added[name] = "; ".join(filter(None, shown)) or get_error_text(e)
 	return not_added
 
 
@@ -992,7 +1366,15 @@ def download_new_parties(company: str, party_type: str):
 	build_xlsx_response(rows, _("New customers") if party_type == "Customer" else _("New suppliers"))
 
 
-def post_advance(company: str, party_type: str, party: str, row, posting_date, temporary: str) -> str:
+def post_advance(
+	company: str,
+	party_type: str,
+	party: str,
+	row,
+	posting_date,
+	temporary: str,
+	dimensions: dict | None = None,
+) -> str:
 	"""An opening journal entry for an advance, on the party's account and marked as one, so a
 	later invoice can be set against it. Returns its name."""
 	# a customer's advance is a credit on what they owe, a supplier's a debit on what we owe
@@ -1009,25 +1391,18 @@ def post_advance(company: str, party_type: str, party: str, row, posting_date, t
 			"user_remark": _("Opening advance from Company Setup"),
 		}
 	)
-	je.append(
-		"accounts",
-		{
-			"account": row.account or get_party_account(party_type, party, company),
-			"party_type": party_type,
-			"party": party,
-			"is_advance": "Yes",
-			"debit_in_account_currency": max(amount, 0),
-			"credit_in_account_currency": max(-amount, 0),
-		},
+	if dimensions is None:
+		dimensions = get_default_dimensions(company)
+	append_line(
+		je,
+		row.account or get_party_account(party_type, party, company),
+		amount,
+		dimensions,
+		party_type=party_type,
+		party=party,
+		is_advance="Yes",
 	)
-	je.append(
-		"accounts",
-		{
-			"account": temporary,
-			"debit_in_account_currency": max(-amount, 0),
-			"credit_in_account_currency": max(amount, 0),
-		},
-	)
+	append_line(je, temporary, -amount, dimensions)
 	je.insert()
 	je.submit()
 	return je.name
@@ -1036,7 +1411,7 @@ def post_advance(company: str, party_type: str, party: str, row, posting_date, t
 def get_posting_dates(onboarding, party_type: str) -> dict:
 	"""The dates the drafts go on, for the posting confirmation: their own invoice dates where ERPNext
 	has the year, else the day before migration (with how many, and the years missing)."""
-	day_before = getdate(add_days(onboarding.migration_date, -1))
+	day_before = get_day_before(onboarding)
 	known, kept, no_year, undated, missing = {}, [], [], 0, set()
 	for row in onboarding.get(get_table(party_type)):
 		if row.status == "Created":
@@ -1093,22 +1468,92 @@ def get_missing_fiscal_year(date, company: str) -> frappe._dict | None:
 	while add_years(start, 1) <= getdate(date):
 		start = add_years(start, 1)
 	end = add_days(add_years(start, 1), -1)
-	return frappe._dict(
-		year=str(start.year) if start.year == end.year else f"{start.year}-{end.year}",
-		year_start_date=start,
-		year_end_date=end,
-	)
+	return frappe._dict(year=get_fy_details(start, end), year_start_date=start, year_end_date=end)
 
 
 def ensure_fiscal_year(date, company: str):
-	"""Add the financial year the opening entries fall in, when ERPNext doesn't have it yet."""
+	"""Add the financial year the opening entries fall in, when ERPNext doesn't have it yet, and the
+	years between it and the years ERPNext has, so none is missing in between."""
 	# a failed posting rolls the year back, but not ERPNext's cached list of years
 	frappe.cache.delete_key("fiscal_years")
 	year = get_missing_fiscal_year(date, company)
-	if year:
-		frappe.get_doc({"doctype": "Fiscal Year", **year}).insert()
-		# so the form doesn't take a year undone by a failed posting for one that is there
-		frappe.db.after_rollback.add(lambda: frappe.cache.delete_key("fiscal_years"))
+	if not year:
+		return
+	years = frappe.get_all("Fiscal Year", fields=["year_start_date", "year_end_date"])
+	later = min(
+		(
+			getdate(row.year_start_date)
+			for row in years
+			if getdate(row.year_start_date) > year.year_start_date
+		),
+		default=None,
+	)
+	earlier = max(
+		(getdate(row.year_end_date) for row in years if getdate(row.year_end_date) < year.year_start_date),
+		default=None,
+	)
+	add_fiscal_year(year, company)
+	following = year
+	while (
+		later
+		and (following := get_missing_fiscal_year(add_days(following.year_end_date, 1), company))
+		and getdate(following.year_end_date) < later
+	):
+		add_fiscal_year(following, company)
+	preceding = year
+	while (
+		earlier
+		and (preceding := get_missing_fiscal_year(add_days(preceding.year_start_date, -1), company))
+		and getdate(preceding.year_start_date) > earlier
+	):
+		add_fiscal_year(preceding, company)
+	# so the form doesn't take a year undone by a failed posting for one that is there
+	frappe.db.after_rollback.add(lambda: frappe.cache.delete_key("fiscal_years"))
+
+
+def get_last_amendment(doctype: str, name: str) -> str:
+	"""The last document of the amendment chain that starts at name."""
+	while next_name := frappe.db.get_value(doctype, {"amended_from": name}, "name"):
+		name = next_name
+	return name
+
+
+def get_amended_name(doctype: str, number: str) -> str:
+	"""The first free name like "INV-1-1", "INV-1-2" for a number that is taken."""
+	count = 1
+	while frappe.db.exists(doctype, f"{number}-{count}"):
+		count += 1
+	return f"{number}-{count}"
+
+
+def add_fiscal_year(year: frappe._dict, company: str):
+	"""Add the year. On a site with other companies a year of that name may be theirs: this company's
+	is then its own, named after it too."""
+	if frappe.db.exists("Fiscal Year", year.year):
+		abbr = frappe.get_cached_value("Company", company, "abbr")
+		year = year | {"year": f"{year.year} ({abbr})", "companies": [{"company": company}]}
+	frappe.get_doc({"doctype": "Fiscal Year", **year}).insert()
+	frappe.cache.delete_key("fiscal_years")
+
+
+def get_day_before(onboarding) -> date | None:
+	"""The day before migration, which the opening entries are dated; None without a migration date."""
+	return getdate(add_days(onboarding.migration_date, -1)) if onboarding.migration_date else None
+
+
+def count_text(count: int, one: str, many: str, *args) -> str:
+	"""Like "1 item" or "1,400 items": one or many, with the count and args filled in."""
+	return (one if count == 1 else many).format(number(count), *args)
+
+
+def number(value: int) -> str:
+	"""A count with the site's thousands separators, like 1,400."""
+	return fmt_money(value, precision=0)
+
+
+def get_error_text(error: Exception) -> str:
+	"""An error's message as plain text, for a row or the open form to show."""
+	return strip_html(cstr(error)) or error.__class__.__name__
 
 
 def get_temporary_account(company: str, create: bool = False) -> str | None:
@@ -1122,9 +1567,12 @@ def get_temporary_account(company: str, create: bool = False) -> str | None:
 	return add_account(company, _("Temporary Opening"), "Temporary", "Asset")
 
 
-def add_account(company: str, account_name: str, account_type: str, root_type: str) -> str:
-	"""A ledger of this type straight under the company's top-level account of the root type."""
-	parent = frappe.db.get_value(
+def add_account(
+	company: str, account_name: str, account_type: str, root_type: str, parent: str | None = None
+) -> str:
+	"""A ledger of this type under the parent group, or else straight under the company's top-level
+	account of the root type."""
+	parent = parent or frappe.db.get_value(
 		"Account",
 		{"company": company, "root_type": root_type, "is_group": 1, "parent_account": ("is", "not set")},
 	)
@@ -1141,3 +1589,222 @@ def add_account(company: str, account_name: str, account_type: str, root_type: s
 		.insert()
 		.name
 	)
+
+
+def get_posting_blocker(
+	company: str,
+	posting_date,
+	undo: bool = False,
+	profit_and_loss: bool = False,
+	voucher_types: tuple[str, ...] = ("Journal Entry",),
+	to_date=None,
+	opening: bool = True,
+) -> str | None:
+	"""Why opening entries dated posting_date (to to_date) can't be posted (or undone), as a sentence
+	to show in place of ERPNext's error. None when nothing stops them. See get_posting_reds."""
+	reds = get_posting_reds(company, posting_date, undo, profit_and_loss, voucher_types, to_date, opening)
+	return reds[0]["text"] if reds else None
+
+
+def get_posting_fix(company: str, posting_date, **kwargs) -> dict | None:
+	"""The fix of the first reason get_posting_blocker gives, as {label, doctype, name}."""
+	reds = get_posting_reds(company, posting_date, **kwargs)
+	return reds[0]["fix"] if reds else None
+
+
+def get_posting_reds(
+	company: str,
+	posting_date,
+	undo: bool = False,
+	profit_and_loss: bool = False,
+	voucher_types: tuple[str, ...] = ("Journal Entry",),
+	to_date=None,
+	opening: bool = True,
+) -> list[dict]:
+	"""Every reason opening entries dated posting_date (to to_date) can't be posted (or undone), each
+	as {text, fix}: fix is the record to open to fix it, as {label, doctype, name}. With
+	profit_and_loss, the entries have income or expense lines too; voucher_types are the documents
+	posted. Without opening, they are ordinary entries, which a closed year stops only on or before
+	its end."""
+	reds = []
+	closing = frappe.get_all(
+		"Period Closing Voucher",
+		filters={"company": company, "docstatus": 1},
+		fields=["name", "period_end_date"],
+		order_by="period_end_date desc",
+		limit=1,
+	)
+	closing = closing[0] if closing else None
+	fix = closing and {
+		"label": _("Open {0}").format(closing.name),
+		"doctype": "Period Closing Voucher",
+		"name": closing.name,
+	}
+	if not opening:
+		closed = closing and closing.period_end_date
+		if posting_date and closed and getdate(posting_date) <= getdate(closed):
+			text = (
+				_(
+					"The year is closed in ERPNext up to {0}, so entries dated {1} can't be undone. Cancel the closing entry first."
+				)
+				if undo
+				else _(
+					"The year is closed in ERPNext up to {0}, so entries dated {1} can't be posted. Cancel the closing entry first."
+				)
+			)
+			reds.append({"text": text.format(formatdate(closed), formatdate(posting_date)), "fix": fix})
+	elif closing:
+		reds.append(
+			{
+				"text": _(
+					"Last year is closed in ERPNext, so opening entries can't be undone. Cancel the closing entry first."
+				)
+				if undo
+				else _(
+					"Last year is closed in ERPNext, so opening entries can't be posted. Cancel the closing entry first."
+				),
+				"fix": fix,
+			}
+		)
+
+	if not undo:
+		for dimension in get_checks_for_pl_and_bs_accounts():
+			if (
+				dimension.company == company
+				and not dimension.default_dimension
+				and (dimension.mandatory_for_bs or (profit_and_loss and dimension.mandatory_for_pl))
+			):
+				reds.append(
+					{
+						"text": _(
+							"Every entry needs a {0}, and {1} has no default {0}. Set one in Accounting Dimension {0} first."
+						).format(dimension.label, company),
+						"fix": {
+							"label": _("Set the default {0}").format(dimension.label),
+							"doctype": "Accounting Dimension",
+							"name": frappe.db.get_value(
+								"Accounting Dimension", {"fieldname": dimension.fieldname}
+							),
+							# set right here: the dimension's own form leads away from Company Setup
+							"document_type": frappe.db.get_value(
+								"Accounting Dimension", {"fieldname": dimension.fieldname}, "document_type"
+							),
+						},
+					}
+				)
+
+	period = posting_date and get_closed_period(company, voucher_types, posting_date, to_date or posting_date)
+	if period:
+		text = (
+			_("Accounting Period {0} is closed for {1}, so these entries can't be undone. Open it first.")
+			if undo
+			else _("Accounting Period {0} is closed for {1}. Open it first.")
+		)
+		reds.append(
+			{
+				"text": text.format(period.name, _(period.document_type)),
+				"fix": {
+					"label": _("Open {0}").format(period.name),
+					"doctype": "Accounting Period",
+					"name": period.name,
+				},
+			}
+		)
+
+	# as ERPNext checks it: the role may post into frozen dates, except Administrator
+	frozen_till, role = frappe.db.get_value(
+		"Company", company, ["accounts_frozen_till_date", "role_allowed_for_frozen_entries"]
+	)
+	if (
+		posting_date
+		and frozen_till
+		and getdate(posting_date) <= getdate(frozen_till)
+		and (role not in frappe.get_roles() or frappe.session.user == "Administrator")
+	):
+		text = (
+			_(
+				"Accounts are frozen up to {0}, so entries dated {1} can't be undone. Change Accounts Frozen Till Date on the company first."
+			)
+			if undo
+			else _(
+				"Accounts are frozen up to {0}, so entries dated {1} can't be posted. Change Accounts Frozen Till Date on the company first."
+			)
+		)
+		reds.append(
+			{
+				"text": text.format(formatdate(frozen_till), formatdate(posting_date)),
+				"fix": {"label": _("Open company"), "doctype": "Company", "name": company},
+			}
+		)
+	return reds
+
+
+def get_closed_period(company: str, voucher_types, from_date, to_date) -> frappe._dict | None:
+	"""A closed Accounting Period of the company for one of these documents over the dates, as
+	ERPNext checks it on post and on cancel. One whose exempted role the user has doesn't count."""
+	return next(iter(get_closed_periods(company, voucher_types, from_date, to_date)), None)
+
+
+def get_closed_periods(company: str, voucher_types, from_date=None, to_date=None) -> list[frappe._dict]:
+	"""The company's Accounting Periods closed for one of these documents, over the dates when given.
+	One whose exempted role the user has doesn't count."""
+	period = frappe.qb.DocType("Accounting Period")
+	closed = frappe.qb.DocType("Closed Document")
+	query = (
+		frappe.qb.from_(period)
+		.inner_join(closed)
+		.on(period.name == closed.parent)
+		.select(period.name, period.end_date, period.exempted_role, closed.document_type)
+		.where(
+			(period.company == company)
+			& (period.disabled == 0)
+			& (closed.closed == 1)
+			& closed.document_type.isin(list(voucher_types))
+		)
+	)
+	if from_date:
+		query = query.where((period.start_date <= to_date) & (period.end_date >= from_date))
+	roles = frappe.get_roles()
+	return [row for row in query.run(as_dict=True) if not (row.exempted_role and row.exempted_role in roles)]
+
+
+def append_line(je, account: str, amount: float, dimensions: dict, cost_center: str | None = None, **fields):
+	"""A journal entry line debiting the account by the amount, or crediting it when negative."""
+	je.append(
+		"accounts",
+		{
+			"account": account,
+			"cost_center": cost_center,
+			"debit_in_account_currency": max(amount, 0),
+			"credit_in_account_currency": max(-amount, 0),
+			**fields,
+			**dimensions,
+		},
+	)
+
+
+def append_lines(
+	je, account: str, amount: float, other: str, dimensions: dict, cost_center: str | None = None
+):
+	"""The account's line, debited by the amount (credited when negative), and the other account's
+	line the other way."""
+	append_line(je, account, amount, dimensions, cost_center)
+	append_line(je, other, -amount, dimensions, cost_center)
+
+
+@contextmanager
+def parties_enabled(party_type: str, parties: list[str]):
+	"""These disabled customers or suppliers enabled for a posting or undo, and disabled again after."""
+	for party in parties:
+		frappe.get_doc(party_type, party).check_permission("write")
+		frappe.db.set_value(party_type, party, "disabled", 0, update_modified=False)
+	yield
+	for party in parties:
+		frappe.db.set_value(party_type, party, "disabled", 1, update_modified=False)
+
+
+def get_default_dimensions(company: str) -> dict[str, str]:
+	"""The company's default for each accounting dimension that has one, by fieldname."""
+	return {
+		fieldname: default for fieldname, default in get_dimensions()[1].get(company, {}).items() if default
+	}
