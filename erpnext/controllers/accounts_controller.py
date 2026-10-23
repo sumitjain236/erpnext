@@ -528,7 +528,13 @@ class AccountsController(TransactionBase):
 			).run()
 
 	def on_trash(self):
-		from erpnext.accounts.utils import delete_exchange_gain_loss_journal
+		from erpnext.accounts.utils import delete_exchange_gain_loss_journal, is_immutable_ledger_enabled
+
+		if self.docstatus == 2 and is_immutable_ledger_enabled():
+			frappe.throw(
+				_("Cancelled transactions cannot be deleted when Immutable Ledger is enabled."),
+				title=_("Immutable Ledger Enabled"),
+			)
 
 		self._remove_references_in_repost_doctypes()
 		self._remove_references_in_unreconcile()
@@ -846,6 +852,34 @@ class AccountsController(TransactionBase):
 					self.currency, self.company_currency, transaction_date, args
 				)
 
+	def on_recurring(self, reference_doc, auto_repeat_doc):
+		self.refresh_exchange_rates()
+
+	def refresh_exchange_rates(self):
+		if not self.meta.get_field("conversion_rate"):
+			return
+
+		transaction_date = self.get("posting_date") or self.get("transaction_date")
+		args = "for_buying" if self.meta.get_field("buying_price_list") else "for_selling"
+
+		for currency_field, rate_field in (
+			("currency", "conversion_rate"),
+			("price_list_currency", "plc_conversion_rate"),
+		):
+			currency = self.get(currency_field)
+			if not currency or currency == self.company_currency:
+				continue
+
+			exchange_rate = get_exchange_rate(currency, self.company_currency, transaction_date, args)
+			if not exchange_rate:
+				frappe.throw(
+					_(
+						"Cannot create recurring document: no exchange rate found for {0} to {1} on {2}. Please create a Currency Exchange record."
+					).format(currency, self.company_currency, transaction_date),
+					title=_("Exchange Rate Not Found"),
+				)
+			self.set(rate_field, exchange_rate)
+
 	def set_missing_item_details(self, for_validate=False):
 		"""set missing item values"""
 		from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
@@ -999,7 +1033,10 @@ class AccountsController(TransactionBase):
 
 				item.set("discount_percentage", pricing_rule_args.get("discount_percentage"))
 				item.set("discount_amount", pricing_rule_args.get("discount_amount"))
-				if pricing_rule_args.get("pricing_rule_for") == "Rate":
+				if (
+					pricing_rule_args.get("has_pricing_rule_for_rate")
+					or pricing_rule_args.get("pricing_rule_for") == "Rate"
+				):
 					item.set("price_list_rate", pricing_rule_args.get("price_list_rate"))
 
 				if item.get("price_list_rate"):
@@ -1640,11 +1677,14 @@ class AccountsController(TransactionBase):
 		)
 
 	def apply_source_discount_to_mapped_items(self, source_doc, existing_item_count):
-		with self.mapped_items_only(existing_item_count):
-			self.update({field: source_doc.get(field) for field in ADDITIONAL_DISCOUNT_FIELDS})
-			self.set_discount_amount_after_mapping(source_doc)
-			self.calculate_taxes_and_totals()
-			self.move_additional_discount_to_items()
+		if len(self.items) == existing_item_count:
+			self.update({"additional_discount_percentage": 0, "discount_amount": 0})
+		else:
+			with self.mapped_items_only(existing_item_count):
+				self.update({field: source_doc.get(field) for field in ADDITIONAL_DISCOUNT_FIELDS})
+				self.set_discount_amount_after_mapping(source_doc)
+				self.calculate_taxes_and_totals()
+				self.move_additional_discount_to_items()
 
 		self.calculate_taxes_and_totals()
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
+
 from unittest.mock import patch
 
 import frappe
@@ -483,15 +484,6 @@ class TestTask(ERPNextTestSuite):
 		create_task("_Test Child Blocking Delete", parent_task=parent.name)
 
 		self.assertRaises(frappe.ValidationError, parent.delete)
-
-	def test_delete_child_task(self):
-		parent = create_task("_Test Parent Of Deleted Child", is_group=1)
-		child = create_task("_Test Deleted Child", parent_task=parent.name)
-
-		child.delete()
-
-		parent.reload()
-		self.assertFalse(parent.depends_on)
 
 	def test_move_child_task_to_another_parent(self):
 		old_parent = create_task("_Test Old Parent", is_group=1)

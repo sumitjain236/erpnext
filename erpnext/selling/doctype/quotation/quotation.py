@@ -259,6 +259,7 @@ class Quotation(SellingController):
 		If permitted in settings and any item has 0 qty, the SO has unit price items.
 		"""
 		if not frappe.get_single_value("Selling Settings", "allow_zero_qty_in_quotation"):
+			self.has_unit_price_items = 0
 			return
 
 		self.has_unit_price_items = any(
@@ -501,6 +502,7 @@ class Quotation(SellingController):
 		return print_lst
 
 	def on_recurring(self, reference_doc, auto_repeat_doc):
+		super().on_recurring(reference_doc, auto_repeat_doc)
 		self.valid_till = None
 
 	def get_rows_with_alternatives(self):

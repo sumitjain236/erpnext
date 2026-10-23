@@ -12,7 +12,7 @@ from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.query_builder import Field
 from frappe.query_builder.functions import IfNull
-from frappe.utils import today
+from frappe.utils import flt, today
 
 from erpnext.stock.doctype.item.item import _get_item_details
 
@@ -166,7 +166,10 @@ def _item_query_filters(filters):
 			query_filters.append(["has_variants", "=", 0])
 
 	for fieldname, value in (filters or {}).items():
-		query_filters.append([fieldname, "=", value])
+		# link_filters arrive as [operator, value]
+		query_filters.append(
+			[fieldname, *value] if isinstance(value, list | tuple) else [fieldname, "=", value]
+		)
 	return query_filters
 
 
@@ -208,7 +211,6 @@ def _postprocess_variant_bom(source, doc, item, variant_items, source_name):
 
 	item_data = _get_item_details(item)
 	doc.item = item
-	doc.quantity = 1
 	doc.update(
 		{
 			"item_name": item_data.item_name,
@@ -217,4 +219,7 @@ def _postprocess_variant_bom(source, doc, item, variant_items, source_name):
 			"allow_alternative_item": item_data.allow_alternative_item,
 		}
 	)
+	mapped_rows = len(doc.items)
 	add_variant_item(variant_items, doc, source_name)
+	for row in doc.items[mapped_rows:]:
+		row.qty = flt(row.qty) * (flt(source.quantity) or 1)

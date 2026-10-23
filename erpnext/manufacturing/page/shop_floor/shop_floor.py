@@ -172,7 +172,7 @@ def get_quality_inspection_checklist(job_card: str):
 	job card. Returns the resolved template, its parameter rows, any already-linked inspection,
 	and the item being inspected.
 	"""
-	frappe.has_permission("Job Card", "read", throw=True)
+	frappe.has_permission("Job Card", "read", doc=job_card, throw=True)
 
 	jc = frappe.db.get_value(
 		"Job Card",
@@ -215,7 +215,7 @@ def get_quality_inspection_checklist(job_card: str):
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def submit_quality_inspection(job_card: str, readings: str | None = None):
 	"""Create + submit an In-Process Quality Inspection for the job card and link it back, so the
 	standard Job Card.validate_inspection() gate passes when the card is submitted.
@@ -230,6 +230,9 @@ def submit_quality_inspection(job_card: str, readings: str | None = None):
 	frappe.has_permission("Quality Inspection", "submit", throw=True)
 
 	jc = frappe.get_doc("Job Card", job_card)
+	jc.check_permission("write")
+	if jc.docstatus != 0:
+		frappe.throw(_("Quality Inspection can be added only to a draft Job Card"))
 
 	# Idempotent: if a submitted inspection is already linked, don't create another.
 	if jc.quality_inspection:
@@ -352,16 +355,23 @@ def _has_job_cards_criterion(wo, docstatus):
 
 
 def _bucket_criterion(wo, status_group):
-	"""The floor is done with a Work Order once every job card is submitted, even though the
-	Work Order stays "In Process" until the finished goods are received. Such operationally
-	complete orders belong on the Completed tab — not stranded under Pending / In Progress."""
+	"""Submitted cards can leave quantity for another card. Require completed operations
+	before moving an open Work Order to Completed, even before finished goods are received."""
 	open_statuses = WORK_ORDER_STATUS_GROUPS["open"]
-	all_job_cards_done = _has_job_cards_criterion(wo, 1) & _has_job_cards_criterion(wo, 0).negate()
-	if status_group == "completed":
-		return (wo.status == "Completed") | (wo.status.isin(open_statuses) & all_job_cards_done)
-	return wo.status.isin(open_statuses) & (
-		_has_job_cards_criterion(wo, 1).negate() | _has_job_cards_criterion(wo, 0)
+	operation = frappe.qb.DocType("Work Order Operation")
+	incomplete_operations = ExistsCriterion(
+		frappe.qb.from_(operation)
+		.select(operation.name)
+		.where((operation.parent == wo.name) & (operation.status != "Completed"))
 	)
+	all_operations_done = (
+		_has_job_cards_criterion(wo, 1)
+		& _has_job_cards_criterion(wo, 0).negate()
+		& incomplete_operations.negate()
+	)
+	if status_group == "completed":
+		return (wo.status == "Completed") | (wo.status.isin(open_statuses) & all_operations_done)
+	return wo.status.isin(open_statuses) & all_operations_done.negate()
 
 
 def _apply_work_order_filters(query, wo, status_group, search, with_job_cards_only):
@@ -558,7 +568,7 @@ def _fetch_job_cards(filters, mode):
 	# This must be part of the query, not a post-filter: a busy workstation's history would
 	# otherwise fill the row limit with old submitted cards and hide the active drafts.
 	or_filters = [["docstatus", "=", 0], ["status", "=", "To Manufacture"]] if mode == "workstation" else None
-	return frappe.get_all(
+	return frappe.get_list(
 		"Job Card",
 		fields=JOB_CARD_FIELDS,
 		filters=filters,
@@ -722,7 +732,7 @@ def get_today_sessions(workstation: str | None, work_order: str | None) -> list[
 	if filters is None:
 		return []
 
-	rows = frappe.get_all(
+	rows = frappe.get_list(
 		"Job Card",
 		filters=filters,
 		fields=TODAY_SESSION_FIELDS,

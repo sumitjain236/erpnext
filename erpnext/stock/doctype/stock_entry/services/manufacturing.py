@@ -4,7 +4,7 @@ from functools import cached_property
 
 import frappe
 from frappe import _, bold
-from frappe.query_builder.functions import Coalesce, Max, Min, NullIf, Sum
+from frappe.query_builder.functions import Coalesce, IfNull, Max, Min, NullIf, Sum
 from frappe.utils import ceil, cint, flt, get_link_to_form
 
 from erpnext.manufacturing.doctype.bom.bom import add_additional_cost
@@ -160,9 +160,13 @@ class BaseManufactureStockEntry(BaseStockEntry):
 
 		item_details["transfer_qty"] = item_details["qty"]
 
-		if self.wo_doc and cint(
-			frappe.db.get_single_value(
-				"Manufacturing Settings", "make_serial_no_batch_from_work_order", cache=True
+		if (
+			self.wo_doc
+			and (self.wo_doc.has_serial_no or self.wo_doc.has_batch_no)
+			and cint(
+				frappe.db.get_single_value(
+					"Manufacturing Settings", "make_serial_no_batch_from_work_order", cache=True
+				)
 			)
 		):
 			if self.wo_doc.has_serial_no:
@@ -175,6 +179,8 @@ class BaseManufactureStockEntry(BaseStockEntry):
 	def set_serial_nos_for_finished_good(self, item_details, existing_row=None):
 		serial_nos = self.get_available_serial_nos_for_fg(item_details.item_code)
 		if not serial_nos:
+			if not existing_row:
+				self.doc.append("items", item_details)
 			return
 
 		row = frappe._dict({"serial_nos": serial_nos[0 : cint(item_details.qty)]})
@@ -302,13 +308,15 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 				continue
 
 			if self.check_invalid_serial_batch_nos_for_finished_good_item(row):
+				had_selection = row.serial_no or row.batch_no or row.serial_and_batch_bundle
 				self.reset_serial_batch_on_fg_row(row)
-				frappe.msgprint(
-					_(
-						"Row {0}: Serial/Batch has been reset to values linked with Work Order {1}"
-						" because the previously selected serial/batch does not belong to this Work Order."
-					).format(row.idx, frappe.bold(self.doc.work_order))
-				)
+				if had_selection:
+					frappe.msgprint(
+						_(
+							"Row {0}: Serial/Batch has been reset to values linked with Work Order {1}"
+							" because the previously selected serial/batch does not belong to this Work Order."
+						).format(row.idx, frappe.bold(self.doc.work_order))
+					)
 
 	def check_invalid_serial_batch_nos_for_finished_good_item(self, row) -> bool:
 		if self.wo_doc.has_serial_no:
@@ -387,7 +395,10 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		if not frappe.db.get_single_value("Manufacturing Settings", "validate_components_quantities_per_bom"):
 			return
 
-		if not self.doc.fg_completed_qty:
+		consumes_transferred_qty = self.backflush_based_on == "Material Transferred for Manufacture" and not (
+			self.wo_doc and self.wo_doc.skip_transfer
+		)
+		if not self.doc.fg_completed_qty or consumes_transferred_qty:
 			return
 
 		rm_items = [item for item in self.doc.items if item.s_warehouse]
@@ -691,7 +702,7 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			.where(
 				(doctype.work_order == self.doc.work_order)
 				& (doctype.docstatus == 1)
-				& (child_doc.s_warehouse.isnotnull())
+				& (IfNull(child_doc.s_warehouse, "") != "")
 				& (
 					doctype.purpose.isin(["Manufacture", "Material Consumption for Manufacture"])
 					| ((doctype.purpose == "Material Transfer for Manufacture") & (doctype.is_return == 1))
@@ -924,9 +935,16 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			row.warehouse = row.t_warehouse
 			key = (row.item_code, row.warehouse, row.original_item or None)
 			if key not in self.available_materials:
-				self.available_materials[key] = frappe._dict(row, serial_nos=[], batches=defaultdict(float))
-			else:
-				self.available_materials[key].qty += row.qty
+				self.available_materials[key] = frappe._dict(
+					row,
+					qty=0.0,
+					uom=row.stock_uom,
+					conversion_factor=1,
+					serial_nos=[],
+					batches=defaultdict(float),
+				)
+
+			self.available_materials[key].qty += flt(row.transfer_qty)
 
 			if row.serial_and_batch_bundle:
 				material = self.available_materials[key]
@@ -946,7 +964,7 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			.select(stock_entry_detail.star)
 			.where(
 				(stock_entry.work_order == self.doc.work_order)
-				& (stock_entry_detail.s_warehouse.isnotnull())
+				& (IfNull(stock_entry_detail.s_warehouse, "") != "")
 				& (
 					stock_entry.purpose.isin(["Manufacture", "Material Consumption for Manufacture"])
 					| (
@@ -969,7 +987,7 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			if row.serial_and_batch_bundle:
 				self._deduct_consumed_serial_batch(buckets, row.serial_and_batch_bundle)
 			else:
-				self._deduct_consumed_qty(buckets, flt(row.qty))
+				self._deduct_consumed_qty(buckets, flt(row.transfer_qty))
 
 	def _get_available_buckets(self, row):
 		"""Use exact attribution when present; otherwise drain the direct item first."""

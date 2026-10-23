@@ -267,11 +267,34 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 
 	def validate(self):
 		self.validate_warehouse()
+		self.validate_job_card_for_semi_finished_goods()
 		self.validate_work_order_status_for_return()
 		self.validate_returned_qty_within_work_order()
 		self.validate_component_and_quantities()
 		self.validate_same_source_target_warehouse()
 		self.validate_alternative_items()
+
+	def validate_job_card_for_semi_finished_goods(self):
+		"""Semi-finished goods move per operation: through its Job Card, or its Subcontracting Order
+		when subcontracted."""
+		if self.doc.is_return or not (self.wo_doc and self.wo_doc.track_semi_finished_goods):
+			return
+
+		if not self.doc.job_card:
+			frappe.throw(
+				_("Transfer materials for Work Order {0} from its Job Cards.").format(
+					get_link_to_form("Work Order", self.wo_doc.name)
+				),
+				title=_("Job Card Required"),
+			)
+
+		if frappe.db.get_value("Job Card", self.doc.job_card, "is_subcontracted"):
+			frappe.throw(
+				_("Send materials for Job Card {0} to the supplier from its Subcontracting Order.").format(
+					get_link_to_form("Job Card", self.doc.job_card)
+				),
+				title=_("Subcontracted Job Card"),
+			)
 
 	def validate_work_order_status_for_return(self):
 		if not (self.doc.is_return and self.wo_doc) or self.wo_doc.status in ("Completed", "Closed"):
@@ -327,7 +350,10 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 
 	def validate_component_and_quantities(self):
 		if self.doc.fg_completed_qty:
-			if frappe.db.get_single_value("Manufacturing Settings", "validate_components_quantities_per_bom"):
+			if (
+				frappe.db.get_single_value("Manufacturing Settings", "validate_components_quantities_per_bom")
+				and self.backflush_based_on != "Material Transferred for Manufacture"
+			):
 				_check_bom_component_qty(
 					self.doc, get_bom_items(self.doc.bom_no, self.doc.use_multi_level_bom)
 				)
@@ -450,6 +476,13 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		work_order = self.wo_doc
 		consider_job_card = work_order.transfer_material_against == "Job Card" and self.doc.get("job_card")
 		job_card_items = self.get_job_card_item_codes() if consider_job_card else []
+		self.job_card_operation = (
+			frappe.db.get_value(
+				"Job Card", self.doc.job_card, ["operation_row_id", "operation"], as_dict=True
+			)
+			if consider_job_card
+			else None
+		)
 		wip_warehouse = self._resolve_wip_warehouse(work_order)
 		extra_pct = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "transfer_extra_materials_percentage")
@@ -461,6 +494,12 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 			)
 		return item_dict
 
+	def _is_row_of_job_card_operation(self, row):
+		from erpnext.manufacturing.doctype.work_order.services.required_items import is_row_of_operation
+
+		operation = self.job_card_operation
+		return not operation or is_row_of_operation(row, operation)
+
 	def _resolve_wip_warehouse(self, work_order):
 		if not frappe.db.get_value("Warehouse", work_order.wip_warehouse, "is_group"):
 			return work_order.wip_warehouse
@@ -470,6 +509,8 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		self, item_dict, d, consider_job_card, job_card_items, wip_warehouse, extra_pct, work_order
 	):
 		if consider_job_card and d.item_code not in job_card_items:
+			return
+		if consider_job_card and not self._is_row_of_job_card_operation(d):
 			return
 		additional_qty = extra_pct * flt(d.required_qty) / 100 if extra_pct else 0.0
 		transfer_pending = (
@@ -483,6 +524,12 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		self._build_required_item_row(item_dict, d, consider_job_card, wip_warehouse, work_order)
 
 	def _build_required_item_row(self, item_dict, d, consider_job_card, wip_warehouse, work_order):
+		key = (d.item_code, d.source_warehouse)
+		if existing_row := item_dict.get(key):
+			existing_row["required_qty"] = flt(existing_row["required_qty"]) + flt(d.required_qty)
+			existing_row["transferred_qty"] = flt(existing_row["transferred_qty"]) + flt(d.transferred_qty)
+			return
+
 		item_row = d.as_dict()
 		item_row["idx"] = len(item_dict) + 1
 		if consider_job_card:
@@ -494,7 +541,7 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 			work_order.allow_alternative_item
 			and frappe.get_cached_value("Item", d.item_code, "allow_alternative_item")
 		)
-		item_dict.setdefault(d.item_code, item_row)
+		item_dict.setdefault(key, item_row)
 
 	def _get_job_card_item(self, item_code):
 		return (

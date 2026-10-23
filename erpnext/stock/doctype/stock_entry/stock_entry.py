@@ -30,8 +30,8 @@ from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock import stock_ledger
 from erpnext.stock.doctype.item.item import validate_item_uoms
 from erpnext.stock.get_item_details import (
+	_get_bin_details,
 	get_barcode_data,
-	get_bin_details,
 	get_conversion_factor,
 	get_default_cost_center,
 )
@@ -265,7 +265,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 	def update_items_from_bin_details(self):
 		for item in self.get("items"):
-			item.update(get_bin_details(item.item_code, item.s_warehouse or item.t_warehouse))
+			item.update(_get_bin_details(item.item_code, item.s_warehouse or item.t_warehouse))
 
 	def before_insert(self):
 		if self.subcontracting_order and frappe.get_cached_value(
@@ -419,7 +419,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.make_gl_entries()
 
 		self.repost_future_sle_and_gle()
-		self.update_cost_in_project()
+		self.update_project_consumed_material_cost()
 		self.update_quality_inspection()
 		super().on_submit_subcontracting_inward()
 		self.update_material_request_qty()
@@ -451,7 +451,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		self.make_gl_entries_on_cancel()
 		self.repost_future_sle_and_gle()
-		self.update_cost_in_project()
+		self.update_project_consumed_material_cost()
 		self.update_quality_inspection()
 		self.adjust_stock_reservation_entries_for_return()
 		self.update_stock_reservation_entries()
@@ -531,18 +531,6 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.validate_qty_is_not_zero()
 		for item in self.get("items"):
 			item.set_transfer_qty()
-
-	def update_cost_in_project(self):
-		if self.work_order and not frappe.db.get_value(
-			"Work Order", self.work_order, "update_consumed_material_cost_in_project"
-		):
-			return
-
-		projects = set(item.project for item in self.items if item.project)
-		for project in projects:
-			project_doc = frappe.get_doc("Project", project)
-			project_doc.set_consumed_material_cost()
-			project_doc.save(ignore_permissions=True)
 
 	def validate_item(self):
 		for item in self.get("items"):
@@ -913,7 +901,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		if self.flags.via_repost:
 			cost_left = max(cost_left, 0)
 
-		return flt(cost_left / finished_item_qty)
+		return flt(cost_left / finished_item_qty) if finished_item_qty else 0.0
 
 	def _get_rm_cost_for_manufacture(
 		self, settings, finished_item_qty, outgoing_items_cost, has_consumption_basis=False
@@ -1392,7 +1380,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 						}
 					)
 
-			frappe.get_doc("Subcontracting Order", self.subcontracting_order).reserve_raw_materials(
+			frappe.get_doc("Subcontracting Order", self.subcontracting_order).make_raw_material_reservations(
 				items=items.values(), stock_entry=self.name
 			)
 
@@ -1777,6 +1765,13 @@ class StockEntry(StockController, SubcontractingInwardController):
 		job_card = frappe.get_doc("Job Card", self.job_card)
 		if job_card.is_corrective_job_card or job_card.is_subcontracted:
 			return
+
+		if self.docstatus == 1:
+			from erpnext.manufacturing.doctype.job_card.job_card import (
+				validate_job_card_submitted_for_manufacture,
+			)
+
+			validate_job_card_submitted_for_manufacture(job_card)
 
 		precision = frappe.get_precision("Stock Entry Detail", "qty")
 		pending_qty = flt(

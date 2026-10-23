@@ -19,23 +19,8 @@ from erpnext.tests.utils import ERPNextTestSuite
 
 class TestPutawayRule(ERPNextTestSuite):
 	def setUp(self):
-		if not frappe.db.exists("Item", "_Rice"):
-			make_item(
-				"_Rice", {"is_stock_item": 1, "has_batch_no": 1, "create_new_batch": 1, "stock_uom": "Kg"}
-			)
-
-		if not frappe.db.exists("Warehouse", {"warehouse_name": "Rack 1"}):
-			create_warehouse("Rack 1")
-		if not frappe.db.exists("Warehouse", {"warehouse_name": "Rack 2"}):
-			create_warehouse("Rack 2")
-
-		self.warehouse_1 = frappe.db.get_value("Warehouse", {"warehouse_name": "Rack 1"})
-		self.warehouse_2 = frappe.db.get_value("Warehouse", {"warehouse_name": "Rack 2"})
-
-		if not frappe.db.exists("UOM", "Bag"):
-			new_uom = frappe.new_doc("UOM")
-			new_uom.uom_name = "Bag"
-			new_uom.save()
+		self.warehouse_1 = "Rack 1 - _TC"
+		self.warehouse_2 = "Rack 2 - _TC"
 
 	def assertUnchangedItemsOnResave(self, doc):
 		"""Check if same items remain even after reapplication of rules.
@@ -454,22 +439,6 @@ class TestPutawayRule(ERPNextTestSuite):
 
 		self.assertUnchangedItemsOnResave(stock_entry)
 
-		stock_entry.load_from_db()
-		stock_entry.cancel()
-
-		rivs = frappe.get_all("Repost Item Valuation", filters={"voucher_no": stock_entry.name})
-		for row in rivs:
-			riv_doc = frappe.get_doc("Repost Item Valuation", row.name)
-			riv_doc.cancel()
-			riv_doc.delete()
-
-		frappe.db.set_single_value("Accounts Settings", "delete_linked_ledger_entries", 1)
-
-		stock_entry.delete()
-		pr.cancel()
-		rule_1.delete()
-		rule_2.delete()
-
 	def test_putaway_rule_on_stock_entry_material_receipt(self):
 		"""Test if rules are applied in Stock Entry of type Receipt."""
 		rule_1 = create_putaway_rule(
@@ -511,6 +480,30 @@ class TestPutawayRule(ERPNextTestSuite):
 
 		get_data(warehouse=self.warehouse_1)
 		rule.delete()
+
+	def test_warehouse_capacity_dashboard_sorts_before_paging(self):
+		from erpnext.stock.dashboard.warehouse_capacity_dashboard import get_data
+
+		warehouse = create_warehouse("_Test Capacity Sort")
+		items = [make_item(properties={"is_stock_item": 1}).name for _ in range(12)]
+		for qty, item_code in zip(range(12, 0, -1), items, strict=True):
+			create_putaway_rule(item_code=item_code, warehouse=warehouse, capacity=100 + qty)
+			make_stock_entry(item_code=item_code, target=warehouse, qty=qty, basic_rate=10)
+
+		for sort_by in ("stock_capacity", "actual_qty", "percent_occupied"):
+			with self.subTest(sort_by=sort_by):
+				rows = get_data(warehouse=warehouse, sort_by=sort_by, sort_order="desc")
+				self.assertEqual(rows[0].item_code, items[0])
+
+	def test_warehouse_capacity_dashboard_permissions(self):
+		from erpnext.stock.dashboard.warehouse_capacity_dashboard import get_data
+		from erpnext.tests.permission_test_utils import as_user, make_fenced_user
+
+		user = make_fenced_user("capacity-item-manager@example.com", ["Item Manager"])
+		with as_user(user):
+			self.assertRaises(frappe.PermissionError, get_data)
+
+		self.assertRaises(frappe.DoesNotExistError, get_data, parent_warehouse="_Test Missing Warehouse")
 
 	def test_putaway_rule_keeps_the_rejected_qty(self):
 		item = make_item(properties={"is_stock_item": 1}).name
