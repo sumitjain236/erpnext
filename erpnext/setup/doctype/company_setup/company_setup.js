@@ -10415,7 +10415,7 @@ function show_job_work_bom(frm, item_code, after) {
 			return;
 		}
 		const dialog = new frappe.ui.Dialog({
-			title: __("Job-work BOM for {0}", [item_code]),
+			title: __("Job-work BOM for {0}", [frappe.utils.escape_html(item_code)]),
 			size: "large",
 			fields: [
 				{

@@ -2202,6 +2202,7 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 				"disabled",
 				"lft",
 				"rgt",
+				"parent_account",
 			],
 		)
 	}
@@ -2289,7 +2290,7 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 				if suggestion:
 					suggestions[balance.label] = suggestion
 				elif new_account := suggest_new_account(
-					company, balance.account_name, balance.get("groups", []), root_type, side
+					accounts.values(), balance.account_name, balance.get("groups", []), root_type, side
 				):
 					new_accounts[balance.label] = new_account
 			rows.append(
@@ -2634,7 +2635,7 @@ def get_account_words(name: str) -> set[str]:
 
 
 def suggest_new_account(
-	company: str, account_name: str, groups: list[str], root_type: str | None, side: str | None
+	accounts, account_name: str, groups: list[str], root_type: str | None, side: str | None
 ) -> dict | None:
 	"""A ledger to add for a line no ledger fits: its type from the sheet's group or its name, like
 	Bank under Bank Accounts or Tax for TDS, and the group it goes under on its side. None when the
@@ -2669,7 +2670,7 @@ def suggest_new_account(
 		"account_name": account_name,
 		"account_type": account_type,
 		"root_type": root_type,
-		"parent_account": get_account_parent(company, account_type, root_type),
+		"parent_account": pick_account_parent(accounts, account_type, root_type),
 	}
 
 
@@ -2699,16 +2700,24 @@ def get_account_parent(
 	like Bank Accounts, or one named for it, like Fixed Assets or Duties and Taxes; else Current
 	Assets or Current Liabilities and the like; else the top-level group."""
 	frappe.has_permission("Company Setup", "read", company, throw=True)
-	groups = [
-		group
-		for group in frappe.get_all(
-			"Account",
-			filters={"company": company, "is_group": 1, "disabled": 0},
-			fields=["name", "account_name", "account_type", "root_type", "parent_account"],
-			order_by="lft",
-		)
-		if not root_type or group.root_type == root_type
-	]
+	accounts = frappe.get_all(
+		"Account",
+		filters={"company": company, "is_group": 1, "disabled": 0},
+		fields=["name", "account_name", "account_type", "root_type", "is_group", "parent_account", "lft"],
+	)
+	return pick_account_parent(accounts, account_type, root_type)
+
+
+def pick_account_parent(accounts, account_type: str | None, root_type: str | None) -> str | None:
+	"""get_account_parent from the company's accounts already loaded, so a sheet's lines need no query each."""
+	groups = sorted(
+		(
+			account
+			for account in accounts
+			if account.is_group and not account.disabled and (not root_type or account.root_type == root_type)
+		),
+		key=lambda account: account.lft,
+	)
 
 	def named(words):
 		return next(
@@ -2748,7 +2757,16 @@ def suggest_balance_accounts(
 	accounts = frappe.get_all(
 		"Account",
 		filters={"company": company},
-		fields=["name", "account_name", "account_type", "root_type", "is_group", "disabled"],
+		fields=[
+			"name",
+			"account_name",
+			"account_type",
+			"root_type",
+			"is_group",
+			"disabled",
+			"parent_account",
+			"lft",
+		],
 	)
 	root_types = (frappe.parse_json(root_types) if isinstance(root_types, str) else root_types) or {}
 	sides = (frappe.parse_json(sides) if isinstance(sides, str) else sides) or {}
@@ -2758,7 +2776,7 @@ def suggest_balance_accounts(
 		suggestion = suggest_account(name, accounts, root_types.get(label), sides.get(label))
 		if suggestion:
 			suggestions[label] = suggestion
-		elif new_account := suggest_new_account(company, name, [], root_types.get(label), sides.get(label)):
+		elif new_account := suggest_new_account(accounts, name, [], root_types.get(label), sides.get(label)):
 			new_accounts[label] = new_account
 	return {"suggestions": suggestions, "new_accounts": new_accounts}
 
