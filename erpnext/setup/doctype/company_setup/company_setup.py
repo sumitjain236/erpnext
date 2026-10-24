@@ -1903,6 +1903,20 @@ class CompanySetup(Document):
 		self.check_permission("write")
 		return orders.mark_items_subcontracted(self)
 
+	def get_job_work_bom(self, item_code: str) -> dict:
+		self.check_permission("read")
+		return orders.get_job_work_bom(self, item_code)
+
+	@frappe.whitelist()
+	def set_job_work_bom(
+		self, item_code: str, materials: list | str, service_item: str, finished_good_qty: float = 1
+	) -> dict:
+		"""Give the item a job-work BOM with only these materials: see open_orders.set_job_work_bom."""
+		self.check_permission("write")
+		return orders.set_job_work_bom(
+			self, item_code, frappe.parse_json(materials), service_item, finished_good_qty
+		)
+
 	def get_made_orders(self, order_type: str) -> dict:
 		self.check_permission("read")
 		return orders.get_made_orders(self, order_type)

@@ -10400,6 +10400,112 @@ function show_open_orders(frm, order_type, result) {
 	);
 }
 
+// A copy of the item's BOM that leaves out what is added in-house, for its Subcontracting BOM
+function show_job_work_bom(frm, item_code, after) {
+	get_data(frm, "get_job_work_bom", { item_code: item_code }, { freeze: true }).then((r) => {
+		const data = r.message;
+		if (!data.bom) {
+			frappe.msgprint({
+				title: __("No BOM"),
+				message: __("{0} has no default BOM. Add its BOM first.", [
+					frappe.utils.escape_html(item_code),
+				]),
+				indicator: "red",
+			});
+			return;
+		}
+		const dialog = new frappe.ui.Dialog({
+			title: __("Job-work BOM for {0}", [item_code]),
+			size: "large",
+			fields: [
+				{
+					fieldname: "materials",
+					fieldtype: "Table",
+					label: __("Materials"),
+					description: __("Ticked materials go to the job worker. Untick what you add in-house."),
+					cannot_add_rows: 1,
+					cannot_delete_rows: 1,
+					data: data.materials.map((row) => ({
+						...row,
+						__checked: row.held ? 1 : 0,
+						note: row.held ? "" : __("added by you"),
+					})),
+					fields: [
+						{
+							fieldname: "item_name",
+							fieldtype: "Data",
+							label: __("Material"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 5,
+						},
+						{
+							fieldname: "qty",
+							fieldtype: "Float",
+							label: __("Qty"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 2,
+						},
+						{
+							fieldname: "uom",
+							fieldtype: "Data",
+							label: __("Unit"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 1,
+						},
+						{
+							fieldname: "note",
+							fieldtype: "Data",
+							label: __("Note"),
+							in_list_view: 1,
+							read_only: 1,
+							columns: 2,
+						},
+						{ fieldname: "item_code", fieldtype: "Data", hidden: 1 },
+					],
+				},
+				{
+					fieldname: "service_item",
+					fieldtype: "Link",
+					options: "Item",
+					label: __("Service item"),
+					reqd: 1,
+					default: data.service_item,
+					get_query: () => ({ filters: { is_stock_item: 0, disabled: 0 } }),
+				},
+				{
+					fieldname: "finished_good_qty",
+					fieldtype: "Float",
+					label: __("Finished goods per service unit"),
+					reqd: 1,
+					default: data.finished_good_qty,
+				},
+			],
+			primary_action_label: __("Save job-work BOM"),
+			primary_action: (values) =>
+				call_method(
+					frm,
+					"set_job_work_bom",
+					{
+						item_code: item_code,
+						materials: dialog.fields_dict.materials.grid
+							.get_selected_children()
+							.map((row) => row.item_code),
+						service_item: values.service_item,
+						finished_good_qty: values.finished_good_qty,
+					},
+					{ freeze: true }
+				).then((r) => {
+					dialog.hide();
+					after(r.message);
+				}),
+		});
+		dialog.show();
+	});
+}
+
 class OpenOrdersWindow extends SheetWindow {
 	constructor(frm, order_type, checks, result) {
 		const text = ORDER_TEXT[order_type];
@@ -10567,6 +10673,36 @@ class OpenOrdersWindow extends SheetWindow {
 								frappe.new_doc("Subcontracting BOM", { finished_good: item.items[0] })
 							),
 					  ]
+					: []),
+				...(item.key === "material_not_at_job_worker"
+					? item.items.map((code) => ({
+							label:
+								item.items.length > 1
+									? __("Set job-work BOM for {0}", [code])
+									: __("Set job-work BOM"),
+							onclick: () =>
+								(this.dirty ? this.save() : Promise.resolve()).then(() =>
+									show_job_work_bom(frm, code, (saved) =>
+										this.reopen().then(() =>
+											frappe.ui.toast(
+												saved.short
+													? {
+															type: "info",
+															message: __(
+																"Job-work BOM saved. The job worker still does not hold all the material."
+															),
+													  }
+													: {
+															type: "success",
+															message: __(
+																"Job-work BOM saved. The job worker now holds all the material."
+															),
+													  }
+											)
+										)
+									)
+								),
+					  }))
 					: []),
 				...(item.rows.length ? [rows(item.rows)] : []),
 			],

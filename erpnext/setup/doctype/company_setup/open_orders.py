@@ -995,3 +995,78 @@ def mark_items_subcontracted(onboarding) -> list[str]:
 		item.is_sub_contracted_item = 1
 		item.save()
 	return items
+
+
+def get_job_work_bom(onboarding, item_code: str) -> dict:
+	"""For the job-work BOM dialog: the item's default BOM materials, each with whether the job
+	worker holds it, and the service item and finished goods per service unit to start with."""
+	bom = get_default_bom(item_code)
+	if not bom:
+		return {"bom": None}
+	rows = [row for row in prepare_orders(onboarding, "Subcontracting Order") if row.item_code == item_code]
+	short = {material for row in rows for material in row.short_material or []}
+	current = frappe.db.get_value(
+		"Subcontracting BOM",
+		{"finished_good": item_code, "is_active": 1},
+		["service_item", "finished_good_qty", "service_item_qty"],
+		as_dict=True,
+	)
+	return {
+		"bom": bom,
+		"materials": [
+			{
+				"item_code": line.item_code,
+				"item_name": line.item_name,
+				"qty": line.qty,
+				"uom": line.uom,
+				"held": line.item_code not in short,
+			}
+			for line in frappe.get_doc("BOM", bom).items
+		],
+		"service_item": (current and current.service_item)
+		or next((row.service_item for row in rows if row.service_item), None),
+		"finished_good_qty": flt(current.finished_good_qty) / flt(current.service_item_qty)
+		if current and flt(current.service_item_qty)
+		else 1,
+	}
+
+
+def set_job_work_bom(
+	onboarding, item_code: str, materials: list[str], service_item: str, finished_good_qty: float
+) -> dict:
+	"""Submit a copy of the item's default BOM with only these materials, and point the item's
+	active Subcontracting BOM at it. Returns the BOM and whether the job worker still lacks material."""
+	default_bom = get_default_bom(item_code)
+	if not default_bom:
+		frappe.throw(_("Item {0} has no default BOM.").format(item_code), title=_("No BOM"))
+	bom = frappe.copy_doc(frappe.get_doc("BOM", default_bom))
+	bom.items = [line for line in bom.items if line.item_code in set(materials)]
+	if not bom.items:
+		frappe.throw(_("Tick at least one material."), title=_("No materials"))
+	for idx, line in enumerate(bom.items, 1):
+		line.idx = idx
+	bom.is_default = 0
+	bom.insert()
+	bom.submit()
+	name = frappe.db.get_value("Subcontracting BOM", {"finished_good": item_code, "is_active": 1})
+	subcontracting_bom = (
+		frappe.get_doc("Subcontracting BOM", name) if name else frappe.new_doc("Subcontracting BOM")
+	)
+	subcontracting_bom.update(
+		{
+			"finished_good": item_code,
+			"finished_good_bom": bom.name,
+			"finished_good_qty": flt(finished_good_qty) or 1,
+			"finished_good_uom": frappe.get_cached_value("Item", item_code, "stock_uom"),
+			"service_item": service_item,
+			"service_item_qty": 1,
+			"service_item_uom": frappe.get_cached_value("Item", service_item, "stock_uom"),
+		}
+	)
+	subcontracting_bom.save()
+	short = any(
+		row.short_material
+		for row in prepare_orders(onboarding, "Subcontracting Order")
+		if row.item_code == item_code
+	)
+	return {"bom": bom.name, "short": short}

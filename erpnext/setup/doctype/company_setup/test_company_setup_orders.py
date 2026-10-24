@@ -453,6 +453,43 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			("2026-03-12", 85, [(self.fabric, 24)]),
 		)
 
+	def test_job_work_bom_leaves_out_the_material_added_in_house(self):
+		self.doc.save_warehouses(
+			[{"warehouse_name": "Velan Job Works", "kind": "Job worker", "job_worker": "_Test Setup Velan"}]
+		)
+		with as_administrator():
+			bom = frappe.copy_doc(
+				frappe.get_doc("BOM", frappe.db.get_value("Item", self.dyed, "default_bom"))
+			)
+			bom.append("items", {"item_code": self.yarn, "qty": 1, "rate": 10})
+			bom.is_default = 1
+			bom.insert().submit()
+		velan = frappe.db.get_value(
+			"Warehouse", {"company": self.company, "warehouse_name": "Velan Job Works"}
+		)
+		self.receive(self.fabric, velan, 24)
+		self.doc.save_open_orders(
+			"Subcontracting Order",
+			[{"order_no": "JWO-41", "party_name": "_Test Setup Velan", "item_name": self.dyed, "qty": 12}],
+		)
+		self.assertEqual(
+			[(row["item_code"], row["held"]) for row in self.doc.get_job_work_bom(self.dyed)["materials"]],
+			[(self.fabric, True), (self.yarn, False)],
+		)
+
+		result = self.doc.set_job_work_bom(self.dyed, [self.fabric], "_Test Setup Dyeing", 1)
+		self.assertFalse(result["short"])
+		self.assertFalse(self.doc.get_open_orders("Subcontracting Order")["reds"])
+		self.assertEqual(
+			frappe.get_all("BOM Item", {"parent": result["bom"]}, pluck="item_code"), [self.fabric]
+		)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Subcontracting BOM", {"finished_good": self.dyed, "is_active": 1}, "finished_good_bom"
+			),
+			result["bom"],
+		)
+
 	def save_job_work(self):
 		"""A draft subcontracting order of 12 dyed at Velan, rate 85, its fabric at Velan, and a
 		Subcontracting BOM of 2 Dyeing for each dyed piece."""
