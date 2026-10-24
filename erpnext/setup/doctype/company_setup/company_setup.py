@@ -2191,7 +2191,7 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 			],
 		)
 	}
-	rows, unmatched, groups, suggestions = [], [], 0, {}
+	rows, unmatched, groups, suggestions, new_accounts = [], [], 0, {}, {}
 	left_out = {}
 	# what each left-out line is on: an account of the chart, or "" for a line no account stands for,
 	# like a customer under the debtors group or a group total
@@ -2270,14 +2270,14 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 		else:
 			if not name:
 				unmatched.append(balance.label)
-				suggestion = suggest_account(
-					balance.account_name,
-					accounts.values(),
-					root_type,
-					"debit" if flt(balance.debit) >= flt(balance.credit) else "credit",
-				)
+				side = "debit" if flt(balance.debit) >= flt(balance.credit) else "credit"
+				suggestion = suggest_account(balance.account_name, accounts.values(), root_type, side)
 				if suggestion:
 					suggestions[balance.label] = suggestion
+				elif new_account := suggest_new_account(
+					company, balance.account_name, balance.get("groups", []), root_type, side
+				):
+					new_accounts[balance.label] = new_account
 			rows.append(
 				{
 					"original_account": balance.label,
@@ -2294,6 +2294,7 @@ def sort_balances(company: str, balances: list[dict]) -> frappe._dict:
 			"added": len(rows),
 			"unmatched": unmatched,
 			"suggestions": suggestions,
+			"new_accounts": new_accounts,
 			"groups": groups,
 			"left_out": {account_type: amount for account_type, amount in left_out.items() if amount},
 		},
@@ -2506,7 +2507,37 @@ SHEET_ROOT_TYPES = (
 	# not "Duties & Taxes": it holds input tax credits (assets) as well as tax owed
 	("Liability", {"od", "overdraft", "loans", "provisions", "creditors"}),
 	("Asset", {"investments", "deposits", "cash", "bank"}),
+	# Tally's trading account holds the opening and closing stock of last year's profit
+	("Expense", {"trading"}),
 )
+# what other software calls a ledger the standard chart has under another name
+ACCOUNT_SYNONYMS = (
+	("share capital", "capital stock"),
+	("reserves and surplus", "retained earnings"),
+	("provision for depreciation", "accumulated depreciation"),
+	("salary payable", "payroll payable"),
+	("wage payable", "payroll payable"),
+	("salary and wage", "salary"),
+	("wage", "salary"),
+	("electricity", "utility"),
+	("power and fuel", "utility"),
+	("misc", "miscellaneous"),
+	("travelling", "travel"),
+	("traveling", "travel"),
+	("printing", "print"),
+	("fd", "fixed deposits"),
+	("freight inward", "freight"),
+	("carriage inward", "freight"),
+	("cash credit", "overdraft"),
+	("cc", "overdraft"),
+	("od", "overdraft"),
+	("purchase", "cost of goods sold"),
+	("purchases", "cost of goods sold"),
+	("opening stock", "stock adjustment"),
+	("closing stock", "stock adjustment"),
+)
+# names of tax ledgers, for a line no ledger fits
+TAX_WORDS = {"tds", "tcs", "gst", "cgst", "sgst", "igst", "utgst", "cess", "vat"}
 # words that say nothing about which account a name is
 FILLER_WORDS = {"and", "a", "c", "ac", "the", "of", "account", "accounts"}
 # words many names share, so they don't make two names alike
@@ -2545,7 +2576,7 @@ def suggest_account(
 	or the line's side ("debit" or "credit") does, else the one ledger of that kind whose name is
 	inside this one or this one inside it, like "Rent Expense" and "Office Rent". A reverse charge
 	(RCM) ledger only for a reverse charge line. None when more than one fits."""
-	words = set(get_singular_key(account_name).split()) - FILLER_WORDS
+	words = get_account_words(account_name)
 	if not words:
 		return None
 	root_types = (
@@ -2565,10 +2596,11 @@ def suggest_account(
 			continue
 		if is_reverse_charge(account.account_name) != is_reverse_charge(account_name):
 			continue
-		theirs = set(get_singular_key(account.account_name).split()) - FILLER_WORDS
+		theirs = get_account_words(account.account_name)
 		if theirs == words:
 			found.append(account.name)
-		mine, others = words - COMMON_WORDS, theirs - COMMON_WORDS
+		common = set(get_singular_key(" ".join(f"{word} {word}s" for word in COMMON_WORDS)).split())
+		mine, others = words - common, theirs - common
 		shared = len(mine & others) if mine and others and (mine <= others or others <= mine) else 0
 		if root_types and shared and shared >= most:
 			closest = [*closest, account.name] if shared == most else [account.name]
@@ -2576,6 +2608,55 @@ def suggest_account(
 	if found:
 		return found[0] if len(found) == 1 else None
 	return closest[0] if len(closest) == 1 else None
+
+
+def get_account_words(name: str) -> set[str]:
+	"""The words of a name that say which account it is, in the singular, with other software's
+	names for the standard chart's ledgers put in, like "Share Capital" for "Capital Stock"."""
+	key = f" {get_singular_key(name)} "
+	for words, synonym in ACCOUNT_SYNONYMS:
+		key = key.replace(f" {get_singular_key(words)} ", f" {get_singular_key(synonym)} ")
+	return set(key.split()) - FILLER_WORDS
+
+
+def suggest_new_account(
+	company: str, account_name: str, groups: list[str], root_type: str | None, side: str | None
+) -> dict | None:
+	"""A ledger to add for a line no ledger fits: its type from the sheet's group or its name, like
+	Bank under Bank Accounts or Tax for TDS, and the group it goes under on its side. None when the
+	side isn't known."""
+	group_words = set(normalize_account_name(groups[-1] if groups else "").split())
+	name_words = set(get_singular_key(account_name).split())
+	# a customer's or supplier's ledger comes in with their invoices, not as a balance
+	if name_words & {"debtor", "creditor"} or "receivable" in name_words and not name_words & TAX_WORDS:
+		return None
+	account_type = (
+		"Bank"
+		if "bank" in group_words
+		and not group_words & {"od", "overdraft", "cc"}
+		or "bank" in name_words
+		and root_type in (None, "Asset")
+		and not name_words & {"charge", "fee", "interest", "commission"}
+		else "Cash"
+		if "cash" in group_words
+		else "Fixed Asset"
+		if {"fixed", "assets"} <= group_words and "depreciation" not in name_words
+		else "Tax"
+		if name_words & TAX_WORDS or group_words & {"duties", "tax", "taxes"}
+		else None
+	)
+	if not root_type and account_type in ("Bank", "Cash", "Fixed Asset"):
+		root_type = "Asset"
+	elif not root_type and account_type == "Tax" and side:
+		root_type = "Asset" if side == "debit" else "Liability"
+	if not root_type:
+		return None
+	return {
+		"account_name": account_name,
+		"account_type": account_type,
+		"root_type": root_type,
+		"parent_account": get_account_parent(company, account_type, root_type),
+	}
 
 
 def is_reverse_charge(name: str) -> bool:
@@ -2645,7 +2726,8 @@ def suggest_balance_accounts(
 	root_types: dict | str | None = None,
 	sides: dict | str | None = None,
 ) -> dict:
-	"""Suggestions for opening balance rows without an account, for a window opened again. root_types:
+	"""Suggestions for opening balance rows without an account, for a window opened again, and the
+	ledger to add for a row no ledger fits, as {"suggestions": ..., "new_accounts": ...}. root_types:
 	the kind of line the sheet said each label is, so a suggestion stays within it; sides: "debit" or
 	"credit" for each label, for a line the sheet said no kind of."""
 	frappe.get_doc("Company Setup", company).check_permission("read")
@@ -2656,12 +2738,15 @@ def suggest_balance_accounts(
 	)
 	root_types = (frappe.parse_json(root_types) if isinstance(root_types, str) else root_types) or {}
 	sides = (frappe.parse_json(sides) if isinstance(sides, str) else sides) or {}
-	suggestions = {}
+	suggestions, new_accounts = {}, {}
 	for label in frappe.parse_json(labels) if isinstance(labels, str) else labels:
-		suggestion = suggest_account(get_label_name(label), accounts, root_types.get(label), sides.get(label))
+		name = get_label_name(label)
+		suggestion = suggest_account(name, accounts, root_types.get(label), sides.get(label))
 		if suggestion:
 			suggestions[label] = suggestion
-	return suggestions
+		elif new_account := suggest_new_account(company, name, [], root_types.get(label), sides.get(label)):
+			new_accounts[label] = new_account
+	return {"suggestions": suggestions, "new_accounts": new_accounts}
 
 
 def get_label_name(label: str) -> str:

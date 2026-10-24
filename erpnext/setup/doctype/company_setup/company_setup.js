@@ -2082,6 +2082,8 @@ function show_opening_balances(frm, result) {
 	$intro.append($(`<div data-unmatched></div>`));
 	// accounts suggested for rows without one, applied only when the user says so
 	let suggested = result?.suggestions || null;
+	// rows no ledger fits: the ledger to add, with its type and group
+	let new_accounts = result?.new_accounts || {};
 	$intro.append(make_balance_yellows(frm, dialog));
 	if (posted.length) {
 		grey_line(
@@ -2120,11 +2122,15 @@ function show_opening_balances(frm, result) {
 					),
 				})
 				.then((r) => {
-					suggested = r.message || {};
+					suggested = r.message?.suggestions || {};
+					new_accounts = r.message?.new_accounts || {};
 					update_totals();
 				});
 		}
 		const suggestions = waiting.filter((row) => suggested?.[row.original_account]);
+		const to_add = waiting.filter(
+			(row) => !suggested?.[row.original_account] && new_accounts[row.original_account]
+		);
 		const pairs = suggestions.map(
 			(row) => `${row.original_account} → ${short_name(suggested[row.original_account])}`
 		);
@@ -2141,14 +2147,30 @@ function show_opening_balances(frm, result) {
 									__("Pick an account for 1 row"),
 									__("Pick an account for {0} rows", [waiting.length])
 								),
-								description: suggestions.length
-									? suggestions.length === 1
-										? __("1 close match: {0}. Check it before you use it.", [pairs[0]])
-										: __("{0} close matches: {1}. Check them before you use them.", [
+								description:
+									[
+										suggestions.length === 1 &&
+											__("1 close match: {0}. Check it before you use it.", [pairs[0]]),
+										suggestions.length > 1 &&
+											__("{0} close matches: {1}. Check them before you use them.", [
 												suggestions.length,
 												pairs.join(", "),
-										  ])
-									: undefined,
+											]),
+										to_add.length &&
+											plural(
+												to_add.length,
+												__(
+													"No ledger yet for {0}: add it with its type and group filled in.",
+													[to_add[0].original_account]
+												),
+												__(
+													"No ledger yet for {0}: add each with its type and group filled in.",
+													[to_add.map((row) => row.original_account).join(", ")]
+												)
+											),
+									]
+										.filter(Boolean)
+										.join(" ") || undefined,
 								footer: $(`<div class="flex flex-wrap items-center gap-2"></div>`).append(
 									suggestions.length
 										? frappe.ui.button({
@@ -2158,6 +2180,16 @@ function show_opening_balances(frm, result) {
 														: __("Use these {0} matches", [suggestions.length]),
 												size: "sm",
 												onclick: () => use_suggestions(suggestions),
+										  })
+										: [],
+									to_add.length
+										? frappe.ui.button({
+												label: __("Add account"),
+												size: "sm",
+												onclick: () =>
+													frappe.model.with_doctype("Account", () =>
+														add_balance_account(frm, dialog, new_accounts)
+													),
 										  })
 										: [],
 									frappe.ui.button({
@@ -2356,7 +2388,8 @@ const OPENING_EXCLUDED_TYPES = ["Receivable", "Payable", "Stock", "Temporary"];
 
 // A new account of this company, added as a row of the balances table
 // A new account for a row without one, in a view inside the balances window; the row gets it
-function add_balance_account(frm, balances_dialog) {
+// new_accounts: by row, the ledger to add for it, with its type, as the sheet's suggestions have it
+function add_balance_account(frm, balances_dialog, new_accounts = {}) {
 	const company = frm.doc.company;
 	const currency = erpnext.get_currency(company);
 	const types = frappe.meta
@@ -2367,7 +2400,14 @@ function add_balance_account(frm, balances_dialog) {
 	// the rows that can get the new account; the one being edited is picked first
 	const waiting = grid.df.data.filter((row) => !row.account && row.original_account);
 	const editing = frappe.ui.form.editable_row?.doc;
-	let row = (waiting.includes(editing) && editing) || waiting[0];
+	let row =
+		(waiting.includes(editing) && editing) ||
+		waiting.find((option) => new_accounts[option.original_account]) ||
+		waiting[0];
+	const type_of = (row) => {
+		const hint = row && new_accounts[row.original_account];
+		return hint ? hint.account_type || "Other" : undefined;
+	};
 	// the sheet's label may carry the account number, "1001 - Rent Deposit", but "Security
 	// Deposit - Office Rent" is all name; "Payroll:Taxes" is a QuickBooks sub-account
 	const name_of = (label) => {
@@ -2417,6 +2457,7 @@ function add_balance_account(frm, balances_dialog) {
 				change: () => {
 					row = waiting.find((option) => label_of(option) === form.get_value("for_row"));
 					form.set_value("account_name", row ? name_of(row.original_account) : "");
+					if (type_of(row)) form.set_value("account_type", type_of(row));
 					suggest_parent();
 				},
 			},
@@ -2438,6 +2479,7 @@ function add_balance_account(frm, balances_dialog) {
 					{ value: "Other", label: __("Other") },
 				],
 				description: __("Bank or Cash for money accounts; Other for most others."),
+				default: type_of(row),
 				change: () => suggest_parent(),
 			},
 			{
