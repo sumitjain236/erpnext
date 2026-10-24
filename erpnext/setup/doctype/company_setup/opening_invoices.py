@@ -69,6 +69,8 @@ INVOICE_ROW_FIELDS = (
 PARTY_NAME_FIELDS = {"Customer": "customer_name", "Supplier": "supplier_name"}
 PARTY_ACCOUNT_FIELDS = {"Customer": "debit_to", "Supplier": "credit_to"}
 INVOICE_ACCOUNT_TYPES = {"Customer": ("Receivable", "Asset"), "Supplier": ("Payable", "Liability")}
+# the report title of every party ledger together, as get_similar_key gives it
+PARTY_GROUP_TITLES = {"Customer": "sundry debtors", "Supplier": "sundry creditors"}
 # filled from Selling or Buying Settings when a new one is added
 PARTY_DEFAULTS = {"Customer": ("customer_group", "territory"), "Supplier": ("supplier_group",)}
 # the columns of the sheet for new customers or suppliers, besides their other mandatory fields
@@ -312,8 +314,8 @@ def get_look_alikes(names: list[str]) -> list[list[str]]:
 
 
 def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
-	"""The rows of a receivables or payables report, how many are advances, and the columns that
-	were not used. Reports from other software are read as exported: headings under title rows,
+	"""The rows of a receivables or payables report, how many are advances, the columns that were
+	not used, and the dates that could not be read (bad_dates). Reports from other software are read as exported: headings under title rows,
 	totals and subtotals anywhere, an amount split into Dr and Cr columns (Tally), and bills grouped
 	under a line naming their customer or supplier (QuickBooks, Busy)."""
 	report, keys = read_sheet(file_url)
@@ -328,7 +330,7 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 			_("The sheet needs a Name column and an Outstanding column."), title=_("Columns not found")
 		)
 
-	invoices, advances, party = [], 0, None
+	invoices, advances, party, bad_dates = [], 0, None, []
 	body = rows[start + 1 + sheet.sub_heading :]
 	day_first = {
 		field: get_day_first(get_cell(row, sheet.columns[field]) for row in body)
@@ -353,15 +355,18 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 			continue
 		if amount < 0:
 			advances += 1
+		dates = {}
+		for field in ("invoice_date", "due_date"):
+			cell = get_cell(row, sheet.columns[field])
+			dates[field] = get_sheet_date(cell, day_first[field])
+			if cstr(cell).strip() and not dates[field]:
+				bad_dates.append(f"{name} {invoice_number}: {cstr(cell).strip()}".strip())
 		invoices.append(
 			{
 				"party_name": name,
 				# Tally's mark for an amount set against no bill
 				"invoice_number": None if invoice_number.lower() in ("", "on account") else invoice_number,
-				"invoice_date": get_sheet_date(
-					get_cell(row, sheet.columns["invoice_date"]), day_first["invoice_date"]
-				),
-				"due_date": get_sheet_date(get_cell(row, sheet.columns["due_date"]), day_first["due_date"]),
+				**dates,
 				"outstanding_amount": amount,
 				"ledger": cstr(get_cell(row, sheet.columns["ledger"])).strip(),
 			}
@@ -374,7 +379,9 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 	titles = [
 		value for row in rows[: start or 0] for value in row if isinstance(value, str) and value.strip()
 	]
-	return frappe._dict(invoices=invoices, advances=advances, unused_columns=unused, titles=titles)
+	return frappe._dict(
+		invoices=invoices, advances=advances, unused_columns=unused, titles=titles, bad_dates=bad_dates
+	)
 
 
 def is_heading_row(keys: list[str]) -> bool:
@@ -901,11 +908,13 @@ def get_account_name(account: str) -> str:
 def get_title_account(company: str, party_type: str, titles: list[str]) -> str | None:
 	"""The receivable or payable ledger a report's title rows name, like Tally's "Ledger: Debtors -
 	Retainers", when the company has several and one name is found whole: the longest, when only one
-	is that long."""
+	is that long. Busy's and Tally's "Sundry Debtors" or "Sundry Creditors" is the group of every
+	party ledger, so it names none of them."""
 	accounts = get_invoice_accounts(company, party_type)
 	if len(accounts) < 2 or not titles:
 		return None
-	keys = [f" {get_similar_key(title)} " for title in titles]
+	group = f" {PARTY_GROUP_TITLES[party_type]} "
+	keys = [f" {get_similar_key(title)} ".replace(group, " ") for title in titles]
 	found = sorted(
 		(
 			(len(key), account.name)
@@ -921,12 +930,13 @@ def get_title_account(company: str, party_type: str, titles: list[str]) -> str |
 	return found[0][1]
 
 
-def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, dict]:
+def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, dict, dict]:
 	"""get_party_account for many parties in a few queries: the account each one's invoices go to,
-	and the account saved on the party itself (not its group's or the company's default)."""
+	the account saved on the party itself, and the one saved on the party or its group (neither is
+	the company's default)."""
 	parties = list(set(filter(None, parties)))
 	if not parties:
-		return {}, {}
+		return {}, {}, {}
 	group_field = "customer_group" if party_type == "Customer" else "supplier_group"
 	saved = dict(
 		frappe.get_all(
@@ -953,10 +963,37 @@ def get_party_accounts(party_type: str, parties, company: str) -> tuple[dict, di
 			as_list=True,
 		)
 	)
+	kept = {
+		party: account
+		for party in parties
+		if (account := saved.get(party) or group_accounts.get(groups.get(party)))
+	}
 	default = get_party_account(party_type, None, company)
-	return {
-		party: saved.get(party) or group_accounts.get(groups.get(party)) or default for party in parties
-	}, saved
+	return {party: kept.get(party) or default for party in parties}, saved, kept
+
+
+def get_new_party_accounts(party_type: str, company: str, rows) -> dict[str, str]:
+	"""For rows whose customer or supplier is to be added, by name: the ledger saved on the group
+	the new one gets."""
+	field = PARTY_DEFAULTS[party_type][0]
+	groups = {
+		row.party_name: make_party(party_type, row.party_name, company, row.party_group).get(field)
+		for row in rows
+		if row.create_party and not row.party
+	}
+	group_accounts = dict(
+		frappe.get_all(
+			"Party Account",
+			filters={
+				"parenttype": f"{party_type} Group",
+				"parent": ("in", list(set(filter(None, groups.values()))) or [""]),
+				"company": company,
+			},
+			fields=["parent", "account"],
+			as_list=True,
+		)
+	)
+	return {name: group_accounts[group] for name, group in groups.items() if group in group_accounts}
 
 
 def get_posted_accounts(party_type: str, rows) -> dict[str, str]:
@@ -1017,7 +1054,7 @@ def get_account_clashes(onboarding, party_type: str) -> list[dict]:
 
 	rows = onboarding.get(get_table(party_type))
 	posted_accounts = get_posted_accounts(party_type, rows)
-	party_accounts, saved_accounts = get_party_accounts(
+	party_accounts, saved_accounts, _kept = get_party_accounts(
 		party_type, [row.party for row in rows], onboarding.company
 	)
 	by_party = {}
@@ -1523,6 +1560,20 @@ def get_missing_fiscal_year(date, company: str) -> frappe._dict | None:
 	return frappe._dict(year=get_fy_details(start, end), year_start_date=start, year_end_date=end)
 
 
+def get_fiscal_year_red(company: str, *dates) -> dict | None:
+	"""The years these dates fall in that ERPNext doesn't have and the user can't add, as a red like
+	get_posting_reds gives. None when every year is there or the user can add Fiscal Years."""
+	if frappe.has_permission("Fiscal Year", "create"):
+		return None
+	missing = sorted({year.year for date in dates if (year := get_missing_fiscal_year(date, company))})
+	if not missing:
+		return None
+	return {
+		"text": _("Ask a System Manager to add the financial year {0} first.").format(", ".join(missing)),
+		"fix": {"label": _("New Fiscal Year"), "doctype": "Fiscal Year", "name": "new"},
+	}
+
+
 def ensure_fiscal_year(date, company: str):
 	"""Add the financial year the opening entries fall in, when ERPNext doesn't have it yet, and the
 	years between it and the years ERPNext has, so none is missing in between."""
@@ -1531,6 +1582,8 @@ def ensure_fiscal_year(date, company: str):
 	year = get_missing_fiscal_year(date, company)
 	if not year:
 		return
+	if red := get_fiscal_year_red(company, date):
+		frappe.throw(red["text"], title=_("Financial year missing"))
 	years = frappe.get_all("Fiscal Year", fields=["year_start_date", "year_end_date"])
 	later = min(
 		(
@@ -1720,6 +1773,8 @@ def get_posting_reds(
 		)
 
 	if not undo:
+		if red := get_fiscal_year_red(company, posting_date, to_date):
+			reds.append(red)
 		for dimension in get_checks_for_pl_and_bs_accounts():
 			if (
 				dimension.company == company

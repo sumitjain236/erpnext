@@ -62,6 +62,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	get_look_alikes,
 	get_missing_default_account,
 	get_missing_fiscal_year,
+	get_new_party_accounts,
 	get_parties,
 	get_party_accounts,
 	get_posted_names,
@@ -251,6 +252,7 @@ class CompanySetup(Document):
 					"tab": step.get("tab"),
 					"required": step.get("required"),
 					"needed": is_needed(step, statuses[key]),
+					"status": statuses[key],
 				}
 				for key, step in steps.items()
 			},
@@ -301,6 +303,8 @@ class CompanySetup(Document):
 		self.set_onload("asset_match", assets.get_asset_match(self))
 		self.set_onload("stock_like_lines", get_stock_like_lines(self))
 		self.set_onload("serial_batch_off", stock.is_serial_batch_off())
+		# the batch and serial question is asked before the first items import only
+		self.set_onload("has_items", bool(stock.get_items_status(self).item_count))
 		self.set_onload(
 			"stats",
 			{
@@ -965,8 +969,8 @@ class CompanySetup(Document):
 		"""Replace the draft opening invoices with these rows. Posted ones stay as they are. A row that
 		is one of them again is left out (skipped), and so is a row repeating one above it with the same
 		invoice number (repeated). Rows without a source of their own get this one. A row's ledger is the
-		one picked on it by hand (account_by_hand), else its customer's or supplier's own, else post_to,
-		the ledger picked for the whole sheet."""
+		one picked on it by hand (account_by_hand), else its customer's or supplier's own or its group's,
+		else post_to, the ledger picked for the whole sheet."""
 		self.check_permission("write")
 		self.start_change()
 		table = get_table(party_type)
@@ -1021,10 +1025,12 @@ class CompanySetup(Document):
 				},
 			)
 		drafts = [row for row in self.get(table) if row.status != "Created" and not row.account_by_hand]
-		own = get_party_accounts(party_type, [row.party for row in drafts], self.company)[1]
+		own = get_party_accounts(party_type, [row.party for row in drafts], self.company)[2]
+		new = get_new_party_accounts(party_type, self.company, drafts)
 		for row in drafts:
-			if own.get(row.party) in accounts:
-				row.account = own[row.party]
+			account = own.get(row.party) or new.get(row.party_name)
+			if account in accounts:
+				row.account = account
 			elif post_to:
 				row.account = post_to
 		self.save()
@@ -1044,6 +1050,7 @@ class CompanySetup(Document):
 			"skipped": left_out.skipped,
 			"repeated": left_out.repeated,
 			"unused_columns": sheet.unused_columns,
+			"bad_dates": sheet.bad_dates,
 			"unknown_ledgers": unknown_ledgers,
 			"post_to": post_to,
 		}
@@ -1108,12 +1115,25 @@ class CompanySetup(Document):
 			}
 			if len(accounts) > 1
 			else {},
-			# a ledger saved on the customer or supplier itself, which "Post to" doesn't change
+			# a ledger saved on the customer or supplier or its group, which "Post to" doesn't change
 			"own_accounts": {
 				party: account
 				for party, account in get_party_accounts(
 					party_type, (drafts | set(found.values())) - {None}, self.company
-				)[1].items()
+				)[2].items()
+				if account in accounts
+			}
+			if len(accounts) > 1
+			else {},
+			# the ledger saved on each group, for names confirmed as new
+			"group_accounts": {
+				group: account
+				for group, account in frappe.get_all(
+					"Party Account",
+					filters={"parenttype": f"{party_type} Group", "company": self.company},
+					fields=["parent", "account"],
+					as_list=True,
+				)
 				if account in accounts
 			}
 			if len(accounts) > 1
@@ -2020,8 +2040,8 @@ class CompanySetup(Document):
 				),
 				title=_("Not explained yet"),
 			)
-		if self.migration_date:
-			# work from the migration date on goes in these years
+		# work from the migration date on goes in these years; going live never waits for them
+		if self.migration_date and frappe.has_permission("Fiscal Year", "create"):
 			ensure_fiscal_year(self.migration_date, self.company)
 			ensure_fiscal_year(max(getdate(), getdate(self.migration_date)), self.company)
 		self.status = "Live"
@@ -2557,6 +2577,7 @@ TAX_WORDS = {"tds", "tcs", "gst", "cgst", "sgst", "igst", "utgst", "cess", "vat"
 FILLER_WORDS = {"and", "a", "c", "ac", "the", "of", "account", "accounts"}
 # words many names share, so they don't make two names alike
 COMMON_WORDS = {"expense", "charge", "fee", "cost", "other", "misc", "miscellaneous", "general"}
+COMMON_KEYS = set(get_singular_key(" ".join(f"{word} {word}s" for word in COMMON_WORDS)).split())
 
 
 def get_sheet_root_type(groups: list[str]) -> str | None:
@@ -2614,8 +2635,7 @@ def suggest_account(
 		theirs = get_account_words(account.account_name)
 		if theirs == words:
 			found.append(account.name)
-		common = set(get_singular_key(" ".join(f"{word} {word}s" for word in COMMON_WORDS)).split())
-		mine, others = words - common, theirs - common
+		mine, others = words - COMMON_KEYS, theirs - COMMON_KEYS
 		shared = len(mine & others) if mine and others and (mine <= others or others <= mine) else 0
 		if root_types and shared and shared >= most:
 			closest = [*closest, account.name] if shared == most else [account.name]
@@ -2694,12 +2714,19 @@ ACCOUNT_PARENT_WORDS = {
 
 @frappe.whitelist()
 def get_account_parent(
-	company: str, account_type: str | None = None, root_type: str | None = None
+	company: str,
+	account_type: str | None = None,
+	root_type: str | None = None,
+	account_name: str | None = None,
 ) -> str | None:
 	"""The group a new ledger of this type goes under, on its side (root type): the group of that type,
 	like Bank Accounts, or one named for it, like Fixed Assets or Duties and Taxes; else Current
-	Assets or Current Liabilities and the like; else the top-level group."""
+	Assets or Current Liabilities and the like; else the top-level group. With no side, the side is
+	read from the account name, like "Staff Welfare Expenses"; None when that says none either."""
 	frappe.has_permission("Company Setup", "read", company, throw=True)
+	root_type = root_type or (account_name and get_sheet_root_type([account_name]))
+	if account_name is not None and not root_type and not account_type:
+		return None
 	accounts = frappe.get_all(
 		"Account",
 		filters={"company": company, "is_group": 1, "disabled": 0},

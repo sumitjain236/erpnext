@@ -21,6 +21,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	TABLES,
 	UNDONE_TABLES,
 	get_error_text,
+	get_hand_posted,
 	parties_enabled,
 	post_invoices,
 )
@@ -284,12 +285,31 @@ def get_posted_account(doctype: str, name: str, party: str, party_type: str) -> 
 def create_invoices_in_background(
 	company: str, party_type: str, keep_old_dates: bool = False, disabled_parties: list[str] | None = None
 ):
-	run_posting_job(
-		"company_setup_invoices",
-		company,
-		lambda onboarding: post_invoices(onboarding, party_type, keep_old_dates, True, disabled_parties),
-		party_type=party_type,
-	)
+	try:
+		run_posting_job(
+			"company_setup_invoices",
+			company,
+			lambda onboarding: post_invoices(onboarding, party_type, keep_old_dates, True, disabled_parties),
+			party_type=party_type,
+		)
+	except Exception as e:
+		mark_drafts_failed(company, party_type, get_error_text(e))
+		raise
+
+
+def mark_drafts_failed(company: str, party_type: str, error: str):
+	"""After a posting that failed as a whole and was rolled back: its drafts keep why, so the card
+	still says so after a reload."""
+	onboarding = frappe.get_doc("Company Setup", company)
+	hand_posted = {row.name for row in get_hand_posted(onboarding, party_type)}
+	for row in onboarding.get(TABLES[party_type]):
+		if row.status != "Created" and row.name not in hand_posted:
+			row.update({"status": "Failed", "error": error})
+	onboarding.flags.posting = True
+	onboarding.save()
+	# a test runs the job inline: a commit would keep its data
+	if not frappe.in_test:
+		frappe.db.commit()
 
 
 def undo_invoices_in_background(

@@ -262,6 +262,78 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 			[c for c in self.doc.get_account_clashes("Customer") if c["kind"] in ("posted", "split")]
 		)
 
+	def test_post_to_fills_only_rows_without_a_ledger_of_their_own(self):
+		_default, related = self.add_receivable_account("Debtors - Related Parties")
+		_default, retainers = self.add_receivable_account("Debtors - Retainers")
+		frappe.set_user("Administrator")
+		group = frappe.get_doc(
+			{
+				"doctype": "Customer Group",
+				"customer_group_name": "Onboarding Related Parties",
+				"parent_customer_group": "All Customer Groups",
+				"accounts": [{"company": self.company, "account": related}],
+			}
+		).insert()
+		frappe.set_user("onboarding.accounts@example.com")
+		sister = base.make_customer("Onboarding Sister Co")
+		frappe.db.set_value("Customer", sister, "customer_group", group.name)
+		rows = [
+			{"party_name": sister, "invoice_number": "OB-G-1", "outstanding_amount": 100},
+			{
+				"party_name": self.customer.customer_name,
+				"invoice_number": "OB-G-2",
+				"outstanding_amount": 200,
+			},
+			# a new name confirmed into the group gets the group's ledger
+			{
+				"party_name": "Onboarding Sister Two",
+				"invoice_number": "OB-G-3",
+				"outstanding_amount": 300,
+				"create_party": 1,
+				"party_group": group.name,
+			},
+		]
+		self.doc.save_opening_invoices("Customer", rows, post_to=retainers)
+		self.assertEqual(
+			[row.account for row in self.doc.opening_sales_invoices], [related, retainers, related]
+		)
+		# the window's Post to keeps it too
+		self.assertEqual(self.doc.get_invoice_names("Customer")["own_accounts"], {sister: related})
+
+	def test_a_sundry_debtors_title_names_no_ledger(self):
+		from erpnext.setup.doctype.company_setup.opening_invoices import get_title_account
+
+		self.add_receivable_account("Debtors - Retainers")
+		self.assertIsNone(
+			get_title_account(self.company, "Customer", ["Outstanding Analysis (Bill-wise) - Sundry Debtors"])
+		)
+
+	def test_an_accounts_manager_is_asked_for_a_missing_year_before_posting(self):
+		# test sites have years up to 2050 only
+		self.doc.migration_date = "2081-04-01"
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{
+					"party_name": self.customer.customer_name,
+					"invoice_number": "OB-FY-1",
+					"outstanding_amount": 100,
+				}
+			],
+		)
+		self.doc.run_method("onload")
+		self.assertIn(
+			{
+				"text": "Ask a System Manager to add the financial year 2081 first.",
+				"fix": {"label": "New Fiscal Year", "doctype": "Fiscal Year", "name": "new"},
+			},
+			self.doc.get_onload().posting_reds["Customer"],
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError, "Ask a System Manager", self.doc.create_opening_invoices, "Customer"
+		)
+		self.assertFalse(frappe.db.exists("Sales Invoice", "OB-FY-1"))
+
 	def test_a_draft_posted_by_hand_is_flagged_counted_once_and_removed_on_request(self):
 		from erpnext.setup.doctype.company_setup.opening_invoices import get_sheet_match
 

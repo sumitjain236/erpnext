@@ -74,7 +74,7 @@ ROWS_PER_ENTRY = 100
 OPENING_TIME = "00:00:00"
 CORRECTION_TIME = "23:59:59"
 KINDS = ("Our warehouse", "Job worker", "Work in progress")
-WORK_IN_PROGRESS = re.compile(r"\b(work in (progress|process)|wip)\b")
+WORK_IN_PROGRESS = re.compile(r"(?<!capital )\b(work in (progress|process)|wip)\b")
 JOB_WORKER = re.compile(r"\b(job ?work(s|ers?)?|with processors?)\b")
 DIFFERENCE_ACCOUNT = "Opening Stock Difference"
 # a gap over this share of its line is more likely a warehouse not uploaded than a count difference
@@ -169,12 +169,14 @@ def get_opening_datetime(onboarding):
 
 
 def get_company_items(company: str) -> list[frappe._dict]:
-	"""The company's enabled stock items: those with an Item Default for it, or every one on a site
-	with one company."""
-	filters = {"is_stock_item": 1, "disabled": 0}
+	"""The company's enabled items, stock items and services: those with an Item Default for it, or
+	every one on a site with one company."""
+	filters = {"disabled": 0}
 	if frappe.db.count("Company") > 1:
 		filters["name"] = ("in", frappe.get_all("Item Default", {"company": company}, pluck="parent") or [""])
-	return frappe.get_all("Item", filters=filters, fields=["name", "item_group", "stock_uom"])
+	return frappe.get_all(
+		"Item", filters=filters, fields=["name", "item_group", "stock_uom", "is_stock_item"]
+	)
 
 
 def get_item_index(rows: list | None = None) -> frappe._dict:
@@ -267,6 +269,7 @@ def read_items_status(onboarding) -> frappe._dict:
 	missing = {get_exact_key(row.item_name) for row in drafts if not match_item(index, row)[0]}
 	return frappe._dict(
 		item_count=len(items),
+		services=sum(1 for item in items if not item.is_stock_item),
 		item_groups=len({item.item_group for item in items}),
 		units=len({item.stock_uom for item in items}),
 		missing=len(missing),

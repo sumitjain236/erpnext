@@ -74,6 +74,8 @@ function make_page(frm, fieldname) {
 
 function get_steps(frm) {
 	const details = frm.doc.__onload?.steps || {};
+	// the saved status waits for check_steps; the one worked out on load is the current one
+	const status = (row) => details[row.step_key]?.status || row.status;
 	return (frm.doc.steps || []).map((row) => ({
 		key: row.step_key,
 		name: row.step_key.split(".").pop(),
@@ -85,8 +87,8 @@ function get_steps(frm) {
 		is_started: details[row.step_key]?.started,
 		is_required: details[row.step_key]?.required,
 		is_needed: details[row.step_key]?.needed ?? true,
-		is_complete: row.status === "Done",
-		is_skipped: row.status === "Skipped",
+		is_complete: status(row) === "Done",
+		is_skipped: status(row) === "Skipped",
 	}));
 }
 
@@ -627,6 +629,12 @@ const WHERE_TO_FIND = {
 			),
 		],
 		[
+			"Busy",
+			__(
+				"Display › Stock Status › Material Centre-wise, with closing value, then Alt+E (Busy calls a warehouse a Material Centre)"
+			),
+		],
+		[
 			"Zoho Books",
 			__("Reports › Inventory › Inventory Valuation Summary, one warehouse at a time, then Export"),
 		],
@@ -639,6 +647,7 @@ const WHERE_TO_FIND = {
 		],
 	],
 	fixed_assets: [
+		["Busy", __("Display › Final Results › Depreciation Chart, then Alt+E")],
 		["QuickBooks", __("Reports › Fixed Asset List, then Export to Excel")],
 		[
 			"Excel / other",
@@ -1256,7 +1265,7 @@ function show_go_live(frm) {
 					label: __("See your books"),
 					onclick: () => {
 						dialog.hide();
-						show_posting_preview(frm, false);
+						show_posting_preview(frm, false, () => show_go_live(frm));
 					},
 				},
 			],
@@ -1272,6 +1281,7 @@ function show_go_live(frm) {
 			if (!drafts) {
 				return {
 					title: __("{0} is not done.", [step.title]),
+					description: step.summary || undefined,
 					buttons: [{ label: __("Open"), onclick: open(step) }],
 				};
 			}
@@ -1356,11 +1366,29 @@ function show_go_live(frm) {
 				])
 			),
 		reminders.missing_years?.length &&
-			frappe.ui.alert({
-				theme: "blue",
-				title: __("Going live adds the financial year {0}", [reminders.missing_years.join(", ")]),
-				description: __("Your entries from the migration date on go in it."),
-			}),
+			(frappe.model.can_create("Fiscal Year")
+				? frappe.ui.alert({
+						theme: "blue",
+						title: __("Going live adds the financial year {0}", [
+							reminders.missing_years.join(", "),
+						]),
+						description: __("Your entries from the migration date on go in it."),
+				  })
+				: make_alerts([
+						{
+							theme: "yellow",
+							title: __("Ask a System Manager to add the financial year {0}", [
+								reminders.missing_years.join(", "),
+							]),
+							description: __("Your entries from the migration date on go in it."),
+							buttons: [
+								fix_button(
+									{ label: __("New Fiscal Year"), doctype: "Fiscal Year", name: "new" },
+									frm
+								),
+							],
+						},
+				  ])),
 	].filter(Boolean);
 
 	const dialog = new frappe.ui.Dialog({
@@ -2386,9 +2414,7 @@ function make_lines_card(label, lines, caption, info) {
 
 const OPENING_EXCLUDED_TYPES = ["Receivable", "Payable", "Stock", "Temporary"];
 
-// A new account of this company, added as a row of the balances table
-// A new account for a row without one, in a view inside the balances window; the row gets it
-// new_accounts: by row, the ledger to add for it, with its type, as the sheet's suggestions have it
+// A new account, in a view inside the balances window; the row picked gets it
 function add_balance_account(frm, balances_dialog, new_accounts = {}) {
 	const company = frm.doc.company;
 	const currency = erpnext.get_currency(company);
@@ -2467,6 +2493,7 @@ function add_balance_account(frm, balances_dialog, new_accounts = {}) {
 				label: __("Account Name"),
 				reqd: 1,
 				default: row ? name_of(row.original_account) : "",
+				change: () => !row && suggest_parent(),
 			},
 			{
 				fieldname: "account_type",
@@ -2510,9 +2537,10 @@ function add_balance_account(frm, balances_dialog, new_accounts = {}) {
 				company: company,
 				account_type: account_type === "Other" ? null : account_type,
 				root_type: row?.root_type || side,
+				account_name: form.get_value("account_name") || "",
 			})
 			.then((r) => {
-				if (r.message && !picked_parent) form.set_value("parent_account", r.message);
+				if (!picked_parent) form.set_value("parent_account", r.message || "");
 			});
 	};
 	suggest_parent();
@@ -2747,7 +2775,8 @@ function left_out_text(frm, left_out = {}) {
 // Opening entries are dated the day before the migration date, in a year a new site may not have
 function make_fiscal_year_note(frm) {
 	const missing = frm.doc.__onload?.missing_fiscal_year;
-	if (!missing) return null;
+	// without the right to add it, the posting reds ask for it instead
+	if (!missing || !frappe.model.can_create("Fiscal Year")) return null;
 	return frappe.ui.alert({
 		theme: "blue",
 		title: __("The financial year {0} is added when you post", [missing.year]),
@@ -2890,7 +2919,8 @@ function format_time_posted(datetime) {
 }
 
 // The books on the day before the migration date; with can_post, as they will be after posting
-function show_posting_preview(frm, can_post = true) {
+// on_close: called when the window closes, unless it closed to open another step's window
+function show_posting_preview(frm, can_post = true, on_close = null) {
 	get_data(frm, "preview_opening_balances").then((r) => {
 		const preview = r.message;
 		const currency = erpnext.get_currency(frm.doc.company);
@@ -2917,6 +2947,7 @@ function show_posting_preview(frm, can_post = true) {
 		if (year_note)
 			dialog.get_field("preview").$wrapper.append($(`<div class="mb-3"></div>`).append(year_note));
 		if (!can_post) dialog.get_field("preview").$wrapper.append(make_books_checks(frm, dialog));
+		if (on_close) dialog.onhide = () => !dialog.opened_other && on_close();
 		dialog
 			.get_field("preview")
 			.$wrapper.append(make_posting_preview(preview, currency, frm, can_post ? null : dialog));
@@ -2972,6 +3003,7 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 	const open_invoices = {
 		label: party_type === "Supplier" ? __("Open bills") : __("Open invoices"),
 		onclick: () => {
+			if (books_dialog) books_dialog.opened_other = true;
 			books_dialog?.hide();
 			show_tab(frm, party_type === "Customer" ? "selling_tab" : "buying_tab");
 			show_opening_invoices(frm, party_type);
@@ -3992,7 +4024,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	// several receivable or payable accounts: each invoice shows the one it goes to, and can change
 	const accounts = names.accounts || [];
 	const party_accounts = { ...names.party_accounts };
-	// a customer's or supplier's own ledger wins over the sheet's "Post to"
+	// a ledger saved on the customer or supplier, or on its group, wins over the sheet's "Post to"
 	const own_accounts = names.own_accounts || {};
 	const data = get_draft_rows(frm, party_type, names).map((row) => ({
 		...row,
@@ -4065,8 +4097,19 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 						get_query: () => ({ filters: { name: ["in", accounts] } }),
 						filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
 						onchange: function () {
-							// picked on this row only: the sheet's Post to and the customer's own ledger no longer change it
-							if (this.doc) this.doc.account_by_hand = this.doc.account ? 1 : 0;
+							// picked by hand for all of the customer's rows: Post to and its own ledger no longer change them
+							const picked = this.doc;
+							if (!picked) return;
+							const same = (row) =>
+								row === picked ||
+								(picked.party
+									? row.party === picked.party
+									: !!picked.party_name && row.party_name === picked.party_name);
+							for (const row of (dialog.get_value("invoices") || []).filter(same)) {
+								row.account = picked.account;
+								row.account_by_hand = picked.account ? 1 : 0;
+							}
+							grid.refresh();
 							refresh_state();
 						},
 					},
@@ -4279,6 +4322,14 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 				: __("Not read: {0}. Only the name, bill number, dates, amount and account are used.", [
 						result.unused_columns.join(", "),
 				  ])
+		);
+	}
+	if (result?.bad_dates?.length) {
+		grey(
+			__("Dates we could not read, left empty: {0}. Type them in, or those rows are dated {1}.", [
+				result.bad_dates.join(", "),
+				day_before,
+			])
 		);
 	}
 	if (result?.unknown_ledgers?.length) {
@@ -4943,22 +4994,20 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			for (const name of names_grid.get_selected_children()) {
 				const action = get_action(name);
 				if (!action) continue;
-				set_rows_party(
+				const group = group_control.get_value() || null;
+				const rows = set_rows_party(
 					name.name_on_sheet,
 					action === "link"
-						? {
-								party: name.party,
-								create_party: 0,
-								account: own_accounts[name.party] || sheet_account,
-								account_by_hand: 0,
-						  }
-						: {
-								party: null,
-								create_party: 1,
-								party_group: group_control.get_value() || null,
-								account: sheet_account,
-								account_by_hand: 0,
-						  }
+						? { party: name.party, create_party: 0 }
+						: { party: null, create_party: 1, party_group: group }
+				);
+				// a ledger the sheet or the user gave stays
+				const account =
+					action === "link"
+						? own_accounts[name.party]
+						: names.group_accounts?.[group || default_group];
+				rows.filter((row) => !row.account_by_hand).forEach(
+					(row) => (row.account = account || sheet_account)
 				);
 				confirmed.add(name.name_on_sheet);
 				done += 1;
@@ -5199,6 +5248,7 @@ function post_opening_invoices(
 		waiting.length && [__("Stay as drafts"), __("{0} · {1}", [waiting.length, reasons.join("; ")])],
 	].filter(Boolean);
 	const missing_year = frm.doc.__onload?.missing_fiscal_year;
+	const can_add_year = frappe.model.can_create("Fiscal Year");
 	// where the drafts are dated: their own dates where ERPNext has the year, else the day before
 	// migration; invoices in a missing year are the choice above it
 	const dated = (dates) => {
@@ -5223,7 +5273,9 @@ function post_opening_invoices(
 				)
 			),
 			[
-				missing_year && __("The financial year {0} is added when you post.", [missing_year.year]),
+				missing_year &&
+					can_add_year &&
+					__("The financial year {0} is added when you post.", [missing_year.year]),
 				is_customer ? __("Nothing is sent to customers.") : __("Nothing is sent to suppliers."),
 			]
 				.filter(Boolean)
@@ -5232,6 +5284,7 @@ function post_opening_invoices(
 	};
 	const fixes = [];
 	let keep_old_dates = false;
+	let old_years = [];
 	const confirm = new frappe.ui.Dialog({
 		title: is_customer ? __("Post opening invoices?") : __("Post opening bills?"),
 		fields: [{ fieldname: "summary", fieldtype: "HTML" }],
@@ -5288,6 +5341,7 @@ function post_opening_invoices(
 			.appendTo($summary);
 	}
 	const $ledgers = $(`<div></div>`).prependTo($summary);
+	const $years = $(`<div></div>`).prependTo($summary);
 	const $clashes = $(`<div class="flex flex-col gap-3"></div>`).appendTo($summary);
 	const $note = $(`<div></div>`).appendTo($summary);
 	// a ledger these would put above its trial balance line while another is short: not posted
@@ -5321,7 +5375,23 @@ function post_opening_invoices(
 				  ).addClass("mb-3")
 				: []
 		);
-		confirm.get_primary_btn().prop("disabled", !!overs.length);
+		// a missing year this user can't add stops the post
+		const years = can_add_year
+			? []
+			: [...new Set([missing_year?.year, ...(keep_old_dates ? old_years : [])].filter(Boolean))];
+		$years.empty().append(
+			years.length
+				? make_posting_reds(frm, [
+						{
+							text: __("Ask a System Manager to add the financial year {0} first.", [
+								years.join(", "),
+							]),
+							fix: { label: __("New Fiscal Year"), doctype: "Fiscal Year", name: "new" },
+						},
+				  ])
+				: []
+		);
+		confirm.get_primary_btn().prop("disabled", !!overs.length || !!years.length);
 	};
 	confirm.get_field("summary").$wrapper.append($summary);
 	Promise.all([
@@ -5331,9 +5401,11 @@ function post_opening_invoices(
 		$note.append(dated(dates.message));
 		if (dates.message.no_year) {
 			keep_old_dates = true;
+			old_years = dates.message.missing_years;
 			$note.before(
 				make_old_dates_choice(dates.message, party_type, currency, day_before, (keep) => {
 					keep_old_dates = keep;
+					check_ledgers();
 				})
 			);
 		}
@@ -5853,7 +5925,7 @@ function import_buttons(frm, doctype, step) {
 }
 
 // items with batch or serial numbers import only once Stock Settings tracks them: asked before
-// the import opens, while they are off
+// the first items import opens, while they are off
 function ask_serial_and_batch(frm) {
 	return new Promise((resolve) => {
 		const dialog = new frappe.ui.Dialog({
@@ -5891,7 +5963,7 @@ const TITLED_IMPORTS = ["Customer", "Supplier", "Item"];
 
 function open_party_import(frm, doctype, after = null, asked = false) {
 	if (!frappe.model.can_create("Data Import")) return;
-	if (doctype === "Item" && !asked && frm.doc.__onload?.serial_batch_off) {
+	if (doctype === "Item" && !asked && frm.doc.__onload?.serial_batch_off && !frm.doc.__onload?.has_items) {
 		return ask_serial_and_batch(frm).then(() => open_party_import(frm, doctype, after, true));
 	}
 	const open = (data_import) =>
@@ -6667,10 +6739,15 @@ function make_books_checks(frm, dialog) {
 		const lines_match = bank.matched === bank.total;
 		// the lines match, but a statement balance doesn't: a yellow, as on the Bank accounts card
 		const statement_off = lines_match ? bank.statement_off || [] : [];
-		const matches = lines_match && !statement_off.length;
+		// as Go live says: the lines match, but the Bank accounts step is not done
+		const step = get_steps(frm).find((step) => step.name === "bank_accounts");
+		const step_open = lines_match && !statement_off.length && step && !step.is_complete;
+		const matches = lines_match && !statement_off.length && !step_open;
 		rows.push({
 			title: __("Bank"),
-			line: statement_off.length
+			line: step_open
+				? step.summary || __("Bank accounts is not done")
+				: statement_off.length
 				? statement_off.length === 1
 					? __("{0} of {1} off by {2} from its statement", [
 							1,
@@ -6685,6 +6762,8 @@ function make_books_checks(frm, dialog) {
 				: __("{0} of {1} accounts match their lines", [bank.matched, bank.total]),
 			badge: matches
 				? { label: __("Matches"), theme: "green" }
+				: step_open
+				? { label: __("Not done"), theme: "amber" }
 				: {
 						label: __("{0} off", [statement_off.length || bank.total - bank.matched]),
 						theme: "amber",
@@ -6796,6 +6875,7 @@ function make_books_checks(frm, dialog) {
 						)
 					)
 					.on("click", () => {
+						dialog.opened_other = true;
 						dialog.hide();
 						row.open();
 					});
@@ -8734,9 +8814,11 @@ function setup_dialog_grid(grid, on_delete) {
 	};
 }
 
-// a qty typed keeps the row's rate: the value follows
+// a qty or rate typed keeps the row's rate: the value follows
 function set_rate_on_amount() {
-	if (flt(this.doc.qty)) this.doc.rate = flt(this.doc.amount) / flt(this.doc.qty);
+	if (!flt(this.doc.qty)) return;
+	this.doc.rate = flt(this.doc.amount) / flt(this.doc.qty);
+	this.grid_row?.refresh_field("rate");
 }
 
 function keep_rate_on_qty() {
@@ -9009,7 +9091,7 @@ class OpeningStockWindow extends SheetWindow {
 				list_column("qty", "Float", __("Qty"), 1, { onchange: keep_rate_on_qty }),
 				list_column("uom", "Data", __("Unit"), 1),
 				// the rate shows a typo in qty or value at a glance
-				list_column("rate", "Currency", __("Rate"), 1),
+				list_column("rate", "Currency", __("Rate"), 1, { onchange: keep_rate_on_qty }),
 				list_column("amount", "Currency", __("Value"), job_work ? 1 : 2, {
 					onchange: set_rate_on_amount,
 				}),
@@ -10428,11 +10510,15 @@ function show_job_work_bom(frm, item_code, after) {
 					data: data.materials.map((row) => ({
 						...row,
 						__checked: row.held ? 1 : 0,
+						material:
+							row.item_name && row.item_name !== row.item_code
+								? `${row.item_code}: ${row.item_name}`
+								: row.item_code,
 						note: row.held ? "" : __("added by you"),
 					})),
 					fields: [
 						{
-							fieldname: "item_name",
+							fieldname: "material",
 							fieldtype: "Data",
 							label: __("Material"),
 							in_list_view: 1,
@@ -10480,6 +10566,7 @@ function show_job_work_bom(frm, item_code, after) {
 					fieldtype: "Float",
 					label: __("Finished goods per service unit"),
 					reqd: 1,
+					non_negative: 1,
 					default: data.finished_good_qty,
 				},
 			],
@@ -10554,8 +10641,15 @@ class OpenOrdersWindow extends SheetWindow {
 			warehouse("warehouse", order_type === "Sales Order" ? __("Deliver from") : __("Receive into"), 1),
 			{ fieldname: "order_date", fieldtype: "Date", label: __("Order date") },
 		];
+		const where = {
+			"Sales Order": "open_orders",
+			"Purchase Order": "open_orders",
+			"Subcontracting Order": "job_work_orders",
+		}[order_type];
 		super(frm, {
 			title: text.title,
+			where: where,
+			has_data: order_rows(frm, order_type, false).length,
 			open: (result) => show_open_orders(frm, order_type, result),
 			save_method: "save_open_orders",
 			get_method: "get_open_orders",
@@ -10667,6 +10761,7 @@ class OpenOrdersWindow extends SheetWindow {
 			description: names_of(item.key, item.rows),
 			buttons: [
 				...(actions[item.key] || []),
+				...(item.fix ? [fix_button(item.fix, frm)] : []),
 				...(item.key === "no_service_item"
 					? [
 							go(__("Add Subcontracting BOM"), () =>
@@ -11443,6 +11538,7 @@ class FixedAssetsWindow extends SheetWindow {
 					],
 				]),
 				checks.year_missing &&
+					frappe.model.can_create("Fiscal Year") &&
 					grey_line(
 						__("The financial year starting {0} is added when you post.", [
 							frappe.datetime.str_to_user(checks.year_start),

@@ -32,6 +32,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	find_party,
 	get_cached,
 	get_day_before,
+	get_fiscal_year_red,
 	get_parties,
 	get_sheet_date,
 	get_similar_key,
@@ -41,7 +42,9 @@ from erpnext.setup.doctype.company_setup.opening_stock import (
 	get_unit_factors,
 	get_unit_key,
 	get_uom_index,
+	get_warehouse_index,
 	match_item,
+	match_warehouse,
 )
 from erpnext.setup.doctype.company_setup.posted_entries import (
 	cancel_doc,
@@ -110,7 +113,16 @@ ORDER_COLUMNS = {
 	),
 	"uom": ("unit", "uom", "usage_unit"),
 	"rate": ("rate", "price", "item_price"),
-	"order_date": ("order_date", "salesorder_date", "sales_order_date", "purchase_order_date", "date"),
+	"order_date": (
+		"order_date",
+		"salesorder_date",
+		"sales_order_date",
+		"purchase_order_date",
+		"so_date",
+		"po_date",
+		"voucher_date",
+		"date",
+	),
 	"delivery_date": (
 		"delivery_date",
 		"due_date",
@@ -119,6 +131,11 @@ ORDER_COLUMNS = {
 		"required_by",
 		"expected_shipment_date",
 		"expected_delivery_date",
+		"expected_receipt_date",
+		"expected_date",
+		"required_date",
+		"required_by_date",
+		"reqd_by_date",
 	),
 	"bom": ("bom", "bom_no"),
 	"wip_warehouse": ("wip_warehouse",),
@@ -225,6 +242,11 @@ def save_open_orders(
 	made = {get_order_key(row) for row in onboarding.open_orders if row.order_type == order_type}
 	undone = {get_order_key(row): row for row in onboarding.undone_orders if row.order_type == order_type}
 	skipped = 0
+	warehouses = get_warehouse_index(onboarding)
+
+	def find_warehouse(name):
+		return name and match_warehouse(warehouses, frappe._dict(warehouse=name, warehouse_name=name))
+
 	for row in rows:
 		row = frappe._dict(row)
 		if not cstr(row.item_name or row.item_code).strip():
@@ -243,6 +265,8 @@ def save_open_orders(
 				"party_name": " ".join(cstr(row.party_name).split()) or None,
 				"qty": flt(row.qty),
 				"rate": flt(row.rate),
+				"warehouse": find_warehouse(row.warehouse or before.get("warehouse")),
+				"wip_warehouse": find_warehouse(row.wip_warehouse or before.get("wip_warehouse")),
 				"source": row.source or source,
 				"status": "Draft",
 			},
@@ -454,6 +478,8 @@ def get_order_checks(onboarding, order_type: str, prepared: list | None = None) 
 	prepared = prepare_orders(onboarding, order_type) if prepared is None else prepared
 	made = [row for row in onboarding.open_orders if row.order_type == order_type and row.status == "Made"]
 	reds = get_reds(order_type, prepared)
+	if year_red := get_fiscal_year_red(onboarding.company, get_day_before(onboarding)):
+		reds.insert(0, {"key": "fiscal_year", "rows": [], "items": [], **year_red})
 	blocker = reds[0]["text"] if reds else None
 	if not prepared:
 		blocker = _("Upload a sheet or add rows to make orders.")
@@ -969,7 +995,14 @@ def read_orders_status(onboarding, order_type: str) -> frappe._dict:
 
 def get_boms_status(company: str) -> frappe._dict:
 	"""BOMs of the company, and the items it makes that have none."""
-	boms = frappe.db.count("BOM", {"company": company, "docstatus": 1, "is_active": 1})
+	job_work_boms = set(frappe.get_all("Subcontracting BOM", pluck="finished_good_bom"))
+	boms = sum(
+		1
+		for bom in frappe.get_all(
+			"BOM", {"company": company, "docstatus": 1, "is_active": 1}, ["name", "is_default"]
+		)
+		if bom.is_default or bom.name not in job_work_boms
+	)
 	if not boms:
 		# items are shared by every company, so one with no BOMs is not told about another's items
 		return frappe._dict(boms=0, without_bom=[])
@@ -1034,29 +1067,37 @@ def get_job_work_bom(onboarding, item_code: str) -> dict:
 def set_job_work_bom(
 	onboarding, item_code: str, materials: list[str], service_item: str, finished_good_qty: float
 ) -> dict:
-	"""Submit a copy of the item's default BOM with only these materials, and point the item's
-	active Subcontracting BOM at it. Returns the BOM and whether the job worker still lacks material."""
+	"""Point the item's active Subcontracting BOM at a copy of its default BOM with only these
+	materials, made only when its current BOM has other materials. Returns the BOM and whether the
+	job worker still lacks material."""
+	if flt(finished_good_qty) <= 0:
+		frappe.throw(
+			_("Finished goods per service unit must be more than 0."), title=_("Wrong finished goods")
+		)
 	default_bom = get_default_bom(item_code)
 	if not default_bom:
 		frappe.throw(_("Item {0} has no default BOM.").format(item_code), title=_("No BOM"))
-	bom = frappe.copy_doc(frappe.get_doc("BOM", default_bom))
-	bom.items = [line for line in bom.items if line.item_code in set(materials)]
-	if not bom.items:
-		frappe.throw(_("Tick at least one material."), title=_("No materials"))
-	for idx, line in enumerate(bom.items, 1):
-		line.idx = idx
-	bom.is_default = 0
-	bom.insert()
-	bom.submit()
 	name = frappe.db.get_value("Subcontracting BOM", {"finished_good": item_code, "is_active": 1})
 	subcontracting_bom = (
 		frappe.get_doc("Subcontracting BOM", name) if name else frappe.new_doc("Subcontracting BOM")
 	)
+	bom_name = subcontracting_bom.finished_good_bom
+	if not bom_name or set(get_bom_materials(bom_name)) != set(materials):
+		bom = frappe.copy_doc(frappe.get_doc("BOM", default_bom))
+		bom.items = [line for line in bom.items if line.item_code in set(materials)]
+		if not bom.items:
+			frappe.throw(_("Tick at least one material."), title=_("No materials"))
+		for idx, line in enumerate(bom.items, 1):
+			line.idx = idx
+		bom.is_default = 0
+		bom.insert()
+		bom.submit()
+		bom_name = bom.name
 	subcontracting_bom.update(
 		{
 			"finished_good": item_code,
-			"finished_good_bom": bom.name,
-			"finished_good_qty": flt(finished_good_qty) or 1,
+			"finished_good_bom": bom_name,
+			"finished_good_qty": flt(finished_good_qty),
 			"finished_good_uom": frappe.get_cached_value("Item", item_code, "stock_uom"),
 			"service_item": service_item,
 			"service_item_qty": 1,
@@ -1069,4 +1110,8 @@ def set_job_work_bom(
 		for row in prepare_orders(onboarding, "Subcontracting Order")
 		if row.item_code == item_code
 	)
-	return {"bom": bom.name, "short": short}
+	return {"bom": bom_name, "short": short}
+
+
+def get_bom_materials(bom: str) -> list[str]:
+	return frappe.get_all("BOM Item", {"parent": bom, "parenttype": "BOM"}, pluck="item_code")

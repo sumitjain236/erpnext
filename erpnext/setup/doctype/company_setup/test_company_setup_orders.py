@@ -272,6 +272,18 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			[("SO-01180", self.customer, 15, "Nos", 1085.6)],
 		)
 
+		purchase = base.make_file(
+			"purchase_orders.csv",
+			[
+				"PO No,Supplier,Item,Qty,PO Date,Expected Date",
+				f"PO-7,Velan,{self.fabric},5,2026-03-02,2026-04-20",
+			],
+		)
+		self.assertEqual(
+			[(r["order_date"], r["delivery_date"]) for r in read_order_sheet(purchase)],
+			[("2026-03-02", "2026-04-20")],
+		)
+
 	def test_an_upload_replaces_only_the_drafts_of_its_order_numbers(self):
 		row = {"party_name": self.customer, "item_name": self.fabric, "qty": 3, "rate": 100}
 		self.doc.save_open_orders(
@@ -489,6 +501,17 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			),
 			result["bom"],
 		)
+		# saved again with the same materials: the same BOM, no new copy
+		again = self.doc.set_job_work_bom(self.dyed, [self.fabric], "_Test Setup Dyeing", 2)
+		self.assertEqual(again["bom"], result["bom"])
+		self.assertRaises(
+			frappe.ValidationError,
+			self.doc.set_job_work_bom,
+			self.dyed,
+			[self.fabric],
+			"_Test Setup Dyeing",
+			-1,
+		)
 
 	def save_job_work(self):
 		"""A draft subcontracting order of 12 dyed at Velan, rate 85, its fabric at Velan, and a
@@ -617,6 +640,11 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			{row.item_name: row.warehouse for row in self.doc.open_orders},
 			{self.fabric: finished, self.yarn: stores},
 		)
+		self.doc.save_open_orders(
+			"Sales Order",
+			[{"party_name": self.customer, "item_name": self.fabric, "qty": 1, "warehouse": "Stores"}],
+		)
+		self.assertEqual(self.doc.open_orders[-1].warehouse, stores)
 
 
 class TestTaxTemplates(ERPNextTestSuite):

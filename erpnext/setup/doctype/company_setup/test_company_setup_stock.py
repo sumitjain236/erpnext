@@ -213,9 +213,21 @@ class TestOpeningStockCases(ERPNextTestSuite):
 			"Asset",
 			parent=frappe.db.get_value("Account", self.stock_in_hand, "parent_account"),
 		)
+		# capital work in progress is a fixed asset, not stock
+		cwip = add_account(
+			self.company,
+			"Capital Work in Progress",
+			"",
+			"Asset",
+			parent=frappe.db.get_value("Account", self.stock_in_hand, "parent_account"),
+		)
 		capital = get_account(self.company, root_type="Equity", account_type=("!=", "Temporary"))
 		self.doc.save_opening_balances(
-			[{"account": wip, "debit": 1000}, {"account": capital, "credit": 1000}]
+			[
+				{"account": wip, "debit": 1000},
+				{"account": cwip, "debit": 500},
+				{"account": capital, "credit": 1500},
+			]
 		)
 		# keeping it as a balance is remembered, so the question is not asked again
 		self.doc.run_method("onload")

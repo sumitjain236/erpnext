@@ -63,6 +63,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	get_default_dimensions,
 	get_error_text,
 	get_exact_key,
+	get_fiscal_year_red,
 	get_missing_fiscal_year,
 	get_posting_blocker,
 	get_posting_fix,
@@ -1090,13 +1091,17 @@ def get_asset_checks(onboarding) -> dict:
 	new_items = [row for row in categories if not get_category_item(row.asset_category)]
 	hsn_label = get_hsn_label()
 	unanswered = plan.mid_year and not onboarding.depreciation_booked
+	year_red = get_fiscal_year_red(onboarding.company, onboarding.migration_date)
+	untyped = get_untyped_accounts(onboarding, drafts)
 	reds = frappe._dict(
-		posting=get_posting_blocker(onboarding.company, net_value_date, opening=False)
+		posting=year_red["text"]
+		if year_red
+		else get_posting_blocker(onboarding.company, net_value_date, opening=False)
 		if any(net_value.values()) or plan.hand.amount
 		else None,
 		permission=get_permission_blocker(categories),
 		no_account=[row.idx for row in drafts if not row.asset_account],
-		untyped=sorted(get_untyped_accounts(onboarding, drafts)),
+		untyped=sorted(untyped),
 		wrong_type=get_wrong_type_accounts(drafts, categories, net_value),
 		categories=[
 			asset.row.idx
@@ -1210,7 +1215,9 @@ def get_asset_checks(onboarding) -> dict:
 		"monthly": plan.monthly,
 		"year_missing": plan.year.missing,
 		"reds": get_asset_reds(reds, len(drafts), hand, hsn_label),
-		"posting_fix": reds.posting and get_posting_fix(onboarding.company, net_value_date, opening=False),
+		"posting_fix": year_red["fix"]
+		if year_red
+		else reds.posting and get_posting_fix(onboarding.company, net_value_date, opening=False),
 		"yellows": yellows,
 		"greys": greys,
 		"net_value": net_value,
@@ -1231,7 +1238,7 @@ def get_asset_checks(onboarding) -> dict:
 		"auto_depreciation": cint(
 			frappe.db.get_single_value("Accounts Settings", "book_asset_depreciation_entry_automatically")
 		),
-		"untyped_types": get_untyped_accounts(onboarding, drafts),
+		"untyped_types": untyped,
 		"off": get_category_off(onboarding, drafts, net_value, plan),
 		"depreciation_off": get_depreciation_off(onboarding, categories, net_value, plan),
 	}

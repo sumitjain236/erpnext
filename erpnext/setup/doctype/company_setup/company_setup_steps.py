@@ -201,13 +201,20 @@ def opening_balances(onboarding) -> dict:
 		)
 		drafts = sum(1 for row in rows if row.status != "Posted")
 		unpicked = sum(1 for row in rows if row.status != "Posted" and not row.account)
-		summary = (
-			_("{0} ready to post · difference {1}").format(
+		covered = get_posted_cover(onboarding) if difference else 0
+		left = flt(difference + covered, money_precision())
+		if not difference:
+			summary = _("{0} ready to post · balanced").format(number(drafts))
+		elif covered and abs(left) < 1:
+			summary = _("{0} ready to post · covered by what is posted").format(number(drafts))
+		elif covered:
+			summary = _("{0} ready to post · {1} not covered yet").format(
+				number(drafts), fmt_money(abs(left), currency=currency)
+			)
+		else:
+			summary = _("{0} ready to post · difference {1}").format(
 				number(drafts), fmt_money(abs(difference), currency=currency)
 			)
-			if difference
-			else _("{0} ready to post · balanced").format(number(drafts))
-		)
 		if unpicked:
 			summary = _("{0} in draft · {1} need an account").format(number(drafts), number(unpicked))
 	else:
@@ -476,9 +483,14 @@ def items(onboarding) -> dict:
 			count_text(status.item_count, _("1 item"), _("{0} items")), number(status.missing)
 		)
 	elif status.item_count:
+		stock_items = status.item_count - status.services
 		summary = " · ".join(
 			[
-				count_text(status.item_count, _("1 item"), _("{0} items")),
+				count_text(stock_items, _("1 stock item"), _("{0} stock items"))
+				+ " · "
+				+ count_text(status.services, _("1 service"), _("{0} services"))
+				if status.services
+				else count_text(status.item_count, _("1 item"), _("{0} items")),
 				count_text(status.item_groups, _("1 item group"), _("{0} item groups")),
 				count_text(status.units, _("1 unit"), _("{0} units")),
 			]
@@ -583,6 +595,20 @@ def opening_stock(onboarding) -> dict:
 		"tab": "stock_tab",
 		"required": needs_stock(onboarding),
 	}
+
+
+def get_posted_cover(onboarding) -> float:
+	"""What the customer invoices, supplier bills and, with a stock line, the stock posted add up to:
+	the opening balances' difference waits for it, as the Opening balances window says."""
+	covered = sum(
+		flt(row.outstanding_amount) for row in onboarding.opening_sales_invoices if row.status == "Created"
+	) - sum(
+		flt(row.outstanding_amount) for row in onboarding.opening_purchase_invoices if row.status == "Created"
+	)
+	if flt(onboarding.sheet_stock):
+		stock = get_stock_match(onboarding) or {}
+		covered += flt(stock.get("books")) + flt(stock.get("difference_posted"))
+	return covered
 
 
 def before_trial_balance() -> str:
