@@ -1231,6 +1231,7 @@ def get_asset_checks(onboarding) -> dict:
 		"auto_depreciation": cint(
 			frappe.db.get_single_value("Accounts Settings", "book_asset_depreciation_entry_automatically")
 		),
+		"untyped_types": get_untyped_accounts(onboarding, drafts),
 		"off": get_category_off(onboarding, drafts, net_value, plan),
 		"depreciation_off": get_depreciation_off(onboarding, categories, net_value, plan),
 	}

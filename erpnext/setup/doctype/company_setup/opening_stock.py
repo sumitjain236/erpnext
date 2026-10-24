@@ -1225,15 +1225,15 @@ def get_stock_reds(checks: dict) -> list[dict]:
 		line_name = (
 			frappe.get_cached_value("Account", first["line"], "account_name")
 			if first["line"]
-			else _("a stock line of your trial balance")
+			else _("a stock account of your trial balance")
 		)
 		add(
 			"wrong_lines",
 			count_text(
 				len(reds.wrong_lines),
-				_("{1} would post to {2}, not {3}. Set its stock line in Warehouses."),
+				_("{1} would post to {2}, not {3}. Set its stock account in Warehouses."),
 				_(
-					"{0} warehouses would post to the wrong stock line, like {1} to {2}, not {3}. Set their stock lines in Warehouses."
+					"{0} warehouses would post to the wrong stock account, like {1} to {2}, not {3}. Set their stock accounts in Warehouses."
 				),
 				first["warehouse"],
 				account_name,
@@ -2404,7 +2404,7 @@ def get_difference_blocker(onboarding) -> str | None:
 		return _("Your stock matches your trial balance.")
 	if abs(sum(line["difference"] for line in lines)) < 1:
 		return _(
-			"The total matches, but stock is on the wrong lines. Undo the warehouses on the wrong line, set their stock line in Warehouses, and post them again."
+			"The total matches, but stock is on the wrong accounts. Undo the warehouses on the wrong account, set their stock account in Warehouses, and post them again."
 		)
 	empty = next((line for line in lines if line["nothing_posted"]), None)
 	if empty:

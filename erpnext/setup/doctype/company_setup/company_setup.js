@@ -34,6 +34,7 @@ frappe.ui.form.on("Company Setup", {
 		);
 		frm.events.render(frm);
 		watch_stock_posting(frm);
+		show_tabs_cue(frm);
 		// a step done or undone since the last save, from the company's data, is saved now
 		// once at a time: two reloads close together would save the steps twice over each other
 		if (frm.doc.__onload?.steps_changed && !frm.checking_steps) {
@@ -99,29 +100,38 @@ function make_overview_stats(frm) {
 	const posted =
 		(frm.doc.opening_balances || []).some((row) => row.status === "Posted") ||
 		[...sales, ...purchases].some((row) => row.status === "Created");
+	// what is posted, with the opening invoices made by hand, against the trial balance's line;
 	// advances are negative rows: they lower the total but aren't invoices
 	const owed = (rows, label, count_label, party_type) => {
-		// with the opening invoices made by hand, counted in the company's currency
-		const match = frm.doc.__onload?.sheet_match?.[party_type] || {};
-		const outside = match.outside || {};
-		// a draft row an invoice made by hand stands for counts once, as that invoice
-		const hand = match.hand_posted || {};
+		const match = frm.doc.__onload?.sheet_match?.[party_type];
+		const outside = match?.outside || {};
+		const posted_rows = rows.filter((row) => row.status === "Created");
 		const total =
-			rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0) +
-			flt(outside.amount) -
-			flt(hand.amount);
+			posted_rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0) + flt(outside.amount);
 		const invoices =
-			rows.filter((row) => flt(row.outstanding_amount) > 0).length +
-			(outside.count || 0) -
-			(hand.count || 0);
+			posted_rows.filter((row) => flt(row.outstanding_amount) > 0).length + (outside.count || 0);
+		const sheet = match && format_currency(match.sheet, currency, 0);
+		const entered = rows.reduce((sum, row) => sum + flt(row.outstanding_amount), 0);
+		if (!posted_rows.length && !outside.count) {
+			return frappe.ui.stat_card({
+				label: label,
+				value: match ? sheet : rows.length ? format_currency(entered, currency, 0) : null,
+				caption: match
+					? __("In your trial balance · 0 posted")
+					: rows.length
+					? __("Entered · 0 posted")
+					: null,
+			});
+		}
+		const count = count_label(format_number(invoices, null, 0));
 		return frappe.ui.stat_card({
 			label: label,
-			value: rows.length || outside.count ? format_currency(total, currency) : null,
-			caption: (rows.length || outside.count) && count_label(format_number(invoices, null, 0)),
+			value: format_currency(total, currency, 0),
+			caption: match ? __("Posted of {0} · {1}", [sheet, count]) : __("Posted · {0}", [count]),
 		});
 	};
 	const waiting = frm.doc.__onload?.temporary_parts || [];
-	const $cards = $(`<div class="es-stat-card-grid"></div>`).append(
+	const $cards = $(`<div class="es-stat-card-grid company-setup-stats"></div>`).append(
 		frappe.ui.stat_card({
 			label: __("Temporary Opening"),
 			value: format_currency(posted ? Math.abs(temporary) : 0, currency),
@@ -186,22 +196,26 @@ const PARTY = {
 
 // Every task with its status, in any order. Each row opens its task; rows are grouped by tab.
 function make_checklist(frm, steps) {
-	// every step counts except the ones skipped by hand
-	const counted = steps.filter((step) => !step.is_skipped);
-	const skipped = steps.length - counted.length;
-	const done = counted.filter((step) => step.is_complete).length;
+	// the required steps count; Go live is what they lead to
+	const required = steps.filter((step) => step.is_required && step.name !== "go_live");
+	const done = required.filter((step) => step.is_complete).length;
+	const optional_left = steps.filter(
+		(step) => !step.is_required && !step.is_complete && !step.is_skipped
+	).length;
 	const $card = $(`<div class="contact-box flex flex-col gap-1 mb-0"></div>`);
 	$card.append(
 		frappe.ui.progress({
 			label: __("Set up {0}", [frm.doc.company]),
 			hint: () =>
-				skipped
-					? __("{0} of {1} done, {2} skipped", [done, counted.length, skipped])
-					: __("{0} of {1} done", [done, counted.length]),
+				done < required.length
+					? __("{0} of {1} required steps done", [done, required.length])
+					: optional_left
+					? __("All required steps done · {0} optional left", [optional_left])
+					: __("All required steps done"),
 			intervals: true,
-			interval_count: counted.length,
+			interval_count: required.length,
 			size: "md",
-			value: counted.length ? (done / counted.length) * 100 : 0,
+			value: required.length ? (done / required.length) * 100 : 0,
 		})
 	);
 	const first_tab = steps.findIndex((step) => step.tab);
@@ -305,17 +319,20 @@ function make_task_card(frm, step) {
 			// the reports show only what is posted
 			$card.append(
 				$(`<div class="flex flex-wrap items-center gap-2 ps-8 pt-2"></div>`).append(
-					REPORTS.flatMap(([report, label], index) => [
-						index ? $(`<span class="text-p-sm text-ink-gray-4">·</span>`) : [],
-						$(`<a class="text-p-sm text-ink-gray-7"></a>`)
-							.text(label)
-							.attr(
-								"href",
-								frappe.router.make_url(["query-report", report]) +
-									"?" +
-									$.param(report_filters(frm, report))
-							),
-					])
+					// a separator wraps with the link after it
+					REPORTS.map(([report, label], index) =>
+						$(`<span class="flex items-center gap-2 whitespace-nowrap"></span>`).append(
+							index ? $(`<span class="text-p-sm text-ink-gray-4">·</span>`) : [],
+							$(`<a class="text-p-sm text-ink-gray-7"></a>`)
+								.text(label)
+								.attr(
+									"href",
+									frappe.router.make_url(["query-report", report]) +
+										"?" +
+										$.param(report_filters(frm, report))
+								)
+						)
+					)
 				)
 			);
 		} else {
@@ -356,7 +373,10 @@ function add_sheet_match(frm, party_type, $card) {
 		.addClass("flex flex-wrap items-center gap-2")
 		.append(frappe.ui.badge({ label: label, theme: theme }));
 	const is_customer = party_type === "Customer";
-	const open = { label: __("Open invoices"), onclick: () => show_opening_invoices(frm, party_type) };
+	const open = {
+		label: party_type === "Customer" ? __("Open invoices") : __("Open bills"),
+		onclick: () => show_opening_invoices(frm, party_type),
+	};
 	const notes = [
 		...Object.entries(left_out.currencies).map(([code, part]) => ({
 			theme: "yellow",
@@ -497,11 +517,9 @@ function add_undone_line(frm, party_type, $card) {
 function get_posting_text(frm, party_type) {
 	const { done, total } = frm.posting?.[party_type] || {};
 	if (!total) {
-		return party_type === "Customer"
-			? __("Posting invoices in the background")
-			: __("Posting bills in the background");
+		return party_type === "Customer" ? __("Posting invoices…") : __("Posting bills…");
 	}
-	return __("Posting {0} in the background · {1} done", [count_invoices(total, party_type), done]);
+	return __("Posting {0} of {1}…", [format_number(done || 0, null, 0), format_number(total, null, 0)]);
 }
 
 function make_posting_bar(frm, party_type, opts = {}) {
@@ -802,7 +820,7 @@ function make_task(frm, step, buttons) {
 		: step.is_started
 		? ["circle-dot", "text-ink-gray-8"]
 		: ["circle-dashed", "text-ink-gray-5"];
-	const note = step.is_skipped ? __("Skipped for now.") : step.summary || step.description;
+	const note = step.is_skipped ? __("Skipped for now") : step.summary || step.description;
 
 	// the buttons sit at the right end, and wrap below the text only when the card is too narrow
 	const $task = $(`<div class="flex flex-wrap items-center gap-3"></div>`);
@@ -891,7 +909,9 @@ function show_migration_date(frm) {
 		reports.map(([, , task_name]) => [SOURCES[task_name][0], frm.doc[SOURCES[task_name][0]] || ""])
 	);
 	const $where = $(`<div class="flex flex-col gap-3"></div>`);
-	const show_where = () =>
+	// a report that follows the trial balance comes from an Excel sheet when that software has none
+	const follow_labels = [];
+	const show_where = () => {
 		$where
 			.empty()
 			.append(
@@ -899,6 +919,15 @@ function show_migration_date(frm) {
 					make_where_box(get_places(task_name, sources[SOURCES[task_name][0]]), title)
 				)
 			);
+		for (const [$label, task_name] of follow_labels) {
+			const source = sources[SOURCES[task_name][0]];
+			$label.text(
+				!source || WHERE_TO_FIND[task_name].some(([software]) => software === source)
+					? __("Same software as trial balance")
+					: __("Excel sheet")
+			);
+		}
+	};
 
 	const $reports = $(`<div class="flex flex-col gap-2 pt-2"></div>`);
 	const values = Object.values(sources);
@@ -925,8 +954,9 @@ function show_migration_date(frm) {
 	const $list = $(`<div class="flex flex-col border rounded-lg"></div>`).appendTo($reports);
 	controls = reports.map(([title, note, task_name, follows], index) => {
 		const source_field = SOURCES[task_name][0];
+		if (follows) follow_labels.push([grey_line("").addClass("shrink-0"), task_name]);
 		const [$select, control] = follows
-			? [grey_line(__("As the trial balance")).addClass("shrink-0")]
+			? [follow_labels.at(-1)[0]]
 			: make_source_select(sources[source_field], (value) => {
 					sources[source_field] = value || "";
 					show_where();
@@ -946,7 +976,7 @@ function show_migration_date(frm) {
 		return control;
 	});
 	grey_line(
-		__("Customer and supplier lists help too. Without them, names are made from the unpaid invoices.")
+		__("Customer and supplier lists help too. Without them, you confirm each new name before posting.")
 	).appendTo($reports);
 	dialog.get_field("reports").$wrapper.append($reports);
 
@@ -1231,10 +1261,38 @@ function show_go_live(frm) {
 				},
 			],
 		},
-		...open_steps.map((step) => ({
-			title: __("{0} is not done.", [step.title]),
-			buttons: [{ label: __("Open"), onclick: open(step) }],
-		})),
+		...open_steps.map((step) => {
+			const party_type = {
+				opening_sales_invoices: "Customer",
+				opening_purchase_invoices: "Supplier",
+			}[step.name];
+			const drafts =
+				party_type &&
+				(frm.doc[PARTY[party_type].table] || []).filter((row) => row.status !== "Created").length;
+			if (!drafts) {
+				return {
+					title: __("{0} is not done.", [step.title]),
+					buttons: [{ label: __("Open"), onclick: open(step) }],
+				};
+			}
+			return party_type === "Customer"
+				? {
+						title: plural(
+							drafts,
+							__("1 opening invoice is still a draft."),
+							__("{0} opening invoices are still drafts.", [drafts])
+						),
+						buttons: [{ label: __("Open invoices"), onclick: open(step) }],
+				  }
+				: {
+						title: plural(
+							drafts,
+							__("1 opening bill is still a draft."),
+							__("{0} opening bills are still drafts.", [drafts])
+						),
+						buttons: [{ label: __("Open bills"), onclick: open(step) }],
+				  };
+		}),
 		...gaps.map((step) => ({
 			title: step.is_skipped
 				? __("{0} is skipped, but your trial balance has lines for it.", [step.title])
@@ -1645,7 +1703,7 @@ function name_with_badge(name_html, badge_html) {
 }
 
 function new_badge() {
-	return frappe.ui.badge.html({ label: __("New"), theme: "blue" });
+	return frappe.ui.badge.html({ label: __("New"), theme: "gray" });
 }
 
 // where rows came from: the sheet's name, or typed in
@@ -1741,7 +1799,7 @@ function make_kv_lines(lines) {
 const STEP_ACTIONS = {
 	chart_of_accounts: (frm, step) => {
 		if (step.is_complete) {
-			return [{ label: __("Edit chart"), icon: "pencil", onclick: () => show_chart(frm) }];
+			return [{ label: __("Edit chart"), onclick: () => show_chart(frm) }];
 		}
 		return [
 			{
@@ -1750,7 +1808,6 @@ const STEP_ACTIONS = {
 			},
 			!frm.doc.__onload?.chart_import_blocked && {
 				label: __("Import my chart"),
-				icon: "import",
 				onclick: () => show_chart_import(frm),
 			},
 		].filter(Boolean);
@@ -1761,7 +1818,6 @@ const STEP_ACTIONS = {
 		return [
 			{
 				label: frm.doc.opening_balances?.length ? __("Edit balances") : __("Enter balances"),
-				icon: "pencil",
 				onclick: () => show_opening_balances(frm),
 			},
 			// only a draft has something to preview and post
@@ -1778,7 +1834,6 @@ const STEP_ACTIONS = {
 	bank_accounts: (frm, step) => [
 		{
 			label: step.is_complete ? __("Edit bank details") : __("Add bank details"),
-			icon: step.is_complete ? "pencil" : undefined,
 			onclick: () => show_bank_accounts(frm),
 		},
 	],
@@ -1808,6 +1863,22 @@ const STEP_MORE = {
 					},
 			  ].filter(Boolean)
 			: [{ label: __("View chart"), icon: "eye", onclick: () => show_chart(frm) }],
+	taxes: (frm) => [
+		{
+			label: __("Sales tax templates"),
+			icon: "arrow-up-right",
+			onclick: () =>
+				frappe.set_route("List", "Sales Taxes and Charges Template", { company: frm.doc.company }),
+		},
+		{
+			label: __("Purchase tax templates"),
+			icon: "arrow-up-right",
+			onclick: () =>
+				frappe.set_route("List", "Purchase Taxes and Charges Template", {
+					company: frm.doc.company,
+				}),
+		},
+	],
 	opening_balances: (frm) =>
 		(frm.doc.opening_balances || []).some((row) => row.status === "Posted")
 			? [{ label: __("Posted balances"), icon: "list", onclick: () => show_posted(frm, "balances") }]
@@ -1832,6 +1903,10 @@ function show_opening_balances(frm, result) {
 	const abbr = frm.doc.__onload?.company_details?.abbr;
 	const short_name = (account) => (abbr ? account.replace(new RegExp(` - ${abbr}$`), "") : account);
 	const posted = (frm.doc.opening_balances || []).filter((row) => row.status === "Posted");
+	const drafts = (frm.doc.opening_balances || []).filter((row) => row.status !== "Posted");
+	// a zero is left blank, so the side with the amount stands out
+	const amount = (value, df, options, doc) =>
+		flt(value) ? frappe.form.formatters.Currency(value, df, options, doc) : "";
 	const dialog = new frappe.ui.Dialog({
 		title: __("Opening balances"),
 		size: "extra-large",
@@ -1843,9 +1918,7 @@ function show_opening_balances(frm, result) {
 				label: __("Balances"),
 				cannot_add_rows: false,
 				in_place_edit: true,
-				data: (frm.doc.opening_balances || [])
-					.filter((row) => row.status !== "Posted")
-					.map((row) => ({ ...row, name: undefined })),
+				data: drafts.map((row) => ({ ...row, name: undefined })),
 				fields: [
 					{
 						fieldname: "original_account",
@@ -1862,6 +1935,7 @@ function show_opening_balances(frm, result) {
 						label: __("Account"),
 						in_list_view: 1,
 						columns: 2,
+						formatter: (value) => frappe.utils.escape_html(short_name(value || "")),
 						// a new account is added with this company's Add account, not the full form
 						only_select: 1,
 						filter_description: __(
@@ -1895,7 +1969,7 @@ function show_opening_balances(frm, result) {
 						fieldtype: "Data",
 						label: __("Account Type"),
 						read_only: 1,
-						in_list_view: 1,
+						in_list_view: drafts.some((row) => row.account_type) ? 1 : 0,
 						columns: 1,
 					},
 					{
@@ -1912,6 +1986,7 @@ function show_opening_balances(frm, result) {
 						label: __("Debit"),
 						in_list_view: 1,
 						columns: 2,
+						formatter: amount,
 						onchange: () => update_totals(),
 					},
 					{
@@ -1920,6 +1995,7 @@ function show_opening_balances(frm, result) {
 						label: __("Credit"),
 						in_list_view: 1,
 						columns: 2,
+						formatter: amount,
 						onchange: () => update_totals(),
 					},
 				],
@@ -1968,7 +2044,39 @@ function show_opening_balances(frm, result) {
 		)
 		.appendTo($intro);
 	$intro.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances));
-	const $cards = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
+	const $cards = $(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).appendTo($intro);
+	// nothing entered yet: the table's place says how to start, and the cards wait for rows
+	let typing = false;
+	const $empty = $(`<div class="border rounded-lg py-10 mb-3"></div>`)
+		.append(
+			frappe.ui.empty_state({
+				icon: "file-spreadsheet",
+				title: __("Upload your trial balance"),
+				description: __("Excel or CSV. Each account is read with its debit or credit."),
+				actions: [
+					{
+						label: __("Upload sheet"),
+						icon: "upload",
+						variant: "solid",
+						onclick: () => upload_opening_balances(frm, dialog),
+					},
+					{
+						label: __("Add row"),
+						onclick: () => {
+							typing = true;
+							update_totals();
+							dialog.fields_dict.balances.grid.add_new_row();
+						},
+					},
+					{
+						label: __("Download sample sheet"),
+						variant: "ghost",
+						onclick: () => download_sheet(company, "chart_sheet.download_opening_balances"),
+					},
+				],
+			})
+		)
+		.appendTo($intro);
 	if (result) $intro.append(make_upload_result(frm, result));
 	// drawn from the rows as they change: see update_totals
 	$intro.append($(`<div data-unmatched></div>`));
@@ -1990,6 +2098,10 @@ function show_opening_balances(frm, result) {
 	const currency = erpnext.get_currency(company);
 	const update_totals = () => {
 		const rows = dialog.fields_dict.balances.df.data || [];
+		const empty = !rows.length && !typing;
+		$empty.toggleClass("hide", !empty);
+		$cards.toggleClass("hide", empty);
+		dialog.set_df_property("balances", "hidden", empty ? 1 : 0);
 		const waiting = rows.filter((row) => !row.account && row.original_account);
 		if (waiting.length && !suggested) {
 			suggested = {};
@@ -2071,9 +2183,9 @@ function show_opening_balances(frm, result) {
 			make_lines_card(
 				__("Debit and credit"),
 				[
-					[__("Debit"), money(frm, debit)],
-					[__("Credit"), money(frm, credit)],
-					[__("Difference"), money(frm, Math.abs(debit - credit)), true],
+					[__("Debit"), money(frm, debit, 0)],
+					[__("Credit"), money(frm, credit, 0)],
+					[__("Difference"), money(frm, Math.abs(debit - credit), 0), true],
 				],
 				get_difference_caption(frm, debit - credit)
 			),
@@ -2090,18 +2202,18 @@ function show_opening_balances(frm, result) {
 					],
 					[
 						__("Liabilities and capital"),
-						money(frm, net(["Liability", "Equity"], -1) + flt(frm.doc.sheet_payables)),
+						money(frm, net(["Liability", "Equity"], -1) + flt(frm.doc.sheet_payables), 0),
 					],
-					[__("Profit"), money(frm, net(["Income"], -1) - net(["Expense"], 1)), true],
+					[__("Profit"), money(frm, net(["Income"], -1) - net(["Expense"], 1), 0), true],
 				],
 				get_profit_caption(frm)
 			),
 			make_lines_card(
 				__("For other steps"),
 				[
-					[__("Receivables"), money(frm, frm.doc.sheet_receivables)],
-					[__("Payables"), money(frm, frm.doc.sheet_payables)],
-					[__("Stock"), money(frm, frm.doc.sheet_stock)],
+					[__("Receivables"), money(frm, frm.doc.sheet_receivables, 0)],
+					[__("Payables"), money(frm, frm.doc.sheet_payables, 0)],
+					[__("Stock"), money(frm, frm.doc.sheet_stock, 0)],
 				],
 				__("From your trial balance. Not posted with these balances."),
 				__(
@@ -2135,12 +2247,12 @@ function show_opening_balances(frm, result) {
 					type: "success",
 					message:
 						suggestions.length === 1
-							? __("1 row filled: {0}", [
+							? __("1 account matched: {0}", [
 									`${suggestions[0].original_account} → ${short_name(
 										suggestions[0].account
 									)}`,
 							  ])
-							: __("{0} rows filled.", [suggestions.length]),
+							: __("{0} accounts matched.", [suggestions.length]),
 					duration: 8000,
 				});
 			});
@@ -2744,7 +2856,7 @@ function show_posting_preview(frm, can_post = true) {
 			title: __("Your books on {0}", [frappe.datetime.str_to_user(preview.posting_date)]),
 			size: "extra-large",
 			fields: [{ fieldname: "preview", fieldtype: "HTML" }],
-			primary_action_label: can_post ? __("Post") : __("Done"),
+			primary_action_label: can_post ? __("Post to books") : __("Done"),
 			primary_action: () =>
 				can_post
 					? call_method(frm, "post_opening_balances", null, { freeze: true }).then(() =>
@@ -2816,7 +2928,7 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 	const left_out = preview.left_out?.count && get_left_out_text(preview.left_out, money);
 	const party_type = preview.left_out?.party_types?.[0];
 	const open_invoices = {
-		label: __("Open invoices"),
+		label: party_type === "Supplier" ? __("Open bills") : __("Open invoices"),
 		onclick: () => {
 			books_dialog?.hide();
 			show_tab(frm, party_type === "Customer" ? "selling_tab" : "buying_tab");
@@ -3009,7 +3121,6 @@ function invoice_buttons(frm, party_type) {
 					: rows.length
 					? __("Edit bills")
 					: __("Enter bills"),
-			icon: all_posted ? "plus" : "pencil",
 			onclick: () => show_opening_invoices(frm, party_type),
 		},
 	];
@@ -3189,7 +3300,7 @@ function show_posted(frm, kind, open_undone) {
 			.join(" · ");
 	const show_list = () => {
 		dialog.set_title(info.title);
-		set_footer(__("Done"), () => dialog.hide());
+		set_footer(__("Close"), () => dialog.hide());
 		show_grid(null);
 		const rows = posted.groups.map((group) => [
 			make_title_cell(source_name(group.source), line_of(group)),
@@ -3259,7 +3370,7 @@ function show_posted(frm, kind, open_undone) {
 	const link = (doctype, name) => $(frappe.utils.get_form_link(doctype, name, true));
 
 	const show_group = (group) => {
-		set_footer(__("Done"), () => dialog.hide());
+		set_footer(__("Close"), () => dialog.hide());
 		// a sheet's rows not posted yet show too: undoing the sheet takes them as well
 		const rows = (frm.doc[info.table] || []).filter(
 			(row) => (is_balances ? row.status === info.posted : true) && (row.source || "") === group.source
@@ -3367,7 +3478,7 @@ function show_posted(frm, kind, open_undone) {
 	};
 
 	const show_undone = (group) => {
-		set_footer(__("Done"), () => dialog.hide());
+		set_footer(__("Close"), () => dialog.hide());
 		$body.empty().append(
 			header(
 				__("Undone from {0}", [source_name(group.source)]),
@@ -3403,7 +3514,7 @@ function show_posted(frm, kind, open_undone) {
 	};
 
 	const show_outside = () => {
-		set_footer(__("Done"), () => dialog.hide());
+		set_footer(__("Close"), () => dialog.hide());
 		show_grid(null);
 		const outside = posted.outside;
 		const doctype = is_balances ? "Journal Entry" : PARTY[kind].doctype;
@@ -3459,7 +3570,11 @@ function show_posted(frm, kind, open_undone) {
 						kind: kind,
 						source: group.source,
 						what: count_entries(group.count, group.advances || 0, kind),
-						one: group.advances ? __("credit") : invoice_word(kind),
+						one: group.advances
+							? kind === "Supplier"
+								? __("debit or advance")
+								: __("credit or advance")
+							: invoice_word(kind),
 						example: group.example,
 				  }
 		);
@@ -3556,7 +3671,12 @@ function show_posted(frm, kind, open_undone) {
 			source: group.source,
 			names: selected.map((row) => row.invoice),
 			what: title,
-			one: flt(selected[0]?.outstanding_amount) < 0 ? __("credit") : invoice_word(kind),
+			one:
+				flt(selected[0]?.outstanding_amount) >= 0
+					? invoice_word(kind)
+					: kind === "Supplier"
+					? __("debit or advance")
+					: __("credit or advance"),
 			example: example && `${example}-1`,
 		});
 		$body.empty().append(
@@ -3771,7 +3891,7 @@ function get_name_badge(kind, party_type, currency) {
 		case "check":
 			return badge(__("Check"), "orange");
 		case "new":
-			return badge(__("New"), "orange");
+			return badge(__("New"), "gray");
 		case "create":
 			return badge(party_type === "Customer" ? __("New customer") : __("New supplier"), "gray");
 		case "confirmed":
@@ -3841,7 +3961,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const confirmed = new Set();
 	const day_before = day_before_text(frm);
 	const dialog = new frappe.ui.Dialog({
-		title: is_customer ? __("Opening sales invoices") : __("Opening purchase invoices"),
+		title: is_customer ? __("Opening sales invoices") : __("Unpaid supplier bills"),
 		size: "extra-large",
 		fields: [
 			{ fieldname: "intro", fieldtype: "HTML" },
@@ -4004,15 +4124,10 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 		.append(
 			$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
 				is_customer
-					? says_check
-						? __(
-								"Invoices still unpaid on {0}, one row each. Enter an advance or credit memo as a negative amount.",
-								[day_before]
-						  )
-						: __(
-								"Invoices still unpaid on {0}, one row each. Enter an advance or credit note as a negative amount.",
-								[day_before]
-						  )
+					? __(
+							"Invoices still unpaid on {0}, one row each. Enter a credit or advance as a negative amount.",
+							[day_before]
+					  )
 					: says_check
 					? __(
 							"Bills still unpaid on {0}, one row each. Enter an advance or vendor credit as a negative amount.",
@@ -4033,7 +4148,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const $post_to = $(`<div class="max-w-sm"></div>`).appendTo($intro);
 	// the ledger picked for the whole sheet: every row goes there, names confirmed later too
 	let sheet_account = null;
-	if (accounts.length > 1 && ledger_lines.length > 1) {
+	if (accounts.length > 1) {
 		const used = [...new Set(data.map((row) => row.account).filter(Boolean))];
 		const post_to = frappe.ui.form.make_control({
 			df: {
@@ -4045,13 +4160,21 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 				placeholder: is_customer
 					? __("Each customer's own ledger")
 					: __("Each supplier's own ledger"),
-				description: is_customer
-					? __("Your trial balance has {0} receivable ledgers. Pick the one this sheet is for.", [
-							ledger_lines.length,
-					  ])
-					: __("Your trial balance has {0} payable ledgers. Pick the one this sheet is for.", [
-							ledger_lines.length,
-					  ]),
+				description: [
+					ledger_lines.length > 1 &&
+						(is_customer
+							? __(
+									"Your trial balance has {0} receivable ledgers. Pick the one this sheet is for.",
+									[ledger_lines.length]
+							  )
+							: __(
+									"Your trial balance has {0} payable ledgers. Pick the one this sheet is for.",
+									[ledger_lines.length]
+							  )),
+					__("Post to sets rows that have no account."),
+				]
+					.filter(Boolean)
+					.join(" "),
 				get_query: () => ({ filters: { name: ["in", accounts] } }),
 				filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
 				change: () => {
@@ -4074,7 +4197,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			post_to.set_value(picked);
 		}
 	}
-	const $stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($intro);
+	const $stats = $(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).appendTo($intro);
 
 	// what was read and left out, under the table
 	const $notes = $(`<div class="flex flex-col gap-1 mt-2"></div>`).appendTo(
@@ -4880,11 +5003,11 @@ function make_opening_invoice_stats(frm, party_type, state, currency) {
 	return [
 		frappe.ui.stat_card({
 			label: __("On your sheet"),
-			value: format_currency(total, currency),
+			value: format_currency(total, currency, 0),
 			caption: state.advance
 				? is_customer
-					? __("Less {0} in credits", [format_currency(state.advance, currency)])
-					: __("Less {0} in debits", [format_currency(state.advance, currency)])
+					? __("Less {0} in credits or advances", [format_currency(state.advance, currency, 0)])
+					: __("Less {0} in debits or advances", [format_currency(state.advance, currency, 0)])
 				: day_before && __("On {0}", [day_before]),
 		}),
 		frappe.ui.stat_card({
@@ -5254,13 +5377,17 @@ function make_account_clash(clash, party_type, currency) {
 	const invoices = count_invoices(count, party_type);
 	clash = { ...clash, account: clash.account_name, from_account: clash.from_account_name };
 	const sheet = clash.parties[0]?.sources[0];
+	const record_uses =
+		clash.parties.length === 1
+			? __("{0}'s record uses {1}.", [clash.parties[0].party, clash.account])
+			: __("Their records use {0}.", [clash.account]);
 	const goes_to =
 		clash.kind === "split"
 			? __("The rest of {0} is on {1}, where your trial balance is short.", [sheet, clash.account])
 			: clash.kind === "posted"
 			? clash.said
 				? __("This sheet says {0}.", [clash.account])
-				: __("Their saved account is {0}.", [clash.account])
+				: record_uses
 			: clash.said
 			? __("This sheet says {0}.", [clash.from_account])
 			: plural(
@@ -5284,7 +5411,7 @@ function make_account_clash(clash, party_type, currency) {
 			: clash.earlier && clash.saved
 			? __("Their earlier invoices and saved account are on {0}.", [clash.account])
 			: clash.saved
-			? __("Their saved account is {0}.", [clash.account])
+			? record_uses
 			: __("Their earlier invoices are on {0}.", [clash.account]);
 	return $(`<div class="flex flex-col gap-2"></div>`).append(
 		$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(
@@ -5503,10 +5630,8 @@ function get_ledger_overs(frm, party_type, ticked = [], disabled = new Set()) {
 
 // a minus row is an advance, or a credit the party is owed back, worded as the country says it
 function credit_rows_label(is_customer) {
-	if (is_customer) {
-		return says_check ? __("Credit memos and advances") : __("Credit notes and advances");
-	}
-	return says_check ? __("Vendor credits and advances") : __("Debit notes and advances");
+	if (is_customer) return __("Credits or advances");
+	return __("Debits or advances");
 }
 
 // Whether a draft row is one an opening invoice made by hand stands for, as the server found it
@@ -5561,7 +5686,7 @@ function get_left_out_text(left_out, money) {
 function count_entries(count, advances, party_type) {
 	const parts = [
 		count - advances && count_invoices(count - advances, party_type),
-		advances && count_advances(advances),
+		advances && count_advances(advances, party_type),
 	].filter(Boolean);
 	return parts.length === 2 ? __("{0} + {1}", parts) : parts[0] || count_invoices(0, party_type);
 }
@@ -5680,7 +5805,6 @@ function import_buttons(frm, doctype, step) {
 				: doctype === "Customer"
 				? __("Import customers")
 				: __("Import suppliers"),
-			icon: "import",
 			onclick: () => open_party_import(frm, doctype),
 		},
 	];
@@ -5689,16 +5813,34 @@ function import_buttons(frm, doctype, step) {
 // items with batch or serial numbers import only once Stock Settings tracks them: asked before
 // the import opens, while they are off
 function ask_serial_and_batch(frm) {
-	return new Promise((resolve) =>
-		frappe.confirm(
-			__("Do any of your items use batch or serial numbers?"),
-			() =>
-				call_method(frm, "turn_on_serial_and_batch")
-					.then(() => reload_fresh(frm))
-					.then(resolve),
-			resolve
-		)
-	);
+	return new Promise((resolve) => {
+		const dialog = new frappe.ui.Dialog({
+			title: __("Batch or serial numbers?"),
+			fields: [{ fieldname: "body", fieldtype: "HTML" }],
+		});
+		const answer = (yes) => {
+			dialog.hide();
+			if (!yes) return resolve();
+			call_method(frm, "turn_on_serial_and_batch")
+				.then(() => reload_fresh(frm))
+				.then(resolve);
+		};
+		dialog
+			.get_field("body")
+			.$wrapper.append(
+				$(`<div class="flex flex-col gap-3"></div>`).append(
+					$(`<div class="text-p-base text-ink-gray-8"></div>`).text(
+						__("Do any of your items use batch or serial numbers?")
+					),
+					grey_line(__("Pick No if you don't track batches. You can turn it on per item later.")),
+					$(`<div class="flex justify-end gap-2"></div>`).append(
+						frappe.ui.button({ label: __("No"), onclick: () => answer(false) }),
+						frappe.ui.button({ label: __("Yes"), onclick: () => answer(true) })
+					)
+				)
+			);
+		dialog.show();
+	});
 }
 
 // customers, suppliers and items come as other software exports them: the sheet is read here first,
@@ -5740,7 +5882,7 @@ function show_chart(frm) {
 	const company = frm.doc.company;
 	const chosen = !!frm.doc.chart_of_accounts_source;
 	const dialog = new frappe.ui.Dialog({
-		title: __("Chart of Accounts"),
+		title: __("Chart of accounts"),
 		size: "large",
 		fields: [{ fieldname: "chart", fieldtype: "HTML" }],
 		primary_action_label: chosen ? __("Done") : __("Use this chart"),
@@ -6449,8 +6591,11 @@ function count_balances(count) {
 	return plural(count, __("1 balance"), __("{0} balances", [count]));
 }
 
-function count_advances(count) {
-	return plural(count, __("1 credit"), __("{0} credits", [count]));
+// a row below zero: a credit or advance the customer has, a debit or advance with a supplier
+function count_advances(count, party_type) {
+	return party_type === "Supplier"
+		? plural(count, __("1 debit or advance"), __("{0} debits or advances", [count]))
+		: plural(count, __("1 credit or advance"), __("{0} credits or advances", [count]));
 }
 
 function short_account(frm, account) {
@@ -6462,7 +6607,7 @@ function show_cheques_posted(frm) {
 	const bank = frm.doc.__onload?.bank || {};
 	frappe.ui.toast({
 		type: "success",
-		message: __("{0} posted on {1}. Clear them from that date in Bank Clearance.", [
+		message: __("{0} posted on {1}.", [
 			count_cheques(bank.cheques, bank.deposits, bank.charges),
 			day_before_text(frm),
 		]),
@@ -6935,7 +7080,7 @@ class BankAccountsWindow {
 		const on_day = this.day ? __("On {0}", [this.day]) : null;
 		if (rows.length) {
 			$head.append(
-				$(`<div class="es-stat-card-grid mb-3"></div>`).append(
+				$(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).append(
 					frappe.ui.stat_card({
 						label: __("Bank accounts"),
 						value: format_number(rows.length, null, 0),
@@ -6946,10 +7091,10 @@ class BankAccountsWindow {
 					make_lines_card(
 						__("Book balance"),
 						[
-							[__("In credit · {0}", [in_credit.length]), money(this.frm, sum(in_credit))],
+							[__("In credit · {0}", [in_credit.length]), money(this.frm, sum(in_credit), 0)],
 							[
 								__("Overdrawn or owed · {0}", [overdrawn.length]),
-								money(this.frm, sum(overdrawn)),
+								money(this.frm, sum(overdrawn), 0),
 							],
 						],
 						on_day
@@ -7006,7 +7151,7 @@ class BankAccountsWindow {
 		// one box for all the banks off, said once
 		if (off_banks.length) {
 			const [first] = off_banks;
-			const amount = money(this.frm, Math.abs(first.off));
+			const amount = money(this.frm, Math.abs(first.off), 0);
 			const cheques_next =
 				this.dialog.get_value("has_uncleared_cheques") !== "No" &&
 				!(this.frm.doc.uncleared_cheques || []).length;
@@ -7032,8 +7177,8 @@ class BankAccountsWindow {
 								__("{0} ({1})", [
 									bank.name,
 									bank.off > 0
-										? __("{0} more", [money(this.frm, bank.off)])
-										: __("{0} less", [money(this.frm, -bank.off)]),
+										? __("{0} more", [money(this.frm, bank.off, 0)])
+										: __("{0} less", [money(this.frm, -bank.off, 0)]),
 								])
 							)
 							.join(", "),
@@ -7064,8 +7209,21 @@ class BankAccountsWindow {
 								unmarked.length,
 								unmarked.map((account) => short_account(this.frm, account)).join(", "),
 						  ]),
-				description: __("Mark them to add their bank details."),
-				buttons: [{ label: __("Mark them"), onclick: () => this.mark_accounts() }],
+				description: plural(
+					unmarked.length,
+					__("Mark it to add its bank details."),
+					__("Mark them to add their bank details.")
+				),
+				buttons: [
+					{
+						label: plural(
+							unmarked.length,
+							__("Mark it as a bank account"),
+							__("Mark them as bank accounts")
+						),
+						onclick: () => this.mark_accounts(unmarked),
+					},
+				],
 			});
 		}
 		$head.append(make_alerts(alerts).addClass("mb-3"));
@@ -7087,7 +7245,7 @@ class BankAccountsWindow {
 			!rows.length
 				? __("Mark the bank accounts to add their details.")
 				: alerts.some((alert) => alert.theme === "red")
-				? __("Clear the red to save.")
+				? __("Fix the red items above to save.")
 				: !this.dialog.get_value("has_uncleared_cheques")
 				? __("Answer the question to save.")
 				: null
@@ -7139,7 +7297,7 @@ class BankAccountsWindow {
 		);
 	}
 
-	mark_accounts() {
+	mark_accounts(accounts) {
 		call_method(this.frm, "save_bank_accounts", {
 			rows: this.get_account_rows(),
 			has_uncleared_cheques: this.dialog.get_value("has_uncleared_cheques") || null,
@@ -7148,6 +7306,14 @@ class BankAccountsWindow {
 			.then(() => call_method(this.frm, "mark_bank_accounts"))
 			.then(() => {
 				close_and_reload(this.frm, this.dialog).then(() => show_bank_accounts(this.frm));
+				frappe.ui.toast({
+					type: "success",
+					message: plural(
+						accounts.length,
+						__("{0} is now a bank account.", [short_account(this.frm, accounts[0])]),
+						__("{0} accounts are now bank accounts.", [accounts.length])
+					),
+				});
 			});
 	}
 
@@ -7211,8 +7377,48 @@ class BankAccountsWindow {
 			render_input: true,
 		});
 		this.picker.set_value(this.picked || "");
-		this.$stats = $(`<div class="es-stat-card-grid mb-3"></div>`).appendTo($head);
+		this.$stats = $(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).appendTo($head);
 		this.$alerts = $(`<div class="mb-3"></div>`).appendTo($head);
+		// nothing entered yet: the table's place says how to start, and the cards wait for rows
+		this.typing = false;
+		this.$empty = $(`<div class="border rounded-lg py-10 mb-3"></div>`)
+			.append(
+				frappe.ui.empty_state({
+					icon: "file-spreadsheet",
+					title: cheque_words(__("Upload your uncleared cheques")),
+					description: cheque_words(
+						__(
+							"Excel or CSV of the cheques and deposits the bank had not cleared. Each is read with its bank, number, date and amount."
+						)
+					),
+					actions: [
+						{
+							label: __("Upload sheet"),
+							icon: "upload",
+							variant: "solid",
+							onclick: () => this.upload(),
+						},
+						{
+							label: __("Add row"),
+							onclick: () => {
+								this.typing = true;
+								this.refresh_cheques();
+								this.cheques_grid.add_new_row();
+							},
+						},
+						{
+							label: __("Download sample sheet"),
+							variant: "ghost",
+							onclick: () =>
+								download_sheet(
+									this.frm.doc.company,
+									"bank_accounts.download_uncleared_cheques"
+								),
+						},
+					],
+				})
+			)
+			.appendTo($head);
 	}
 
 	// the grid's rows go back into the list of all drafts; rows added under a bank get that bank
@@ -7316,31 +7522,31 @@ class BankAccountsWindow {
 		this.$stats.empty().append(
 			frappe.ui.stat_card({
 				label: on(__("Book balance")),
-				value: money(this.frm, picked ? picked.book : sum("book")),
+				value: money(this.frm, picked ? picked.book : sum("book"), 0),
 				caption: this.day ? __("On {0}", [this.day]) : null,
 			}),
 			make_lines_card(on(__("Uncleared")), [
 				[
 					__("Issued · {0}", [shown.reduce((n, bank) => n + bank.issued_count, 0)]),
-					money(this.frm, picked ? picked.issued : sum("issued")),
+					money(this.frm, picked ? picked.issued : sum("issued"), 0),
 				],
 				[
 					__("Deposited · {0}", [shown.reduce((n, bank) => n + bank.deposited_count, 0)]),
-					money(this.frm, picked ? picked.deposited : sum("deposited")),
+					money(this.frm, picked ? picked.deposited : sum("deposited"), 0),
 				],
 			]),
 			frappe.ui.stat_card({
-				label: on(__("Worked out")),
-				value: money(this.frm, picked ? picked.worked_out : sum("worked_out")),
+				label: on(__("Expected statement")),
+				value: money(this.frm, picked ? picked.worked_out : sum("worked_out"), 0),
 				caption: picked
 					? statement === null
 						? __("No statement balance typed")
 						: picked.off
 						? __("Statement {0} · off by {1}", [
-								money(this.frm, statement),
-								money(this.frm, Math.abs(picked.off)),
+								money(this.frm, statement, 0),
+								money(this.frm, Math.abs(picked.off), 0),
 						  ])
-						: __("Statement {0} · matches", [money(this.frm, statement)])
+						: __("Statement {0} · matches", [money(this.frm, statement, 0)])
 					: __("{0} of {1} match their statement", [
 							banks.filter((bank) => bank.off === 0).length,
 							banks.filter((bank) => bank.off !== null).length,
@@ -7448,7 +7654,7 @@ class BankAccountsWindow {
 				theme: "yellow",
 				title: __("{0} is off by {1}. Check the statement balance or the rows.", [
 					name_of(bank.account),
-					money(this.frm, Math.abs(bank.off)),
+					money(this.frm, Math.abs(bank.off), 0),
 				]),
 				buttons: [{ label: __("Show rows"), onclick: () => this.pick(bank.account) }],
 			}));
@@ -7473,15 +7679,26 @@ class BankAccountsWindow {
 			cheque_words(
 				__("{0} with no cheque or reference number.", [count_rows(count_mine(state.no_reference))])
 			),
-			__("Add it, so Bank Clearance can tell them apart.")
+			__("Add it, so Bank Clearance, where you mark them cleared later, can tell them apart.")
 		);
-		this.$alerts.empty().append(make_alerts([...reds, ...yellows]));
+		const empty = !this.typing && !this.sync().length;
+		this.$empty.toggleClass("hide", !empty);
+		this.$stats.toggleClass("hide", empty);
+		this.dialog.set_df_property("cheques", "hidden", empty ? 1 : 0);
+		// with no rows only what stops adding them is said
+		this.$alerts
+			.empty()
+			.append(
+				make_alerts(
+					empty ? reds.slice(0, this.checks.balances_posted ? 0 : 1) : [...reds, ...yellows]
+				)
+			);
 		set_footer_reason(
 			this.dialog,
 			!rows.length
 				? __("Upload a sheet or add rows to post.")
 				: reds.length
-				? __("Clear the red to post.")
+				? __("Fix the red items above to post.")
 				: null
 		);
 	}
@@ -7588,7 +7805,7 @@ class BankAccountsWindow {
 		this.set_view("confirm");
 		fill_confirm(this.dialog, {
 			title: cheque_words(__("Post uncleared cheques?")),
-			back: cheque_words(__("Back to the uncleared cheques. Nothing is posted until you confirm.")),
+			back: cheque_words(__("Nothing is posted until you confirm.")),
 			on_back: () => this.show_cheques(),
 			body: [
 				make_kv_lines([
@@ -7814,7 +8031,7 @@ function items_import_menu(frm) {
 	if (!frappe.model.can_create("Data Import")) return [];
 	return [
 		frappe.ui.dropdown({
-			button: { label: __("Import"), icon: "import", icon_right: "chevron-down" },
+			button: { label: __("Import"), icon_right: "chevron-down" },
 			align: "end",
 			options: [
 				{
@@ -7859,7 +8076,6 @@ function order_buttons(frm, step) {
 				: order_type === "Work Order"
 				? __("Add work orders")
 				: __("Add orders"),
-			icon: drafts ? "pencil" : "plus",
 			onclick: () => show_open_orders(frm, order_type),
 		},
 	];
@@ -7906,7 +8122,6 @@ Object.assign(STEP_ACTIONS, {
 	taxes: (frm, step) => [
 		{
 			label: step.is_complete ? __("Edit taxes") : __("Set up taxes"),
-			icon: step.is_complete ? "pencil" : undefined,
 			onclick: () => show_taxes(frm),
 		},
 	],
@@ -7914,21 +8129,18 @@ Object.assign(STEP_ACTIONS, {
 	warehouses: (frm, step) => [
 		{
 			label: step.is_complete ? __("Edit warehouses") : __("Add warehouses"),
-			icon: step.is_complete ? "pencil" : "plus",
 			onclick: () => show_warehouses(frm),
 		},
 	],
 	opening_stock: (frm) => [
 		{
 			label: has_rows(frm.doc.opening_stock, false) ? __("Edit stock") : __("Add stock"),
-			icon: has_rows(frm.doc.opening_stock, false) ? "pencil" : "plus",
 			onclick: () => show_opening_stock(frm),
 		},
 	],
 	job_workers: (frm) => [
 		{
 			label: __("Edit in Warehouses"),
-			icon: "pencil",
 			onclick: () => show_warehouses(frm, { job_workers: true }),
 		},
 	],
@@ -7939,13 +8151,12 @@ Object.assign(STEP_ACTIONS, {
 	fixed_assets: (frm) => [
 		{
 			label: has_rows(frm.doc.fixed_assets, false) ? __("Edit assets") : __("Add assets"),
-			icon: has_rows(frm.doc.fixed_assets, false) ? "pencil" : "plus",
 			onclick: () => show_fixed_assets(frm),
 		},
 	],
 	boms: (frm) =>
 		frappe.model.can_create("Data Import")
-			? [{ label: __("Import BOMs"), icon: "import", onclick: () => open_party_import(frm, "BOM") }]
+			? [{ label: __("Import BOMs"), onclick: () => open_party_import(frm, "BOM") }]
 			: [],
 });
 
@@ -8337,7 +8548,7 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 							fieldname: "account",
 							fieldtype: "Link",
 							options: "Account",
-							label: __("Stock line"),
+							label: __("Stock account in your books"),
 							in_list_view: 1,
 							columns: 2,
 							get_query: () => ({
@@ -8436,7 +8647,7 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 				.append(
 					locked.map((row) =>
 						grey_line(
-							__("{0} has stock entries, so its stock line stays {1}.", [
+							__("{0} has stock entries, so its stock account stays {1}.", [
 								row.warehouse_name,
 								short_account(frm, row.account),
 							])
@@ -8451,7 +8662,7 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 						? plural(added, __("Add 1 warehouse"), __("Add {0} warehouses", [added]))
 						: __("Save warehouses")
 				);
-			set_footer_reason(dialog, alerts.length ? __("Clear the red to save.") : null);
+			set_footer_reason(dialog, alerts.length ? __("Fix the red items above to save.") : null);
 		};
 		dialog.show();
 		refresh_state();
@@ -8640,7 +8851,11 @@ class SheetWindow {
 		this.dialog
 			.get_field("stats")
 			.$wrapper.empty()
-			.append(cards.length ? $(`<div class="es-stat-card-grid mb-3"></div>`).append(cards) : []);
+			.append(
+				cards.length
+					? $(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).append(cards)
+					: []
+			);
 	}
 
 	set_alerts(alerts, lines = []) {
@@ -8748,12 +8963,11 @@ class OpeningStockWindow extends SheetWindow {
 			has_data: drafts.length,
 			fields: [
 				list_column("item_name", "Data", __("Item"), job_work || batched ? 2 : 3),
-				list_column("warehouse_name", "Data", __("Warehouse"), 2),
+				list_column("warehouse_name", "Data", __("Warehouse"), job_work || batched ? 1 : 2),
 				list_column("qty", "Float", __("Qty"), 1, { onchange: keep_rate_on_qty }),
 				list_column("uom", "Data", __("Unit"), 1),
-				job_work || batched
-					? { fieldname: "rate", fieldtype: "Currency", label: __("Rate") }
-					: list_column("rate", "Currency", __("Rate"), 1),
+				// the rate shows a typo in qty or value at a glance
+				list_column("rate", "Currency", __("Rate"), 1),
 				list_column("amount", "Currency", __("Value"), job_work ? 1 : 2, {
 					onchange: set_rate_on_amount,
 				}),
@@ -8895,8 +9109,8 @@ class OpeningStockWindow extends SheetWindow {
 					caption: lines
 						? plural(
 								lines,
-								__("1 stock line"),
-								__("{0} stock lines, each checked on its own", [lines])
+								__("1 stock account"),
+								__("{0} stock accounts, each checked on its own", [lines])
 						  )
 						: __("No stock in your trial balance"),
 				}),
@@ -9075,6 +9289,7 @@ class OpeningStockWindow extends SheetWindow {
 					off > 0
 						? __("{0} less than your trial balance.", [money(this.frm, off)])
 						: __("{0} more than your trial balance.", [money(this.frm, -off)]),
+				description: this.get_biggest_rows(),
 				buttons:
 					checks.drafts.rows || !checks.posted.rows
 						? []
@@ -9093,9 +9308,9 @@ class OpeningStockWindow extends SheetWindow {
 		} else if (!red_count && !checks.drafts.rows && checks.match?.lines_off?.length) {
 			alerts.push({
 				theme: "red",
-				title: __("The total matches, but stock is on the wrong lines."),
+				title: __("The total matches, but stock is on the wrong accounts."),
 				description: __(
-					"Undo the warehouses on the wrong line, set their stock line in Warehouses, and post them again."
+					"Undo the warehouses on the wrong account, set their stock account in Warehouses, and post them again."
 				),
 				buttons: [
 					go(__("Posted stock"), () => show_posted_stock(frm)),
@@ -9106,6 +9321,18 @@ class OpeningStockWindow extends SheetWindow {
 		return alerts;
 	}
 
+	// the rows of most value: a typo in qty or value is usually one of them
+	get_biggest_rows() {
+		const rows = this.checks.drafts.rows
+			? this.get_rows()
+			: (this.frm.doc.opening_stock || []).filter((row) => row.status === "Posted");
+		const biggest = [...rows]
+			.sort((a, b) => Math.abs(flt(b.amount)) - Math.abs(flt(a.amount)))
+			.slice(0, 3)
+			.map((row) => `${row.item_name} ${money(this.frm, row.amount)}`);
+		return biggest.length ? __("Biggest rows: {0}", [biggest.join(", ")]) : undefined;
+	}
+
 	// every warehouse posted with its stock line, then each line against the trial balance
 	render_lines() {
 		const $lines = this.dialog.get_field("lines").$wrapper.empty();
@@ -9113,7 +9340,12 @@ class OpeningStockWindow extends SheetWindow {
 		if (this.checks.drafts.rows || !match?.warehouses?.length) return;
 		$lines.append(
 			make_read_table(
-				[[__("Warehouse")], [__("Rows"), true], [__("Posted"), true], [__("Stock line")]],
+				[
+					[__("Warehouse")],
+					[__("Rows"), true],
+					[__("Posted"), true],
+					[__("Stock account in your books")],
+				],
 				match.warehouses.map((warehouse) => [
 					warehouse.warehouse,
 					format_number(warehouse.rows, null, 0),
@@ -9123,7 +9355,7 @@ class OpeningStockWindow extends SheetWindow {
 			).addClass("mb-3"),
 			make_read_table(
 				[
-					[__("Stock line")],
+					[__("Stock account in your books")],
 					[__("Posted"), true],
 					...(match.difference_posted ? [[__("Difference posted"), true]] : []),
 					[__("Trial balance"), true],
@@ -9166,7 +9398,7 @@ class OpeningStockWindow extends SheetWindow {
 				: !this.checks.perpetual_inventory
 				? __("Turn on perpetual inventory to post.")
 				: blocker && blocker !== __("Upload a sheet or add rows to post.")
-				? __("Clear the reds to post.")
+				? __("Fix the red items above to post.")
 				: blocker
 		);
 	}
@@ -9186,7 +9418,7 @@ class OpeningStockWindow extends SheetWindow {
 		const migration = frappe.datetime.str_to_user(this.frm.doc.migration_date);
 		this.show_confirm({
 			title: __("Post opening stock?"),
-			back: __("Back to the stock sheet. Nothing is posted until you confirm."),
+			back: __("Nothing is posted until you confirm."),
 			body: [
 				make_kv_lines(
 					[
@@ -9266,13 +9498,17 @@ class OpeningStockWindow extends SheetWindow {
 			if (big) {
 				$big = make_alerts([
 					{
-						theme: "red",
-						title: __("{0} is a big gap on {1}. A warehouse may be missing.", [
-							money(this.frm, Math.abs(big.difference)),
-							short_account(this.frm, big.account) || __("Stock"),
-						]),
+						theme: "yellow",
+						title: [
+							big.difference > 0
+								? __("{0} less than your trial balance", [money(this.frm, big.difference)])
+								: __("{0} more than your trial balance", [money(this.frm, -big.difference)]),
+							this.get_biggest_rows(),
+						]
+							.filter(Boolean)
+							.join(" · "),
 						description: __(
-							"Upload the missing warehouse, or tick below to post the difference."
+							"A gap this big is often a missing warehouse or a typo. Upload the missing warehouse or fix the row, or tick below to post the difference."
 						),
 					},
 				]);
@@ -9295,7 +9531,7 @@ class OpeningStockWindow extends SheetWindow {
 					money(this.frm, Math.abs(total)),
 					short_account(this.frm, difference.account),
 				]),
-				back: __("Back to Opening stock. Nothing is posted until you confirm."),
+				back: __("Nothing is posted until you confirm."),
 				body: [
 					make_read_table(
 						[
@@ -9360,10 +9596,20 @@ class OpeningStockWindow extends SheetWindow {
 	}
 }
 
+// a correction as it changes the stock value, like "Lowers stock by ₹23,31,000"
+function stock_change_text(frm, amount) {
+	if (Math.abs(flt(amount)) < 0.01) return __("Stock value unchanged");
+	return amount > 0
+		? __("Raises stock by {0}", [money(frm, amount)])
+		: __("Lowers stock by {0}", [money(frm, -amount)]);
+}
+
 function show_stock_corrected(frm, result) {
 	frappe.ui.toast({
 		type: "success",
-		message: __("{0} corrected · net {1}", [count_rows(result.rows), money(frm, result.amount)]),
+		message: [__("{0} corrected", [count_rows(result.rows)]), stock_change_text(frm, result.amount)].join(
+			" · "
+		),
 	});
 }
 
@@ -9484,7 +9730,7 @@ function show_posted_window(frm, opts) {
 		const refresh = () => {
 			const selected = grid.get_selected_children();
 			const blocked = (selected.length ? selected : grid.df.data).filter(opts.blocked);
-			const reason = blocked.length && __("Clear the red to undo.");
+			const reason = blocked.length && __("Fix the red items above to undo.");
 			const alert = blocked.length && can_undo && opts.blocked_alert(blocked, group, dialog);
 			$head.empty().append(
 				make_back_header(source_name(group.source), line_of(group), () => show_list(), [
@@ -9838,7 +10084,7 @@ function show_correct_rows(frm, group, posted_dialog) {
 			!count
 				? __("Change a row's qty or value to correct it.")
 				: win.refused
-				? __("Clear the red to correct rows.")
+				? __("Fix the red items above to correct rows.")
 				: null
 		);
 	};
@@ -9880,16 +10126,10 @@ function show_correct_rows(frm, group, posted_dialog) {
 		const net = rows.reduce((sum, row) => sum + flt(row.amount) - flt(originals[row.name].amount), 0);
 		win.show_confirm({
 			title: plural(rows.length, __("Correct 1 row?"), __("Correct {0} rows?", [rows.length])),
-			back: __("Back to the rows. Nothing changes until you confirm."),
+			back: __("Nothing changes until you confirm."),
 			body: [
 				make_kv_lines([
-					[
-						__("To correct"),
-						__("{0} · net {1}", [
-							count_rows(rows.length),
-							(net > 0 ? "+" : "") + money(frm, net),
-						]),
-					],
+					[__("To correct"), [count_rows(rows.length), stock_change_text(frm, net)].join(" · ")],
 					[__("Dated"), day_before_text(frm)],
 				]),
 				later_entries &&
@@ -10329,7 +10569,7 @@ class OpenOrdersWindow extends SheetWindow {
 				: this.dirty
 				? null
 				: checks.blocker
-				? __("Clear the reds to make orders.")
+				? __("Fix the red items above to make orders.")
 				: null
 		);
 	}
@@ -10338,7 +10578,7 @@ class OpenOrdersWindow extends SheetWindow {
 		const { frm, order_type } = this;
 		this.show_confirm({
 			title: __("{0}?", [order_type_make_label(order_type, this.checks.orders)]),
-			back: __("Back to the orders. Nothing is made until you confirm."),
+			back: __("Nothing is made until you confirm."),
 			body: [
 				make_kv_lines([
 					[
@@ -10754,7 +10994,7 @@ class FixedAssetsWindow extends SheetWindow {
 			posting: checks.posting_fix ? [fix_button(checks.posting_fix, frm)] : [],
 			untyped: [
 				{
-					label: __("Mark them"),
+					label: get_mark_label(Object.values(checks.untyped_types || {})),
 					onclick: () => call_method(frm, "mark_asset_accounts").then(reload),
 				},
 			],
@@ -10775,19 +11015,27 @@ class FixedAssetsWindow extends SheetWindow {
 			],
 		};
 		const named = { untyped: true, wrong_type: true, hsn_code: true, accounts: true };
-		const alerts = (checks.reds || [])
-			.filter((item) => !["empty", "answer"].includes(item.key))
-			.map((item) => ({
-				theme: "red",
-				title: item.text,
-				description: named[item.key]
-					? item.rows.map((name) => short_account(frm, name)).join(", ")
-					: undefined,
-				buttons: [
-					...(actions[item.key] || []),
-					...(!named[item.key] && item.rows.length ? [rows(item.rows)] : []),
-				],
-			}));
+		// one red at a time, in the order to fix them
+		const reds = (checks.reds || []).filter((item) => !["empty", "answer"].includes(item.key));
+		const more =
+			reds.length > 1 &&
+			plural(
+				reds.length - 1,
+				__("1 more to fix after this."),
+				__("{0} more to fix after this.", [reds.length - 1])
+			);
+		const alerts = reds.slice(0, 1).map((item) => ({
+			theme: "red",
+			title: item.text,
+			description:
+				[named[item.key] && item.rows.map((name) => short_account(frm, name)).join(", "), more]
+					.filter(Boolean)
+					.join(" · ") || undefined,
+			buttons: [
+				...(actions[item.key] || []),
+				...(!named[item.key] && item.rows.length ? [rows(item.rows)] : []),
+			],
+		}));
 		alerts.unshift(...get_hand_after_alerts(frm), ...get_upload_alerts(this.result));
 		const yellows = checks.yellows || {};
 		const yellow = (title, description, buttons = []) =>
@@ -10892,7 +11140,7 @@ class FixedAssetsWindow extends SheetWindow {
 				? __("Answer the question to post.")
 				: first === "hand"
 				? __("Spread or download the hand-booked depreciation to post.")
-				: __("Clear the reds to post.")
+				: __("Fix the red items above to post.")
 		);
 	}
 
@@ -10960,7 +11208,7 @@ class FixedAssetsWindow extends SheetWindow {
 		const first = checks.first_depreciation;
 		this.show_confirm({
 			title: plural(count, __("Post 1 asset?"), __("Post {0} assets?", [count])),
-			back: __("Back to the asset list. Nothing is posted until you confirm."),
+			back: __("Nothing is posted until you confirm."),
 			body: [
 				make_kv_lines([
 					[
@@ -11073,6 +11321,16 @@ function get_hand_after_alerts(frm) {
 }
 
 // What an upload of the asset sheet left out and replaced
+// "Mark them", or what the one account becomes
+function get_mark_label(types) {
+	if (types.length !== 1) return __("Mark them");
+	return {
+		"Fixed Asset": __("Mark as fixed asset"),
+		Depreciation: __("Mark as depreciation"),
+		"Accumulated Depreciation": __("Mark as accumulated depreciation"),
+	}[types[0]];
+}
+
 function get_upload_alerts(result) {
 	if (!result?.posted && !result?.replaced) return [];
 	const total = (result.posted || 0) + (result.added || 0);
@@ -11240,6 +11498,19 @@ function make_balance_yellows(frm, dialog) {
 }
 
 // ---------- realtime ----------
+
+// tabs that run past a phone's width fade at the end, so the rest are seen to be there
+function show_tabs_cue(frm) {
+	const $tabs = frm.page.wrapper.find(".form-tabs");
+	const update = () => {
+		const el = $tabs[0];
+		if (!el) return;
+		$tabs.toggleClass("company-setup-tabs-more", el.scrollWidth - el.scrollLeft - el.clientWidth > 4);
+	};
+	$tabs.off("scroll.company_setup").on("scroll.company_setup", update);
+	$(window).off("resize.company_setup").on("resize.company_setup", update);
+	update();
+}
 
 // the realtime event can be missed: while stock posts in the background, look again now and then
 function watch_stock_posting(frm) {

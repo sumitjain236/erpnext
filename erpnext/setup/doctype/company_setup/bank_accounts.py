@@ -419,7 +419,7 @@ def get_statement_mismatches(onboarding) -> list[str]:
 	lines = []
 	for account, off in get_statement_offs(onboarding).items():
 		name, currency = frappe.get_cached_value("Account", account, ["account_name", "account_currency"])
-		amount = fmt_money(abs(off), currency=currency)
+		amount = fmt_money(abs(off), currency=currency, precision=0)
 		lines.append(
 			(
 				_("{0}: statement is {1} more than the books.")

@@ -721,6 +721,27 @@ body[data-route="pos"] {
 	grid-column: 1 / -1;
 }
 
+// Company Setup: on a phone a window's cards sit two to a row, smaller
+@media (max-width: 575.98px) {
+	.company-setup-stats.es-stat-card-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: calc(var(--spacing) * 2);
+	}
+
+	.company-setup-stats .es-stat-card {
+		padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+	}
+
+	.company-setup-stats .es-stat-card__value {
+		font-size: var(--text-lg);
+	}
+}
+
+// Company Setup: tabs past the screen's edge fade out there
+.company-setup-tabs-more {
+	mask-image: linear-gradient(to right, black 85%, transparent);
+}
+
 // Company Setup: each checklist row opens its task
 .company-setup-step {
 	&:hover,

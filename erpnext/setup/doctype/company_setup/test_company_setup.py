@@ -8,7 +8,7 @@ from unittest.mock import patch
 import frappe
 from frappe.contacts.doctype.address.address import get_default_address
 from frappe.custom.doctype.property_setter.property_setter import make_property_setter
-from frappe.utils import flt, getdate
+from frappe.utils import flt, formatdate, getdate
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment
 
@@ -2611,7 +2611,8 @@ class TestBankAccounts(ERPNextTestSuite):
 		self.assertEqual(self.doc.get_onload().bank_match["matched"], 2)
 		self.assertEqual(
 			self.doc.get_onload().steps[step_key(self.doc, "bank_accounts")]["summary"],
-			"2 bank accounts · 3 cheques and 1 deposit posted",
+			"2 bank accounts · 3 cheques and 1 deposit posted. When the bank clears them, mark them in"
+			f" Bank Clearance, from {formatdate('2026-03-31')} on.",
 		)
 
 		# Bank Clearance from the day before lists each cheque, never the opening entry
@@ -3094,7 +3095,8 @@ class TestOpeningStock(ERPNextTestSuite):
 		self.doc.reload()
 		self.doc.run_method("onload")
 		self.assertEqual(
-			self.doc.get_onload().temporary_parts, [{"label": "stock difference", "amount": 100}]
+			self.doc.get_onload().temporary_parts,
+			[{"label": "stock difference", "amount": 100, "to_come": False}],
 		)
 		self.assertEqual([line["difference"] for line in self.doc.get_stock_difference()["lines"]], [100])
 		entry = self.doc.post_stock_difference()
@@ -3220,8 +3222,8 @@ class TestOpeningStock(ERPNextTestSuite):
 			doc.get_onload().temporary_parts,
 			[
 				{"label": "opening balances", "amount": -4000},
-				{"label": "stock", "amount": 46000},
-				{"label": "sales invoices", "amount": 10000},
+				{"label": "stock", "amount": 46000, "to_come": True},
+				{"label": "customer invoices", "amount": 10000, "to_come": True},
 			],
 		)
 		self.assertEqual(

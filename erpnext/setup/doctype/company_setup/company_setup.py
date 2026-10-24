@@ -2761,7 +2761,7 @@ def get_party_account_type(name: str) -> str | None:
 def get_left_out_hint(account_type: str) -> str:
 	return {
 		"Receivable": _("Add what customers owe as opening sales invoices in Selling."),
-		"Payable": _("Add what you owe suppliers as opening purchase invoices in Buying."),
+		"Payable": _("Add what you owe suppliers as unpaid supplier bills in Buying."),
 		"Stock": _("Stock comes in with an opening stock entry."),
 		"Temporary": _("It takes the difference by itself."),
 	}[account_type]

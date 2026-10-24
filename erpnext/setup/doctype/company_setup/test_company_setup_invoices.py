@@ -585,13 +585,13 @@ class TestChequeReports(ERPNextTestSuite):
 		self.save_bank_details("No")
 		step = company_setup_steps.bank_accounts(frappe.get_doc("Company Setup", self.company))
 		self.assertTrue(step["done"])
-		self.assertIn("HDFC Bank A/c: statement is ₹ 23,000.00 more than the books.", step["warnings"][0])
+		self.assertIn("HDFC Bank A/c: statement is ₹ 23,000 more than the books.", step["warnings"][0])
 		# an uncleared cheque listed explains part of the gap
 		self.save_bank_details("Yes")
 		cheque = {"entry_type": "Issued", "reference_no": "000231", "reference_date": "2026-03-27"}
 		self.doc.save_uncleared_cheques([cheque | {"bank_account": self.hdfc, "amount": 20000}], "hdfc.csv")
 		step = company_setup_steps.bank_accounts(frappe.get_doc("Company Setup", self.company))
-		self.assertIn("HDFC Bank A/c: statement is ₹ 3,000.00 more than the books.", step["warnings"][0])
+		self.assertIn("HDFC Bank A/c: statement is ₹ 3,000 more than the books.", step["warnings"][0])
 
 
 class TestUndoDeletes(ERPNextTestSuite):

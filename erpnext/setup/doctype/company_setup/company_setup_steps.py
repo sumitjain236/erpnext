@@ -159,7 +159,7 @@ def chart_of_accounts(onboarding) -> dict:
 			else _("{0} accounts").format(number(count))
 		)
 	return {
-		"title": _("Chart of Accounts"),
+		"title": _("Chart of accounts"),
 		"description": description,
 		"summary": summary,
 		"done": done,
@@ -272,8 +272,12 @@ def bank_accounts(onboarding) -> dict:
 	elif status.has_uncleared_cheques == "Yes" and status.drafts:
 		summary = _("{0} · uncleared cheques in draft").format(accounts)
 	elif posted:
-		summary = _("{0} · {1} posted").format(
-			accounts, count_cheques(status.cheques, status.deposits, status.charges)
+		summary = _(
+			"{0} · {1} posted. When the bank clears them, mark them in Bank Clearance, from {2} on."
+		).format(
+			accounts,
+			count_cheques(status.cheques, status.deposits, status.charges),
+			formatdate(get_day_before(onboarding)),
 		)
 	elif status.has_uncleared_cheques == "No":
 		summary = _("{0} · No uncleared cheques").format(accounts)
@@ -329,7 +333,7 @@ def count_parties(count: int, disabled: int, one: str, many: str) -> str | None:
 
 
 def count_entries(rows, is_sales: bool) -> str:
-	"""Like "39 invoices + 1 credit": the rows less than zero are credits."""
+	"""Like "39 invoices + 1 credit or advance": the rows below zero."""
 	credits = sum(1 for row in rows if flt(row.outstanding_amount) < 0)
 	invoices = len(rows) - credits
 	parts = []
@@ -338,8 +342,14 @@ def count_entries(rows, is_sales: bool) -> str:
 			parts.append(_("1 invoice") if invoices == 1 else _("{0} invoices").format(number(invoices)))
 		else:
 			parts.append(_("1 bill") if invoices == 1 else _("{0} bills").format(number(invoices)))
-	if credits:
-		parts.append(_("1 credit") if credits == 1 else _("{0} credits").format(number(credits)))
+	if credits and is_sales:
+		parts.append(
+			_("1 credit or advance") if credits == 1 else _("{0} credits or advances").format(number(credits))
+		)
+	elif credits:
+		parts.append(
+			_("1 debit or advance") if credits == 1 else _("{0} debits or advances").format(number(credits))
+		)
 	return _("{0} + {1}").format(*parts) if len(parts) == 2 else parts[0]
 
 
@@ -370,7 +380,7 @@ def opening_purchase_invoices(onboarding) -> dict:
 	return opening_invoices(
 		onboarding,
 		"Purchase Invoice",
-		_("Opening purchase invoices"),
+		_("Unpaid supplier bills"),
 		_("Supplier bills still unpaid on the day before migration."),
 		"buying_tab",
 	)
@@ -409,11 +419,11 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, tab
 		undone = onboarding.get("undone_sales_invoices" if is_sales else "undone_purchase_invoices")
 		text = (_("{0} posted · {1}") if undone else _("All {0} posted · {1}")).format(
 			count_entries(posted, is_sales),
-			fmt_money(sum(flt(row.outstanding_amount) for row in posted), currency=currency),
+			fmt_money(sum(flt(row.outstanding_amount) for row in posted), currency=currency, precision=0),
 		)
 	elif drafts:
 		to_review = len({row.party_name for row in drafts if not row.party and not row.create_party})
-		amount = fmt_money(sum(flt(row.outstanding_amount) for row in drafts), currency=currency)
+		amount = fmt_money(sum(flt(row.outstanding_amount) for row in drafts), currency=currency, precision=0)
 		text = _("{0} ready to post · {1}").format(count_entries(drafts, is_sales), amount)
 		if to_review:
 			text += " · " + (
@@ -539,7 +549,7 @@ def opening_stock(onboarding) -> dict:
 		if status.lines and abs(status.off) >= 1:
 			summary += " · " + _("off by {0}").format(off)
 	elif status.posted and status.lines and not status.matches and abs(status.off) < 1:
-		summary = _("{0} posted, {1} · the total matches, but stock is on the wrong lines").format(
+		summary = _("{0} posted, {1} · the total matches, but stock is on the wrong accounts").format(
 			count_text(status.posted, _("1 row"), _("{0} rows")), uploads
 		)
 	elif status.posted and status.lines and not status.matches:
@@ -689,7 +699,9 @@ def boms(onboarding) -> dict:
 		summary = f"{summary} · {missing}" if summary else missing
 	return {
 		"title": _("BOMs"),
-		"description": _("Add your BOMs before your first work order."),
+		"description": _(
+			"Add your BOMs (bills of materials: what goes into each product you make) before your first work order."
+		),
 		"summary": summary,
 		"done": bool(status.boms),
 		"tab": "manufacturing_tab",
@@ -760,8 +772,16 @@ def check_books(onboarding) -> dict:
 		summary = _("{0} still to post").format(frappe.utils.comma_and(waiting, add_quotes=False))
 	elif not banks_match:
 		summary = _("{0} of {1} bank accounts match their lines").format(bank["matched"], bank["total"])
+	elif to_come := [part for part in get_temporary_parts(onboarding) if part.get("to_come")]:
+		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
+		summary = _("Waiting for: {0}").format(
+			" · ".join(
+				f"{part['label']} {fmt_money(abs(part['amount']), currency=currency, precision=0)}"
+				for part in to_come
+			)
+		)
 	elif not stock_matches and abs(stock["off"]) < 1:
-		summary = _("Stock is on the wrong lines")
+		summary = _("Stock is on the wrong accounts")
 	elif not stock_matches:
 		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
 		summary = _("Stock is off by {0}").format(fmt_money(abs(stock["off"]), currency=currency))
@@ -821,10 +841,16 @@ def get_temporary_parts(onboarding) -> list[dict]:
 	stock = get_stock_match(onboarding)
 	if stock and stock["line"] and abs(stock["off"]) >= 1:
 		all_posted = stock["books"] and not any(row.status != "Posted" for row in onboarding.opening_stock)
-		parts.append({"label": _("stock difference") if all_posted else _("stock"), "amount": stock["off"]})
+		parts.append(
+			{
+				"label": _("stock difference") if all_posted else _("stock"),
+				"amount": stock["off"],
+				"to_come": not all_posted,
+			}
+		)
 	for party_type, label, sign in (
-		("Customer", _("sales invoices"), 1),
-		("Supplier", _("purchase bills"), -1),
+		("Customer", _("customer invoices"), 1),
+		("Supplier", _("supplier bills"), -1),
 	):
 		match = get_sheet_match(onboarding, party_type)
 		if not match:
@@ -836,7 +862,7 @@ def get_temporary_parts(onboarding) -> list[dict]:
 		)
 		short = flt(match["sheet"] - posted, money_precision())
 		if abs(short) >= 0.01:
-			parts.append({"label": label, "amount": flt(sign * short, money_precision())})
+			parts.append({"label": label, "amount": flt(sign * short, money_precision()), "to_come": True})
 	return parts
 
 

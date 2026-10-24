@@ -477,7 +477,7 @@ class TestOpeningStockCases(ERPNextTestSuite):
 		match = stock.get_stock_match(self.doc)
 		self.assertEqual((match["off"], match["matches"]), (0, False))
 		self.assertEqual(sorted(match["lines_off"]), sorted([self.stock_in_hand, wip_line]))
-		self.assertIn("stock is on the wrong lines", self.doc.get_stock_difference()["blocker"])
+		self.assertIn("stock is on the wrong accounts", self.doc.get_stock_difference()["blocker"])
 
 	def test_moved_work_in_progress_gets_its_warehouse_and_can_move_back(self):
 		wip = add_account(
