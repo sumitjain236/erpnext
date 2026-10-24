@@ -7,6 +7,7 @@ whole document with its thousands of rows."""
 import frappe
 
 from erpnext.setup.doctype.company_setup import opening_stock as stock
+from erpnext.setup.doctype.company_setup import posted_entries
 
 
 def get_setup(company: str):
@@ -28,6 +29,20 @@ def get_invoice_names(company: str, party_type: str) -> dict:
 @frappe.whitelist()
 def get_posted_entries(company: str, kind: str) -> dict:
 	return get_setup(company).get_posted_entries(kind)
+
+
+@frappe.whitelist()
+def get_delete_setting(company: str) -> dict:
+	get_setup(company)
+	return posted_entries.get_delete_setting()
+
+
+@frappe.whitelist()
+def get_undo_split(
+	company: str, kind: str, source: str | None = None, names: list | str | None = None
+) -> dict:
+	names = frappe.parse_json(names) if isinstance(names, str) else names
+	return posted_entries.get_undo_split(get_setup(company), kind, source, names)
 
 
 @frappe.whitelist()

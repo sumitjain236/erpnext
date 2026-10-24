@@ -78,6 +78,7 @@ class TestOpeningStockCases(ERPNextTestSuite):
 		return next(row for row in self.doc.opening_stock if all(row.get(k) == v for k, v in filters.items()))
 
 	def test_batch_rows_are_corrected_by_batch_and_every_correction_is_undone(self):
+		self.enterContext(self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 1}))
 		batch_item = make_tracked_item("_Test Setup Batch Item", "has_batch_no")
 		self.save_rows(
 			[

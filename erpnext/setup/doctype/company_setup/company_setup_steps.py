@@ -238,13 +238,14 @@ def bank_accounts(onboarding) -> dict:
 		and status.added == status.accounts
 		and bool(status.default_bank)
 		and (status.has_uncleared_cheques == "No" or cheques_done)
-		and not status.statement_off
 	)
 	accounts = _("1 bank account") if status.accounts == 1 else _("{0} bank accounts").format(status.accounts)
 	skipped = any(
 		row.step_key.endswith(".bank_accounts") and row.status == "Skipped" for row in onboarding.steps
 	)
-	if not status.accounts and not status.unmarked:
+	if not status.accounts and not status.unmarked and not onboarding.opening_balances:
+		summary = before_trial_balance()
+	elif not status.accounts and not status.unmarked:
 		summary = _("No bank lines in your opening balances · add bank details if you have a bank account")
 	elif not status.accounts:
 		summary = count_text(
@@ -266,10 +267,6 @@ def bank_accounts(onboarding) -> dict:
 		).format(accounts)
 	elif status.added < status.accounts:
 		summary = _("{0} of {1} bank accounts added.").format(status.added, status.accounts)
-	elif status.statement_off:
-		summary = _("{0} · statement balance differs from the books: {1}").format(
-			accounts, ", ".join(status.statement_off)
-		)
 	elif not status.default_bank:
 		summary = _("{0} · pick a default bank").format(accounts)
 	elif status.has_uncleared_cheques == "Yes" and status.drafts:
@@ -290,6 +287,7 @@ def bank_accounts(onboarding) -> dict:
 		"summary": summary and cheque_words(onboarding.company, summary),
 		"done": done,
 		"started": bool(onboarding.bank_accounts or onboarding.uncleared_cheques) and not done,
+		"warnings": status.statement_off if onboarding.status != "Live" else [],
 		"has_lines": bool(status.accounts),
 		"tab": "accounts_tab",
 	}
@@ -311,14 +309,38 @@ def count_cheques(cheques: int, deposits: int, charges: int = 0) -> str:
 
 def customers(onboarding) -> dict:
 	count = frappe.db.count("Customer", {"disabled": 0})
+	disabled = frappe.db.count("Customer", {"disabled": 1})
 	return {
 		"title": _("Customers"),
 		"description": _("Import your customers with their addresses and tax IDs, as often as you like."),
-		"summary": count and (_("1 customer") if count == 1 else _("{0} customers").format(count)),
+		"summary": count_parties(count, disabled, _("1 customer"), _("{0} customers")),
 		"done": bool(count),
 		"tab": "selling_tab",
 		"required": has_party_lines(onboarding, "Customer"),
 	}
+
+
+def count_parties(count: int, disabled: int, one: str, many: str) -> str | None:
+	"""Like "24 customers (1 disabled)"."""
+	if not count:
+		return None
+	text = one if count == 1 else many.format(number(count))
+	return _("{0} ({1} disabled)").format(text, number(disabled)) if disabled else text
+
+
+def count_entries(rows, is_sales: bool) -> str:
+	"""Like "39 invoices + 1 credit": the rows less than zero are credits."""
+	credits = sum(1 for row in rows if flt(row.outstanding_amount) < 0)
+	invoices = len(rows) - credits
+	parts = []
+	if invoices or not credits:
+		if is_sales:
+			parts.append(_("1 invoice") if invoices == 1 else _("{0} invoices").format(number(invoices)))
+		else:
+			parts.append(_("1 bill") if invoices == 1 else _("{0} bills").format(number(invoices)))
+	if credits:
+		parts.append(_("1 credit") if credits == 1 else _("{0} credits").format(number(credits)))
+	return _("{0} + {1}").format(*parts) if len(parts) == 2 else parts[0]
 
 
 def opening_sales_invoices(onboarding) -> dict:
@@ -327,17 +349,17 @@ def opening_sales_invoices(onboarding) -> dict:
 		"Sales Invoice",
 		_("Opening sales invoices"),
 		_("Customer invoices still unpaid on the day before migration."),
-		_("All {0} invoices posted · {1}"),
 		"selling_tab",
 	)
 
 
 def suppliers(onboarding) -> dict:
 	count = frappe.db.count("Supplier", {"disabled": 0})
+	disabled = frappe.db.count("Supplier", {"disabled": 1})
 	return {
 		"title": _("Suppliers"),
 		"description": _("Import your suppliers with their addresses and tax IDs, as often as you like."),
-		"summary": count and (_("1 supplier") if count == 1 else _("{0} suppliers").format(count)),
+		"summary": count_parties(count, disabled, _("1 supplier"), _("{0} suppliers")),
 		"done": bool(count),
 		"tab": "buying_tab",
 		"required": has_party_lines(onboarding, "Supplier"),
@@ -350,12 +372,11 @@ def opening_purchase_invoices(onboarding) -> dict:
 		"Purchase Invoice",
 		_("Opening purchase invoices"),
 		_("Supplier bills still unpaid on the day before migration."),
-		_("All {0} bills posted · {1}"),
 		"buying_tab",
 	)
 
 
-def opening_invoices(onboarding, doctype: str, title: str, description: str, summary: str, tab: str) -> dict:
+def opening_invoices(onboarding, doctype: str, title: str, description: str, tab: str) -> dict:
 	totals = frappe.get_all(
 		doctype,
 		filters={"company": onboarding.company, "is_opening": "Yes", "docstatus": 1},
@@ -367,40 +388,33 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, sum
 	drafts = [row for row in onboarding.get(table) if row.status != "Created" and row not in hand]
 	failed = sum(1 for row in drafts if row.status == "Failed")
 	currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
-	# counted like the Overview cards: invoices without the advances, the amount net of them
+	# counted like the windows: invoices + credits, the amount net of the credits
+	is_sales = doctype == "Sales Invoice"
 	posted = [row for row in onboarding.get(table) if row.status == "Created"]
-	posted_count = number(sum(1 for row in posted if flt(row.outstanding_amount) > 0))
 	if drafts and totals.count:
 		text = (
 			_("{0} posted · {1} left to post: {2} failed, fix them and post again").format(
-				posted_count, number(len(drafts)), failed
+				count_entries(posted, is_sales), count_entries(drafts, is_sales), failed
 			)
 			if failed
-			else _("{0} posted · {1} left to post").format(posted_count, number(len(drafts)))
+			else _("{0} posted · {1} left to post").format(
+				count_entries(posted, is_sales), count_entries(drafts, is_sales)
+			)
 		)
 	elif failed:
 		text = _("{0} ready to post · {1} failed, fix them and post again").format(
-			number(len(drafts)), failed
+			count_entries(drafts, is_sales), failed
 		)
 	elif totals.count:
-		undone = onboarding.get(
-			"undone_sales_invoices" if doctype == "Sales Invoice" else "undone_purchase_invoices"
-		)
-		is_sales = doctype == "Sales Invoice"
-		if posted_count == "1":
-			text = _("1 invoice posted · {1}") if is_sales else _("1 bill posted · {1}")
-		elif undone:
-			text = _("{0} invoices posted · {1}") if is_sales else _("{0} bills posted · {1}")
-		else:
-			text = summary
-		text = text.format(
-			posted_count,
+		undone = onboarding.get("undone_sales_invoices" if is_sales else "undone_purchase_invoices")
+		text = (_("{0} posted · {1}") if undone else _("All {0} posted · {1}")).format(
+			count_entries(posted, is_sales),
 			fmt_money(sum(flt(row.outstanding_amount) for row in posted), currency=currency),
 		)
 	elif drafts:
 		to_review = len({row.party_name for row in drafts if not row.party and not row.create_party})
 		amount = fmt_money(sum(flt(row.outstanding_amount) for row in drafts), currency=currency)
-		text = _("{0} ready to post · {1}").format(number(len(drafts)), amount)
+		text = _("{0} ready to post · {1}").format(count_entries(drafts, is_sales), amount)
 		if to_review:
 			text += " · " + (
 				_("1 name to review") if to_review == 1 else _("{0} names to review").format(to_review)
@@ -459,6 +473,8 @@ def items(onboarding) -> dict:
 				count_text(status.units, _("1 unit"), _("{0} units")),
 			]
 		)
+	elif not onboarding.opening_balances:
+		summary = before_trial_balance()
 	elif not needs_stock(onboarding):
 		summary = _("Not needed · no stock in your opening balances · add items if you keep stock")
 	else:
@@ -543,6 +559,8 @@ def opening_stock(onboarding) -> dict:
 		summary = _("{0} in stock in your trial balance · add it before your first stock entry").format(
 			fmt_money(status.line_total, currency=currency, precision=0)
 		)
+	elif not onboarding.opening_balances:
+		summary = before_trial_balance()
 	else:
 		summary = _("Not needed · no stock in your opening balances · add stock if you keep any")
 	done = not status.drafts and bool(status.posted) and (status.matches or not status.lines)
@@ -555,6 +573,11 @@ def opening_stock(onboarding) -> dict:
 		"tab": "stock_tab",
 		"required": needs_stock(onboarding),
 	}
+
+
+def before_trial_balance() -> str:
+	"""What a step the trial balance decides on says until the trial balance is in."""
+	return _("Optional · we'll tell you once your trial balance is in")
 
 
 def needs_stock(onboarding) -> bool:
@@ -632,6 +655,8 @@ def fixed_assets(onboarding) -> dict:
 		summary = _(
 			"{0} in your trial balance · add the asset list before your first depreciation run"
 		).format(fmt_money(status.line_total, currency=currency, precision=0))
+	elif not onboarding.opening_balances:
+		summary = before_trial_balance()
 	else:
 		summary = _(
 			"Optional · no fixed assets in your opening balances · add the asset list if you have any"

@@ -7,7 +7,9 @@ import frappe
 
 from erpnext.accounts.party import get_party_account
 from erpnext.controllers.sales_and_purchase_return import make_return_doc
+from erpnext.setup.doctype.company_setup import company_setup_steps
 from erpnext.setup.doctype.company_setup import test_company_setup as base
+from erpnext.setup.doctype.company_setup.posted_entries import get_delete_setting
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	get_account,
 	get_balance,
@@ -157,6 +159,33 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 		result = self.doc.undo_posting("Customer", "", ["OB-OFF-1"])
 		self.assertEqual((result.removed, result.failed), (1, []))
 		self.assertEqual(frappe.db.get_value("Customer", disabled, "disabled"), 1)
+
+	def test_the_per_ledger_check_counts_only_the_rows_that_post(self):
+		from erpnext.setup.doctype.company_setup.opening_invoices import get_ledger_overs
+
+		default, insurers = self.add_receivable_account("Debtors - Insurance")
+		usd = frappe.get_doc("Customer", base.make_customer("Onboarding Dollar Customer"))
+		frappe.set_user("Administrator")
+		usd.db_set("default_currency", "USD")
+		frappe.set_user("onboarding.accounts@example.com")
+		disabled = base.make_customer("Onboarding Off Customer", disabled=1)
+		self.doc.migration_date = "2026-04-01"
+		self.doc.sheet_accounts = frappe.as_json({"Receivable": {default: 100, insurers: 300}})
+		self.doc.save()
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{"party_name": self.customer.customer_name, "outstanding_amount": 100},
+				{"party_name": usd.customer_name, "outstanding_amount": 500},
+				{"party_name": disabled, "outstanding_amount": 500},
+			],
+		)
+		# the USD and disabled rows stay drafts, so they put nothing over the default ledger's line
+		self.assertEqual(get_ledger_overs(self.doc, "Customer"), [])
+		# the disabled customer posted anyway does
+		self.assertEqual(
+			[over["account"] for over in get_ledger_overs(self.doc, "Customer", [disabled])], [default]
+		)
 
 	def test_posting_writes_no_party_account_so_a_sheet_goes_back_to_its_ledger(self):
 		sundry, retainers = self.add_receivable_account("Debtors - Retainers")
@@ -550,6 +579,20 @@ class TestChequeReports(ERPNextTestSuite):
 		)
 		self.assertEqual(get_balance(self.od), -50000)
 
+	def test_a_statement_off_the_books_is_a_yellow_line_and_the_step_is_still_done(self):
+		self.doc.mark_bank_accounts()
+		self.post_balances()
+		self.save_bank_details("No")
+		step = company_setup_steps.bank_accounts(frappe.get_doc("Company Setup", self.company))
+		self.assertTrue(step["done"])
+		self.assertIn("HDFC Bank A/c: statement is ₹ 23,000.00 more than the books.", step["warnings"][0])
+		# an uncleared cheque listed explains part of the gap
+		self.save_bank_details("Yes")
+		cheque = {"entry_type": "Issued", "reference_no": "000231", "reference_date": "2026-03-27"}
+		self.doc.save_uncleared_cheques([cheque | {"bank_account": self.hdfc, "amount": 20000}], "hdfc.csv")
+		step = company_setup_steps.bank_accounts(frappe.get_doc("Company Setup", self.company))
+		self.assertIn("HDFC Bank A/c: statement is ₹ 3,000.00 more than the books.", step["warnings"][0])
+
 
 class TestUndoDeletes(ERPNextTestSuite):
 	"""Undo deletes what Company Setup posted, when nothing else holds it, so posting again keeps names."""
@@ -576,9 +619,9 @@ class TestUndoDeletes(ERPNextTestSuite):
 			]
 		)
 		self.assertEqual(posted["OB-DEL-1"], "OB-DEL-1")
-		# the ledger rows go too, though the site keeps a cancelled transaction's own
+		# ticked in the undo: deleted with the ledger rows, though Accounts Settings keeps them
 		with self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 0}):
-			result = self.doc.undo_posting("Customer", "a.xlsx")
+			result = self.doc.undo_posting("Customer", "a.xlsx", delete_entries=1)
 		self.assertEqual(result.kept_cancelled, [])
 		(comment,) = frappe.get_all(
 			"Comment",
@@ -599,6 +642,40 @@ class TestUndoDeletes(ERPNextTestSuite):
 		self.assertEqual(
 			(get_balance(receivable, "OB-DEL-1"), get_balance(temporary, "OB-DEL-1")), (400, -400)
 		)
+
+	def test_unticked_the_undo_keeps_the_invoice_and_a_repost_takes_the_next_name(self):
+		self.doc.migration_date = "2026-04-01"
+		row = {"party_name": self.customer.customer_name, "invoice_date": "2026-03-01"}
+		self.post([row | {"invoice_number": "OB-AUD-1", "outstanding_amount": 400}])
+		# Accounts Settings deletes ledger rows, but the undo keeps them
+		self.assertEqual(self.doc.undo_posting("Customer", "a.xlsx", delete_entries=0).kept_cancelled, [])
+		self.assertEqual(frappe.db.get_value("Sales Invoice", "OB-AUD-1", "docstatus"), 2)
+		self.assertTrue(frappe.db.exists("GL Entry", {"voucher_no": "OB-AUD-1", "is_cancelled": 1}))
+		(comment,) = frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "Company Setup", "reference_name": self.doc.name},
+			pluck="content",
+		)
+		self.assertIn("1 Sales Invoice kept cancelled", comment)
+		for name, amends in (("OB-AUD-1-1", "OB-AUD-1"), ("OB-AUD-1-2", "OB-AUD-1-1")):
+			self.doc.reload()
+			self.post([row | {"invoice_number": "OB-AUD-1", "outstanding_amount": 400}])
+			self.assertEqual(
+				frappe.db.get_value("Sales Invoice", name, ["docstatus", "amended_from"]), (1, amends)
+			)
+			self.doc.reload()
+			if name == "OB-AUD-1-1":
+				self.doc.undo_posting("Customer", "a.xlsx", delete_entries=0)
+
+	def test_with_no_choice_the_undo_follows_accounts_settings(self):
+		self.doc.migration_date = "2026-04-01"
+		row = {"party_name": self.customer.customer_name, "invoice_date": "2026-03-01"}
+		self.post([row | {"invoice_number": "OB-DEF-1", "outstanding_amount": 400}])
+		with self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 0}):
+			self.assertFalse(get_delete_setting()["delete"])
+			self.doc.undo_posting("Customer", "a.xlsx")
+		self.assertEqual(frappe.db.get_value("Sales Invoice", "OB-DEF-1", "docstatus"), 2)
+		self.assertTrue(get_delete_setting()["delete"])
 
 	def test_undoing_an_empty_pick_undoes_nothing(self):
 		self.doc.migration_date = "2026-04-01"

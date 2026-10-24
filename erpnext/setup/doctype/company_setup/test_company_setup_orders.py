@@ -543,6 +543,15 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			(order.bom_no, [(row.operation, row.time_in_mins) for row in order.operations]),
 			(bom.name, [("_Test Setup Weaving", 120)]),
 		)
+		self.assertTrue(frappe.get_all("Job Card", {"work_order": name}))
+
+		# undone: its job cards go with it, so nothing stops the delete
+		self.doc.reload()
+		self.doc.undo_open_orders("Work Order", None)
+		self.assertEqual(
+			(frappe.db.exists("Work Order", name), frappe.get_all("Job Card", {"work_order": name})),
+			(None, []),
+		)
 
 	def test_orders_use_the_company_and_item_group_default_warehouses(self):
 		finished, stores = (

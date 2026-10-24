@@ -6,7 +6,7 @@
 import frappe
 from frappe import _
 from frappe.query_builder.functions import Count, Sum
-from frappe.utils import cstr, flt, get_fullname
+from frappe.utils import cint, cstr, flt, get_fullname
 from frappe.utils.scheduler import is_scheduler_inactive
 
 from erpnext.accounts.utils import (
@@ -66,6 +66,9 @@ def get_posted_invoices(onboarding, party_type: str) -> dict:
 		)
 		group["count"] += 1
 		group["advances"] = group.get("advances", 0) + (flt(row.outstanding_amount) < 0)
+		if flt(row.outstanding_amount) >= 0:
+			# a re-post's name when the undo keeps the invoices, shown in the undo confirm
+			group.setdefault("example", f"{row.invoice}-1")
 		group["amount"] += flt(row.outstanding_amount)
 		group["paid"] += row.invoice in paid
 		group["posted_on"] = min(
@@ -385,6 +388,10 @@ def enqueue_job(method, job_id: str, rows: int, **kwargs):
 			).format(rows),
 			title=_("Background jobs are off"),
 		)
+	choice = frappe.flags.get("company_setup_delete_entries")
+	if choice is not None:
+		kwargs = {"job": method, "delete_entries": choice, **kwargs}
+		method = run_with_undo_choice
 	frappe.enqueue(
 		method,
 		queue="long",
@@ -394,6 +401,23 @@ def enqueue_job(method, job_id: str, rows: int, **kwargs):
 		now=frappe.in_test,
 		**kwargs,
 	)
+
+
+def run_with_undo_choice(job, delete_entries: int, **kwargs):
+	"""A background undo, with the choice made in its confirm."""
+	set_undo_choice(delete_entries)
+	job(**kwargs)
+
+
+def set_undo_choice(delete_entries: bool | int | None):
+	"""This undo's choice: delete what it cancels, with the ledger rows, or keep what has ledger rows
+	cancelled. None follows Accounts Settings."""
+	frappe.flags.company_setup_delete_entries = None if delete_entries is None else cint(delete_entries)
+
+
+def get_undo_choice() -> bool:
+	choice = frappe.flags.get("company_setup_delete_entries")
+	return deletes_ledger_entries() if choice is None else bool(choice)
 
 
 def cancel_doc(doctype: str, name: str, now: bool = False):
@@ -414,16 +438,21 @@ def cancel_doc(doctype: str, name: str, now: bool = False):
 
 
 def delete_cancelled(doctype: str, name: str) -> bool:
-	"""Delete a cancelled document Company Setup made, with its ledger rows and what it owns, so a
-	posting again takes its name and nothing undone stays behind. Not when the user can't delete it
-	or something else links to it: it stays cancelled and the reason is kept for the undo to tell
-	(pop_kept_reasons). Returns whether it was deleted."""
+	"""Delete a cancelled document Company Setup made, with what it owns, so a posting again takes its
+	name and nothing undone stays behind. One with ledger rows stays cancelled when the undo keeps them
+	(get_undo_choice). Not when the user can't delete it or something else
+	links to it: it stays cancelled and the reason is kept for the undo to tell (pop_kept_reasons).
+	Returns whether it was deleted."""
 	doc = frappe.db.get_value(doctype, name, ["docstatus", "company"], as_dict=True)
 	if not doc or doc.docstatus != 2:
 		return False
-	undo = frappe.flags.setdefault("company_setup_undo", {"company": doc.company, "deleted": {}})
+	undo = frappe.flags.setdefault("company_setup_undo", {"company": doc.company, "deleted": {}, "kept": {}})
 	if frappe.db.get_value("Company Setup", doc.company, "status") == "Live":
 		keep_reason(doctype, name, _("the company is live"))
+		return False
+	delete_entries = get_undo_choice()
+	if not delete_entries and has_ledger_entries(doctype, name):
+		undo["kept"][doctype] = undo["kept"].get(doctype, 0) + 1
 		return False
 	if not frappe.has_permission(doctype, "delete", name):
 		keep_reason(doctype, name, _("you can't delete a {0}").format(_(doctype)))
@@ -432,6 +461,8 @@ def delete_cancelled(doctype: str, name: str) -> bool:
 	try:
 		forget_in_setup(doctype, name)
 		delete_owned(doctype, name)
+		if delete_entries and not deletes_ledger_entries():
+			delete_ledger_entries(doctype, name)
 		frappe.delete_doc(doctype, name)
 		if doctype == "Asset":
 			# ERPNext's "Asset deleted" note: the next asset posted may take this name again
@@ -448,6 +479,101 @@ def delete_cancelled(doctype: str, name: str) -> bool:
 		return False
 	undo["deleted"][doctype] = undo["deleted"].get(doctype, 0) + 1
 	return True
+
+
+def deletes_ledger_entries() -> bool:
+	return bool(cint(frappe.get_single_value("Accounts Settings", "delete_linked_ledger_entries")))
+
+
+def has_ledger_entries(doctype: str, name: str) -> bool:
+	return any(
+		frappe.db.exists(ledger, {"voucher_type": doctype, "voucher_no": name})
+		for ledger in ("GL Entry", "Payment Ledger Entry", "Stock Ledger Entry")
+	)
+
+
+def delete_ledger_entries(doctype: str, name: str):
+	"""The ledger rows ERPNext's own delete removes when Accounts Settings lets it."""
+	delete_exchange_gain_loss_journal(frappe.get_doc(doctype, name))
+	_delete_accounting_ledger_entries(doctype, name)
+	_delete_adv_pl_entries(doctype, name)
+	ple = frappe.qb.DocType("Payment Ledger Entry")
+	frappe.qb.from_(ple).delete().where(
+		(ple.against_voucher_type == doctype) & (ple.against_voucher_no == name) & (ple.delinked == 1)
+	).run()
+	sle = frappe.qb.DocType("Stock Ledger Entry")
+	frappe.qb.from_(sle).delete().where((sle.voucher_type == doctype) & (sle.voucher_no == name)).run()
+
+
+def get_undo_split(onboarding, kind: str, source: str | None, names: list[str] | None = None) -> dict:
+	"""The documents an undo of this source (or of the names picked in it) cancels, counted by doctype
+	in those with ledger rows and those without, which are deleted whatever the undo's choice."""
+	split = {"with_ledger": {}, "without_ledger": {}}
+	for doctype, name in get_undo_documents(onboarding, kind, source, names):
+		counts = split["with_ledger" if has_ledger_entries(doctype, name) else "without_ledger"]
+		counts[doctype] = counts.get(doctype, 0) + 1
+	return split
+
+
+def get_undo_documents(onboarding, kind: str, source: str | None, names: list[str] | None) -> list[tuple]:
+	"""What each undo cancels, as it does: see undo_invoices, undo_balances, bank_accounts.undo_cheques,
+	opening_stock.undo_opening_stock and fixed_assets.undo_fixed_assets."""
+	from erpnext.setup.doctype.company_setup import bank_accounts, opening_stock
+
+	if kind in TABLES:
+		rows = get_undo_rows(onboarding, kind, source, names)
+		paid = get_paid([row.invoice for row in rows])
+		return [
+			(INVOICE_DOCTYPES[kind] if flt(row.outstanding_amount) >= 0 else "Journal Entry", row.invoice)
+			for row in rows
+			if row.invoice not in paid
+		]
+	if kind == "balances":
+		return [
+			("Journal Entry", name)
+			for name in sorted(
+				{
+					row.journal_entry
+					for row in onboarding.opening_balances
+					if row.status == "Posted" and row.journal_entry and (row.source or "") == (source or "")
+				}
+			)
+		]
+	if kind == "cheques":
+		rows = bank_accounts.get_cheques_to_undo(onboarding, source, names)
+		banks = {row.bank_account for row in rows}
+		openings = {
+			row.opening_entry
+			for row in onboarding.uncleared_cheques
+			if row.status == "Posted" and row.bank_account in banks and row.opening_entry
+		}
+		return [("Journal Entry", name) for name in [*(row.journal_entry for row in rows), *sorted(openings)]]
+	if kind == "stock":
+		rows = opening_stock.get_rows_to_undo(onboarding, source, names)
+		entries = {
+			name for row in rows for name in [row.stock_entry, *opening_stock.get_corrections(row)] if name
+		}
+		documents = [("Stock Reconciliation", name) for name in sorted(entries)]
+		if opening_stock.has_difference_on(onboarding, {row.warehouse for row in rows}):
+			documents.append(("Journal Entry", onboarding.stock_difference_entry))
+		return documents
+	if kind == "assets":
+		rows = [
+			row
+			for row in onboarding.fixed_assets
+			if row.status == "Posted"
+			and (row.source or "") == (source or "")
+			and (names is None or row.asset in names)
+		]
+		entries = sorted({row.net_value_entry for row in rows if row.net_value_entry})
+		return [("Asset", row.asset) for row in rows] + [("Journal Entry", name) for name in entries]
+	return []
+
+
+def get_delete_setting() -> dict:
+	"""Accounts Settings' "Delete Accounting and Stock Ledger Entries on deletion of Transaction": the
+	undo confirm's default."""
+	return {"delete": deletes_ledger_entries()}
 
 
 def get_setup_links(doctype: str) -> list[frappe._dict]:
@@ -476,18 +602,8 @@ def forget_in_setup(doctype: str, name: str):
 
 
 def delete_owned(doctype: str, name: str):
-	"""What a cancelled document owns besides itself: the ledger rows ERPNext's own delete removes when
-	Accounts Settings lets it (removed here whatever that says: a setup's mistakes are undone before
-	go-live, not kept), and the cancelled reposts and depreciation schedules made for it."""
-	delete_exchange_gain_loss_journal(frappe.get_doc(doctype, name))
-	_delete_accounting_ledger_entries(doctype, name)
-	_delete_adv_pl_entries(doctype, name)
-	ple = frappe.qb.DocType("Payment Ledger Entry")
-	frappe.qb.from_(ple).delete().where(
-		(ple.against_voucher_type == doctype) & (ple.against_voucher_no == name) & (ple.delinked == 1)
-	).run()
-	sle = frappe.qb.DocType("Stock Ledger Entry")
-	frappe.qb.from_(sle).delete().where((sle.voucher_type == doctype) & (sle.voucher_no == name)).run()
+	"""What a cancelled document owns besides itself and its ledger rows (ERPNext's own delete takes
+	those): the cancelled reposts, depreciation schedules and job cards made for it."""
 	for repost in frappe.get_all(
 		"Repost Item Valuation",
 		filters={"voucher_type": doctype, "voucher_no": name},
@@ -508,6 +624,11 @@ def delete_owned(doctype: str, name: str):
 				"Asset Movement Item", {"parent": movement, "asset": ("!=", name)}
 			):
 				frappe.delete_doc("Asset Movement", movement, ignore_permissions=True)
+	if doctype == "Work Order":
+		for card in frappe.get_all(
+			"Job Card", filters={"work_order": name, "docstatus": ("!=", 1)}, pluck="name"
+		):
+			frappe.delete_doc("Job Card", card, ignore_permissions=True)
 
 
 def keep_reason(doctype: str, name: str, reason: str):
@@ -520,21 +641,35 @@ def pop_kept_reasons(source: str | None = None) -> list[str]:
 	"""Why the entries an undo cancelled are kept, one line each, and forget them. Notes the undo on
 	the Company Setup's timeline."""
 	kept = frappe.flags.pop("company_setup_kept", None) or []
+	frappe.flags.pop("company_setup_delete_entries", None)
 	undo = frappe.flags.pop("company_setup_undo", None)
 	if undo:
-		add_undo_comment(undo["company"], undo["deleted"], kept, source)
+		add_undo_comment(undo["company"], undo["deleted"], undo["kept"], kept, source)
 	return kept
 
 
-def add_undo_comment(company: str, deleted: dict[str, int], kept: list[str], source: str | None):
-	counts = ", ".join(
-		f"{frappe.format_value(count, 'Int')} {_(doctype)}" for doctype, count in deleted.items()
-	)
-	text = (
-		_("Undo by {0}: {1} and their ledger entries deleted.").format(get_fullname(), counts)
-		if deleted
-		else _("Undo by {0}: nothing deleted.").format(get_fullname())
-	)
+def add_undo_comment(
+	company: str,
+	deleted: dict[str, int],
+	kept_by_choice: dict[str, int],
+	kept: list[str],
+	source: str | None,
+):
+	def counts(by_doctype):
+		return ", ".join(
+			f"{frappe.format_value(count, 'Int')} {_(doctype)}" for doctype, count in by_doctype.items()
+		)
+
+	parts = []
+	if deleted:
+		parts.append(_("{0} deleted, with any ledger entries.").format(counts(deleted)))
+	if kept_by_choice:
+		parts.append(
+			_("{0} kept cancelled with their ledger entries, as chosen in the undo.").format(
+				counts(kept_by_choice)
+			)
+		)
+	text = _("Undo by {0}:").format(get_fullname()) + " " + (" ".join(parts) or _("nothing deleted."))
 	if source:
 		text += " " + _("From upload {0}.").format(source)
 	if kept:

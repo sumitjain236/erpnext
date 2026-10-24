@@ -699,17 +699,41 @@ def get_sheet_match(onboarding, party_type: str) -> dict | None:
 	hand_posted = {row.name for row in hand}
 	rows = [row for row in onboarding.get(get_table(party_type)) if row.name not in hand_posted]
 	accounts = get_row_accounts(onboarding, party_type, rows)
+	waiting = get_waiting_parties(onboarding, party_type, rows)
 	entered = {}
+	# the drafts that can't post as they are: in another currency, by currency, or of a disabled party
+	left_out = {"currencies": {}, "disabled": {"amount": 0, "count": 0}}
 	for row in rows:
 		account = accounts[row.name]
-		line = entered.setdefault(account, {"amount": 0, "count": 0, "draft": 0})
-		line["amount"] += flt(row.outstanding_amount)
+		line = entered.setdefault(
+			account, {"amount": 0, "count": 0, "draft": 0, "waiting": 0, "disabled": {}, "left_out": 0}
+		)
+		amount = flt(row.outstanding_amount)
+		line["amount"] += amount
 		line["count"] += 1
 		if row.status != "Created":
-			line["draft"] += flt(row.outstanding_amount)
+			line["draft"] += amount
+			if (not row.party and not row.create_party) or row.party in waiting.other_currency:
+				line["waiting"] += amount
+			elif row.party in waiting.disabled:
+				line["disabled"][row.party] = line["disabled"].get(row.party, 0) + amount
+			if row.party in waiting.other_currency:
+				bucket = left_out["currencies"].setdefault(
+					waiting.other_currency[row.party], {"amount": 0, "count": 0}
+				)
+			elif row.party in waiting.disabled:
+				bucket = left_out["disabled"]
+			else:
+				continue
+			bucket["amount"] += amount
+			bucket["count"] += 1
+			line["left_out"] += amount
 	outside = get_outside_invoices(onboarding, party_type)
 	for invoice in outside:
-		line = entered.setdefault(invoice.account, {"amount": 0, "count": 0, "draft": 0})
+		line = entered.setdefault(
+			invoice.account,
+			{"amount": 0, "count": 0, "draft": 0, "waiting": 0, "disabled": {}, "left_out": 0},
+		)
 		line["amount"] += flt(invoice.amount)
 		line["count"] += 1
 	# a line no account stands for, like Busy's Sundry Debtors beside its sub-groups, is the only other
@@ -732,6 +756,12 @@ def get_sheet_match(onboarding, party_type: str) -> dict | None:
 				"entered": entered.get(account, {}).get("amount", 0),
 				"count": entered.get(account, {}).get("count", 0),
 				"draft": entered.get(account, {}).get("draft", 0),
+				# drafts that stay drafts when posting: unconfirmed or in another currency, and the
+				# disabled customers' or suppliers' unless they are posted anyway
+				"waiting": entered.get(account, {}).get("waiting", 0),
+				"disabled": entered.get(account, {}).get("disabled", {}),
+				# of those, the ones in another currency or of a disabled party, as the card leaves out
+				"left_out": entered.get(account, {}).get("left_out", 0),
 			}
 			for account in accounts
 		]
@@ -739,7 +769,24 @@ def get_sheet_match(onboarding, party_type: str) -> dict | None:
 		else [],
 		"outside": {"count": len(outside), "amount": sum(flt(invoice.amount) for invoice in outside)},
 		"hand_posted": {"count": len(hand), "amount": sum(flt(row.outstanding_amount) for row in hand)},
+		"left_out": left_out,
 	}
+
+
+def get_waiting_parties(onboarding, party_type: str, rows) -> frappe._dict:
+	"""The draft rows' customers or suppliers that keep them drafts when posting: disabled, or in
+	another currency."""
+	from erpnext.setup.doctype.company_setup.company_setup import get_other_currency_parties
+
+	parties = {row.party for row in rows if row.status != "Created" and row.party}
+	return frappe._dict(
+		other_currency=get_other_currency_parties(onboarding.company, party_type, parties),
+		disabled=set(
+			frappe.get_all(
+				party_type, filters={"name": ("in", list(parties) or [""]), "disabled": 1}, pluck="name"
+			)
+		),
+	)
 
 
 def get_hand_posted(onboarding, party_type: str) -> list:
@@ -797,14 +844,19 @@ def get_outside_invoices(onboarding, party_type: str) -> list[frappe._dict]:
 	return [invoice for invoice in invoices if invoice.name not in own]
 
 
-def get_ledger_overs(onboarding, party_type: str) -> list[dict]:
-	"""The receivable or payable ledgers the drafts would put above their trial balance line while
-	another ledger is short of its own: money going to the wrong ledger. Empty when the trial balance
-	doesn't say by ledger, or none is short."""
+def get_ledger_overs(onboarding, party_type: str, disabled_parties: list[str] | None = None) -> list[dict]:
+	"""The receivable or payable ledgers the drafts that post would put above their trial balance
+	line while another ledger is short of its own: money going to the wrong ledger. Empty when the
+	trial balance doesn't say by ledger, or none is short. disabled_parties: those posted anyway."""
 	match = get_sheet_match(onboarding, party_type)
 	if not match or not match["by_account"]:
 		return []
-	lines = match["lines"]
+	lines = []
+	for line in match["lines"]:
+		stays = line["waiting"] + sum(
+			amount for party, amount in line["disabled"].items() if party not in (disabled_parties or [])
+		)
+		lines.append(line | {"entered": line["entered"] - stays, "draft": line["draft"] - stays})
 	short = [line for line in lines if line["sheet"] is not None and line["sheet"] - line["entered"] >= 1]
 	if not short:
 		return []

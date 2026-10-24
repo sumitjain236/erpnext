@@ -15,7 +15,7 @@ from itertools import groupby
 import frappe
 from frappe import _
 from frappe.query_builder.functions import Sum
-from frappe.utils import add_months, cstr, flt, formatdate, getdate
+from frappe.utils import add_months, cstr, flt, fmt_money, formatdate, getdate
 from frappe.utils.background_jobs import is_job_enqueued
 
 from erpnext.accounts.doctype.bank_account.bank_account import _set_closing_balance_as_per_statement
@@ -414,10 +414,34 @@ def save_bank_details(onboarding, rows: list[dict], has_uncleared_cheques: str |
 
 
 def get_statement_mismatches(onboarding) -> list[str]:
-	"""The bank ledgers whose typed statement balance is not their book balance on the day before,
-	with nothing uncleared to explain it, like details typed on the wrong bank."""
+	"""A line for each bank ledger whose typed statement balance is not its book balance on the day
+	before with the uncleared cheques and deposits listed for it added back."""
+	lines = []
+	for account, off in get_statement_offs(onboarding).items():
+		name, currency = frappe.get_cached_value("Account", account, ["account_name", "account_currency"])
+		amount = fmt_money(abs(off), currency=currency)
+		lines.append(
+			(
+				_("{0}: statement is {1} more than the books.")
+				if off > 0
+				else _("{0}: statement is {1} less than the books.")
+			).format(name, amount)
+			+ " "
+			+ cheque_words(
+				onboarding.company,
+				_(
+					"Usually a bank charge or interest not booked yet, or an uncleared cheque missing from the list. Check it, or go ahead."
+				),
+			)
+		)
+	return lines
+
+
+def get_statement_offs(onboarding) -> dict[str, float]:
+	"""By bank ledger, what its statement balance is more than its books, as get_statement_mismatches
+	says it."""
 	if not onboarding.migration_date:
-		return []
+		return {}
 	day_before = get_day_before(onboarding)
 	accounts = [row.account for row in onboarding.bank_accounts if row.has_statement_balance]
 	# the books once the balances are posted, else the trial balance's line
@@ -429,13 +453,18 @@ def get_statement_mismatches(onboarding) -> list[str]:
 		if posted
 		else get_lines(onboarding)
 	)
-	return [
-		frappe.get_cached_value("Account", row.account, "account_name")
-		for row in onboarding.bank_accounts
-		if row.has_statement_balance
-		and row.account in books
-		and abs(flt(row.statement_balance) - flt(books[row.account])) >= 1
-	]
+	uncleared = {}
+	for cheque in onboarding.uncleared_cheques:
+		sign = 1 if cheque.entry_type == "Issued" else -1
+		uncleared[cheque.bank_account] = uncleared.get(cheque.bank_account, 0) + sign * flt(cheque.amount)
+	offs = {}
+	for row in onboarding.bank_accounts:
+		if not row.has_statement_balance or row.account not in books:
+			continue
+		off = flt(row.statement_balance) - flt(books[row.account]) - uncleared.get(row.account, 0)
+		if abs(off) >= 1:
+			offs[row.account] = off
+	return offs
 
 
 def make_bank_account(company: str, row, ledger: frappe._dict) -> str:
@@ -531,9 +560,7 @@ def read_bank_status(onboarding) -> frappe._dict:
 		without_number=sum(1 for bank_account in saved.values() if not bank_account.bank_account_no),
 		unmarked=len(get_unmarked_accounts(company)),
 		default_bank=frappe.get_cached_value("Company", company, "default_bank_account"),
-		statement_off=get_statement_mismatches(onboarding)
-		if onboarding.has_uncleared_cheques == "No"
-		else [],
+		statement_off=get_statement_mismatches(onboarding),
 		has_uncleared_cheques=onboarding.has_uncleared_cheques,
 		drafts=sum(1 for row in onboarding.uncleared_cheques if row.status != "Posted"),
 		cheques=sum(1 for row in posted if row.entry_type == "Issued" and row.bank_account not in cards),
@@ -556,34 +583,29 @@ def read_bank_match(onboarding) -> dict | None:
 	ledgers = [ledger.name for ledger in get_bank_ledgers(onboarding.company)]
 	lines = get_lines(onboarding)
 	books = get_balances(onboarding.company, ledgers, get_day_before(onboarding))
-	# with nothing uncleared, the bank's statement is its book balance too
-	statements = (
-		get_statement_balances(onboarding, get_company_bank_accounts(onboarding.company, ledgers))
-		if onboarding.has_uncleared_cheques == "No"
-		else {}
-	)
-	own_currency = get_balances(
-		onboarding.company,
-		list(statements),
-		get_day_before(onboarding),
-		in_account_currency=True,
-	)
 	rows = [
 		{
 			"account": account,
 			"books": flt(books.get(account)),
 			"line": flt(lines.get(account)),
-			"statement": statements.get(account),
-			"matches": abs(flt(books.get(account)) - flt(lines.get(account))) < 1
-			and (
-				account not in statements
-				or abs(flt(statements[account]) - flt(own_currency.get(account))) < 1
-			),
+			"matches": abs(flt(books.get(account)) - flt(lines.get(account))) < 1,
 		}
 		for account in ledgers
 		if account in lines or flt(books.get(account))
 	]
-	return {"lines": rows, "matched": sum(1 for row in rows if row["matches"]), "total": len(rows)}
+	return {
+		"lines": rows,
+		"matched": sum(1 for row in rows if row["matches"]),
+		"total": len(rows),
+		"statement_off": [
+			{
+				"account": account,
+				"off": off,
+				"currency": frappe.get_cached_value("Account", account, "account_currency"),
+			}
+			for account, off in get_statement_offs(onboarding).items()
+		],
+	}
 
 
 def save_uncleared_cheques(onboarding, rows: list[dict], source: str | None = None) -> int:

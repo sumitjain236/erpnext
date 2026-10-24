@@ -775,6 +775,7 @@ class TestOpeningBalances(ERPNextTestSuite):
 	"""Opening balances on the Accounts tab: everything but customers, suppliers and stock."""
 
 	def setUp(self):
+		self.enterContext(self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 1}))
 		self.company = make_company()
 		frappe.set_user(make_user("onboarding.accounts@example.com", "Accounts Manager"))
 		self.doc = frappe.get_doc("Company Setup", self.company)
@@ -1181,6 +1182,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 	"""Unpaid customer and supplier invoices on the Selling and Buying tabs."""
 
 	def setUp(self):
+		self.enterContext(self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 1}))
 		user = make_user("onboarding.accounts@example.com", "Accounts Manager")
 		for role in ("Sales Manager", "Purchase Manager"):
 			make_user(user, role)
@@ -1499,6 +1501,11 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertNotIn(customer.name, self.doc.get_invoice_names("Customer")["party_accounts"])
 		# nor does the books' preview count it
 		self.assertEqual(self.doc.preview_opening_balances()["left_out_invoices"], 1)
+		# not even on a ledger in the company's currency, as the Selling card leaves it out
+		row = self.doc.opening_sales_invoices[0]
+		frappe.db.set_value(row.doctype, row.name, "account", receivable)
+		self.doc.reload()
+		self.assertEqual(self.doc.preview_opening_balances()["left_out"]["currencies"], {"USD": 1})
 		self.doc.create_opening_invoices("Customer")
 		self.doc.reload()
 
@@ -2224,7 +2231,9 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		self.assertNotIn("<", second.error)
 		self.doc.run_method("onload")
 		step = self.doc.get_onload().steps[step_key(self.doc, "opening_sales_invoices")]
-		self.assertEqual(step["summary"], "1 posted · 1 left to post: 1 failed, fix them and post again")
+		self.assertEqual(
+			step["summary"], "1 invoice posted · 1 invoice left to post: 1 failed, fix them and post again"
+		)
 
 	def test_posted_and_repeated_invoices_are_kept_once(self):
 		result = self.doc.import_opening_invoices(
@@ -2384,6 +2393,7 @@ class TestBankAccounts(ERPNextTestSuite):
 	"""Bank accounts on the Accounts tab: bank details, and the cheques the bank had not cleared."""
 
 	def setUp(self):
+		self.enterContext(self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 1}))
 		self.company = make_company()
 		self.hdfc = add_account(
 			self.company,
@@ -2858,6 +2868,22 @@ class TestEveryTab(ERPNextTestSuite):
 		return {key.rsplit(".", 1)[-1]: step for key, step in steps.items()}
 
 	def test_steps_with_nothing_in_the_trial_balance_show_and_are_optional(self):
+		# before the trial balance is in, nothing is called not needed yet
+		steps = self.get_steps()
+		waiting = "Optional · we'll tell you once your trial balance is in"
+		self.assertEqual(
+			{
+				name: steps[name]["summary"]
+				for name in ("items", "opening_stock", "fixed_assets", "bank_accounts")
+			},
+			dict.fromkeys(("items", "opening_stock", "fixed_assets", "bank_accounts"), waiting),
+		)
+
+		self.doc.reload()
+		self.doc.append(
+			"opening_balances", {"account": get_account(self.company, account_type="Cash"), "debit": 10}
+		)
+		self.doc.save()
 		steps = self.get_steps()
 		self.assertEqual(
 			{
@@ -2916,6 +2942,7 @@ class TestOpeningStock(ERPNextTestSuite):
 	"""Items, Warehouses and Opening stock on the Stock tab."""
 
 	def setUp(self):
+		self.enterContext(self.change_settings("Accounts Settings", {"delete_linked_ledger_entries": 1}))
 		self.company = make_company()
 		frappe.db.set_value("Company", self.company, "enable_perpetual_inventory", 1)
 		self.yarn = make_stock_item("_Test Setup Yarn", "Kg")

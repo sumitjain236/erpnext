@@ -74,6 +74,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	get_table,
 	get_temporary_account,
 	get_title_account,
+	get_waiting_parties,
 	match_party,
 	normalize_account_name,
 	post_invoices,
@@ -92,6 +93,7 @@ from erpnext.setup.doctype.company_setup.posted_entries import (
 	needs_background,
 	pop_kept_reasons,
 	run_or_enqueue,
+	set_undo_choice,
 	undo_balances,
 	undo_invoices,
 	undo_invoices_in_background,
@@ -244,6 +246,7 @@ class CompanySetup(Document):
 					"title": step["title"],
 					"description": step["description"],
 					"summary": step.get("summary"),
+					"warnings": step.get("warnings"),
 					"started": step.get("started"),
 					"tab": step.get("tab"),
 					"required": step.get("required"),
@@ -760,15 +763,30 @@ class CompanySetup(Document):
 			if row.account and row.status != "Posted"
 		]
 		# invoices land on their customer's or supplier's account, a name confirmed as new on the
-		# company's default one; posting leaves out a disabled party and one in another currency
-		draft_invoices, left_out = 0, 0
+		# company's default one; posting leaves out a disabled party and one in another currency, as
+		# get_sheet_match counts them, and a draft an invoice made by hand stands for
+		draft_invoices = 0
+		left_out = {
+			"count": 0,
+			"amount": 0,
+			"currencies": {},
+			"disabled": 0,
+			"unconfirmed": 0,
+			"party_types": [],
+		}
 		currency = frappe.get_cached_value("Company", self.company, "default_currency")
 		for party_type, sign in (("Customer", 1), ("Supplier", -1)):
 			parties = get_parties(party_type)
+			hand_posted = {row.name for row in get_hand_posted(self, party_type)}
+			draft_rows = [
+				row
+				for row in self.get(TABLES[party_type])
+				if row.status != "Created" and row.name not in hand_posted
+			]
+			waiting = get_waiting_parties(self, party_type, draft_rows)
 			party_rows = [
 				(row, row.party if row.party in parties.names else find_party(parties, row.party_name))
-				for row in self.get(TABLES[party_type])
-				if row.status != "Created"
+				for row in draft_rows
 			]
 			accounts = get_party_accounts(party_type, [party for _row, party in party_rows], self.company)[0]
 			for row, party in party_rows:
@@ -777,15 +795,31 @@ class CompanySetup(Document):
 					if party
 					else row.create_party and get_party_account(party_type, None, self.company)
 				)
-				if (
-					not account
-					or party in parties.disabled
-					or frappe.get_cached_value("Account", account, "account_currency") != currency
-				):
-					left_out += 1
+				account_currency = account and frappe.get_cached_value("Account", account, "account_currency")
+				other_currency = waiting.other_currency.get(row.party) or (
+					account_currency != currency and account_currency
+				)
+				reason = (
+					"unconfirmed"
+					if not account
+					else "currency"
+					if other_currency
+					else "disabled"
+					if party in parties.disabled or row.party in waiting.disabled
+					else None
+				)
+				if not reason:
+					drafts.append((account, sign * flt(row.outstanding_amount)))
+					draft_invoices += 1
 					continue
-				drafts.append((account, sign * flt(row.outstanding_amount)))
-				draft_invoices += 1
+				left_out["count"] += 1
+				left_out["amount"] += flt(row.outstanding_amount)
+				if party_type not in left_out["party_types"]:
+					left_out["party_types"].append(party_type)
+				if reason == "currency":
+					left_out["currencies"][other_currency] = left_out["currencies"].get(other_currency, 0) + 1
+				else:
+					left_out[reason] += 1
 		for account, difference in drafts:
 			balances[account] = balances.get(account, 0) + difference
 			balances[temporary] = balances.get(temporary, 0) - difference
@@ -827,7 +861,8 @@ class CompanySetup(Document):
 			"rows": rows,
 			"drafts": sum(1 for row in self.opening_balances if row.status != "Posted"),
 			"draft_invoices": draft_invoices,
-			"left_out_invoices": left_out,
+			"left_out_invoices": left_out["count"],
+			"left_out": left_out,
 		}
 
 	@frappe.whitelist()
@@ -1120,13 +1155,19 @@ class CompanySetup(Document):
 
 	@frappe.whitelist()
 	def undo_posting(
-		self, kind: str, source: str | None = None, invoices: list[str] | str | None = None
+		self,
+		kind: str,
+		source: str | None = None,
+		invoices: list[str] | str | None = None,
+		delete_entries: bool | None = None,
 	) -> dict | str:
 		"""Undo what was posted from one source, or only the invoices named: the invoices are cancelled
-		and their rows kept as undone, the balances go back to drafts. Not once live."""
+		and their rows kept as undone, the balances go back to drafts. Not once live. delete_entries:
+		see set_undo_choice."""
 		self.check_permission("write")
 		self.start_change()
 		check_undo(self)
+		set_undo_choice(delete_entries)
 		if kind != "balances" and kind not in TABLES:
 			frappe.throw(_("Unknown kind {0}").format(kind), title=_("Can't undo"))
 		invoices = frappe.parse_json(invoices) if isinstance(invoices, str) else invoices
@@ -1211,7 +1252,7 @@ class CompanySetup(Document):
 				frappe.PermissionError,
 				title=_("Not permitted"),
 			)
-		overs = get_ledger_overs(self, party_type)
+		overs = get_ledger_overs(self, party_type, disabled_parties)
 		if overs:
 			frappe.throw(
 				get_ledger_over_message(
@@ -1354,13 +1395,18 @@ class CompanySetup(Document):
 
 	@frappe.whitelist()
 	def undo_uncleared_cheques(
-		self, source: str | None = None, entries: list[str] | str | None = None
+		self,
+		source: str | None = None,
+		entries: list[str] | str | None = None,
+		delete_entries: bool | None = None,
 	) -> dict | str:
 		"""Undo the cheques and deposits posted from one source, or only those whose entries are named:
-		see bank_accounts.undo_cheques. Not once live, nor for a cheque the bank cleared."""
+		see bank_accounts.undo_cheques. Not once live, nor for a cheque the bank cleared.
+		delete_entries: see set_undo_choice."""
 		self.check_permission("write")
 		self.start_change()
 		check_undo(self)
+		set_undo_choice(delete_entries)
 		entries = frappe.parse_json(entries) if isinstance(entries, str) else entries
 		if entries is not None and not entries:
 			frappe.throw(
@@ -1491,13 +1537,17 @@ class CompanySetup(Document):
 
 	@frappe.whitelist()
 	def undo_opening_stock(
-		self, source: str | None = None, warehouses: list | str | None = None
+		self,
+		source: str | None = None,
+		warehouses: list | str | None = None,
+		delete_entries: bool | None = None,
 	) -> dict | str:
 		"""Undo an upload's posted stock, or only its warehouses named. Refused once later stock
-		entries exist on them: correct the rows instead."""
+		entries exist on them: correct the rows instead. delete_entries: see set_undo_choice."""
 		self.check_permission("write")
 		self.start_change()
 		check_undo(self)
+		set_undo_choice(delete_entries)
 		warehouses = frappe.parse_json(warehouses) if isinstance(warehouses, str) else warehouses
 		rows = stock.get_rows_to_undo(self, source, warehouses)
 		stock.check_stock_undo(self, rows)
@@ -1765,12 +1815,16 @@ class CompanySetup(Document):
 
 	@frappe.whitelist()
 	def undo_fixed_assets(
-		self, source: str | None = None, asset_names: list | str | None = None
+		self,
+		source: str | None = None,
+		asset_names: list | str | None = None,
+		delete_entries: bool | None = None,
 	) -> dict | str:
 		"""Undo posted assets of one upload, or only those named; refused once depreciation is posted
-		for them. Allowed after Go live."""
+		for them. Allowed after Go live. delete_entries: see set_undo_choice."""
 		self.check_permission("write")
 		self.start_change()
+		set_undo_choice(delete_entries)
 		asset_names = frappe.parse_json(asset_names) if isinstance(asset_names, str) else asset_names
 		posted = [
 			row
