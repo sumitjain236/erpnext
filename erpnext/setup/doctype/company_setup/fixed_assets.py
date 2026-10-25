@@ -147,6 +147,8 @@ WDV_SALVAGE = 0.05
 # not translated, so a user in another language finds the same one
 LOCATION = "Head Office"
 NET_VALUE_ACCOUNT = "Accumulated Depreciation - {0}"
+# words every accumulated depreciation line has, left out when matching one to a category
+LINE_WORDS = {"acc", "accumulated", "depreciation", "dep", "provision", "for", "on", "of", "and"}
 # the Item field of a goods or services code, as India Compliance adds; asked per category when there
 HSN_FIELD = "gst_hsn_code"
 # what ERPNext's Asset Category of a category with posted assets holds
@@ -502,7 +504,8 @@ def get_depreciation_lines(company: str) -> list[frappe._dict]:
 
 
 def find_own_line(lines: list, category: str, asset_account: str) -> str | None:
-	"""The one line named for the category, else the one next to its asset line."""
+	"""The one line named for the category, else the one next to its asset line, else the one
+	sharing the most words with the category, as "Acc. Depreciation - Vehicles" for Motor Vehicles."""
 	parent = frappe.get_cached_value("Account", asset_account, "parent_account")
 	for matches in (
 		[row for row in lines if get_similar_key(category) in get_similar_key(row.account_name)],
@@ -510,7 +513,11 @@ def find_own_line(lines: list, category: str, asset_account: str) -> str | None:
 	):
 		if len(matches) == 1:
 			return matches[0].name
-	return None
+	words = set(get_similar_key(category).split()) - LINE_WORDS
+	shared = {row.name: len(words & set(get_similar_key(row.account_name).split())) for row in lines}
+	most = max(shared.values(), default=0)
+	closest = [name for name, count in shared.items() if count == most]
+	return closest[0] if most and len(closest) == 1 else None
 
 
 def get_own_lines(onboarding) -> dict[str, str]:
@@ -1036,7 +1043,7 @@ def get_net_value_categories(onboarding, prepared: list, plan: frappe._dict) -> 
 	is at net value when those moved; else when its line on the day before is the rows' cost less
 	their depreciation, not their cost."""
 	accounts = {asset.row.asset_account for asset in prepared if asset.row.asset_account}
-	lines = get_balances(onboarding.company, list(accounts), plan.day_before)
+	lines = get_line_balances(onboarding, list(accounts), plan.day_before)
 	moves = {}
 	for account in accounts:
 		rows = [asset.row for asset in prepared if asset.row.asset_account == account]
@@ -1116,6 +1123,13 @@ def get_asset_checks(onboarding) -> dict:
 			if asset.method == "Written Down Value" and asset.rate and not 0 < asset.rate < 100
 		],
 		hsn_code=[row.asset_category for row in new_items if hsn_label and not row.hsn_code],
+		bad_hsn={
+			row.asset_category: error
+			for row in new_items
+			if hsn_label
+			and row.hsn_code
+			and (error := get_asset_item_error(row.asset_category, row.hsn_code))
+		},
 		accounts=[
 			row.asset_category
 			for row in categories
@@ -1188,8 +1202,8 @@ def get_asset_checks(onboarding) -> dict:
 		{row.accumulated_account for row in onboarding.asset_categories if row.accumulated_account}
 	)
 	# a migration date still to come has the opening balances dated then
-	books = get_balances(
-		onboarding.company, asset_accounts + accumulated, max(getdate(nowdate()), plan.day_before)
+	books = get_line_balances(
+		onboarding, asset_accounts + accumulated, max(getdate(nowdate()), plan.day_before)
 	)
 	return {
 		"day_before": plan.day_before,
@@ -1258,7 +1272,7 @@ def get_permission_blocker(categories: list) -> str | None:
 		if not frappe.has_permission(doctype, ptype):
 			roles = [role for role in get_doctype_roles(doctype, ptype) if role != "System Manager"]
 			return _(
-				"Posting makes {0} records, which needs the {1} role. Ask your System Manager for it."
+				"Posting makes {0} records, which needs the {1} role. Ask an Administrator to add it in User."
 			).format(_(doctype), _(roles[0] if roles else "System Manager"))
 	return None
 
@@ -1285,13 +1299,23 @@ def get_changed_categories(company: str, categories: list) -> list[str]:
 	return changed
 
 
+def get_line_balances(onboarding, accounts: list[str], date) -> dict[str, float]:
+	"""The accounts' balances on the date, with their trial balance lines not posted yet: until the
+	balances are posted, the books are as they will be."""
+	balances = get_balances(onboarding.company, accounts, date)
+	for row in onboarding.opening_balances:
+		if row.status != "Posted" and row.account in accounts:
+			balances[row.account] = flt(balances.get(row.account)) + flt(row.debit) - flt(row.credit)
+	return balances
+
+
 def get_category_off(onboarding, rows: list, net_value: dict, plan: frappe._dict) -> dict[str, float]:
 	"""By asset account, how far the rows' cost is from its line on the day before, when not at net value.
 	Nothing while a row has no account: its cost is on one of the lines."""
 	if any(not row.asset_account for row in rows):
 		return {}
 	accounts = sorted({row.asset_account for row in rows} - set(net_value))
-	lines = get_balances(onboarding.company, accounts, plan.day_before)
+	lines = get_line_balances(onboarding, accounts, plan.day_before)
 	off = {}
 	for account in accounts:
 		cost = sum(flt(row.gross) for row in onboarding.fixed_assets if row.asset_account == account)
@@ -1314,7 +1338,7 @@ def get_depreciation_off(
 		for line, accounts in lines.items()
 		if any(category.accumulated_account == line for category in categories)
 	}
-	balances = get_balances(onboarding.company, list(lines), plan.day_before)
+	balances = get_line_balances(onboarding, list(lines), plan.day_before)
 	off = {}
 	for line, accounts in lines.items():
 		depreciation = sum(
@@ -1403,6 +1427,11 @@ def get_asset_reds(
 			_("Give the {0} code of 1 category.").format(hsn_label)
 			if len(reds.hsn_code or []) == 1
 			else _("Give the {0} codes of {1} categories.").format(hsn_label, len(reds.hsn_code or [])),
+		),
+		(
+			"bad_hsn",
+			reds.bad_hsn,
+			"; ".join(f"{category}: {error}" for category, error in (reds.bad_hsn or {}).items()),
 		),
 		(
 			"accounts",
@@ -1652,9 +1681,28 @@ def get_category_item(category: str) -> str | None:
 
 def get_asset_item(category: str, hsn_code: str | None = None) -> str:
 	"""The category's first fixed asset item, else a new one named "<category> - Asset"."""
-	item = get_category_item(category)
-	if item:
-		return item
+	return get_category_item(category) or new_asset_item(category, hsn_code).insert().name
+
+
+def get_asset_item_error(category: str, hsn_code: str) -> str | None:
+	"""Why the category's new item can't be made with this code, by the rules of the app that adds
+	the code, like its length or its master: checked as the item is saved, without saving it."""
+	doc = new_asset_item(category, hsn_code)
+	muted = frappe.flags.mute_messages
+	frappe.flags.mute_messages = True
+	try:
+		doc.run_method("validate")
+	except frappe.ValidationError as e:
+		return get_error_text(e)
+	finally:
+		frappe.flags.mute_messages = muted
+	master = frappe.get_meta("Item").get_field(HSN_FIELD).options
+	if master and not frappe.db.exists(master, hsn_code):
+		return _("Could not find {0}: {1}").format(_(master), hsn_code)
+	return None
+
+
+def new_asset_item(category: str, hsn_code: str | None = None):
 	doc = frappe.new_doc("Item")
 	doc.update(
 		{
@@ -1667,7 +1715,7 @@ def get_asset_item(category: str, hsn_code: str | None = None) -> str:
 	)
 	if get_hsn_label():
 		doc.set(HSN_FIELD, hsn_code)
-	return doc.insert().name
+	return doc
 
 
 def get_hsn_label() -> str | None:
@@ -2022,11 +2070,15 @@ def read_asset_match(onboarding) -> dict | None:
 			)
 	asset_accounts = sorted({row.asset_account for row in rows})
 	accumulated = sorted(set(register) - set(asset_accounts))
-	books = get_register_books(onboarding, rows, list(register))
+	# asset lines no posted row is on: the register matches only when they hold nothing
+	others = [account for account in get_fixed_asset_accounts(onboarding.company) if account not in register]
+	books = get_register_books(onboarding, rows, list(register) + others)
 	after = get_hand_booked(onboarding, after=get_post_time(onboarding))
 	books_cost = flt(sum(flt(books.get(account)) for account in asset_accounts), 2)
 	books_depreciation = flt(-sum(flt(books.get(account)) for account in accumulated), 2)
-	matches = all(abs(flt(books.get(account)) - amount) < 1 for account, amount in register.items())
+	matches = all(abs(flt(books.get(account)) - amount) < 1 for account, amount in register.items()) and all(
+		abs(flt(books.get(account))) < 1 for account in others
+	)
 	return {
 		"cost": cost,
 		"depreciation": flt(depreciation, 2),

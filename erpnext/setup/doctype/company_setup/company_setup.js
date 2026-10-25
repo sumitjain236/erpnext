@@ -8,6 +8,10 @@ frappe.ui.form.on("Company Setup", {
 			update_posting(frm, data.party_type);
 		});
 		listen_for_postings(frm);
+		frappe.realtime.off("company_setup_year_close");
+		frappe.realtime.on("company_setup_year_close", (data) => {
+			if (data.company === frm.doc.company) update_year_close(frm, data.state);
+		});
 	},
 
 	refresh(frm) {
@@ -32,8 +36,10 @@ frappe.ui.form.on("Company Setup", {
 				frm.posting?.[party_type] || {},
 			])
 		);
+		frm.year_close = frm.doc.__onload?.year_close;
 		frm.events.render(frm);
 		watch_stock_posting(frm);
+		watch_year_close(frm);
 		show_tabs_cue(frm);
 		// a step done or undone since the last save, from the company's data, is saved now
 		// once at a time: two reloads close together would save the steps twice over each other
@@ -50,6 +56,7 @@ frappe.ui.form.on("Company Setup", {
 		const steps = get_steps(frm);
 		make_page(frm, "onboarding_html").append(
 			make_company_card(frm),
+			make_missing_roles(frm),
 			make_overview_stats(frm),
 			frm.doc.status === "Live"
 				? $(`<div class="contact-box mb-0"></div>`).append(make_live_note(frm))
@@ -91,6 +98,21 @@ function get_steps(frm) {
 		is_complete: status(row) === "Done",
 		is_skipped: status(row) === "Skipped",
 	}));
+}
+
+// The roles the steps left need that this user lacks, all named at once
+function make_missing_roles(frm) {
+	const missing = frm.doc.__onload?.missing_roles || [];
+	if (!missing.length) return [];
+	return make_alerts([
+		{
+			theme: "yellow",
+			title: __("To finish setup you also need these roles. Ask an Administrator to add them in User."),
+			description: missing
+				.map(({ role, steps }) => __("{0} for {1}", [__(role), frappe.utils.comma_and(steps)]))
+				.join(" · "),
+		},
+	]);
 }
 
 // What the opening books add up to so far; shown once anything is entered
@@ -159,15 +181,20 @@ function make_overview_stats(frm) {
 	];
 }
 
-// "Waiting for stock ₹ 18,40,000 and sales invoices ₹ 4,12,000"; past two parts, only their names
+// "Waiting for stock ₹ 18,40,000 and sales invoices ₹ 4,12,000"; past two parts, only their names.
+// Invoices, bills or stock over the trial balance come first: they wait for nothing
 function get_waiting_text(parts, currency) {
+	const over = parts.filter((part) => part.over);
+	const shown = over.length ? over : parts;
 	const named =
-		parts.length > 2
-			? parts.map((part) => part.label)
-			: parts.map((part) =>
+		shown.length > 2
+			? shown.map((part) => part.label)
+			: shown.map((part) =>
 					__("{0} {1}", [part.label, format_currency(Math.abs(part.amount), currency, 0)])
 			  );
-	return __("Waiting for {0}", [frappe.utils.comma_and(named)]);
+	return over.length
+		? __("More than your trial balance: {0}", [frappe.utils.comma_and(named)])
+		: __("Waiting for {0}", [frappe.utils.comma_and(named)]);
 }
 
 const TABS = [
@@ -205,7 +232,7 @@ function make_checklist(frm, steps) {
 	const done = counted.filter(finished).length;
 	const required = counted.filter((step) => step.is_required);
 	const required_done = required.filter(finished).length;
-	const $card = $(`<div class="contact-box flex flex-col gap-1 mb-0"></div>`);
+	const $card = $(`<div class="contact-box flex flex-col gap-1 mb-0" data-company-setup-checklist></div>`);
 	$card.append(
 		frappe.ui.progress({
 			label: __("Set up {0}", [frm.doc.company]),
@@ -238,18 +265,37 @@ function make_checklist(frm, steps) {
 			group = label;
 			$(`<div class="text-sm-medium text-ink-gray-5 pt-3"></div>`).text(label).appendTo($card);
 		}
+		const closing = step.name === "check_books" && frm.year_close && !frm.year_close.error;
+		const $task = make_task(
+			frm,
+			closing
+				? { ...step, is_closing: true, summary: get_year_close_summary(frm) }
+				: step.is_needed || step.summary
+				? step
+				: { ...step, summary: __("Optional · not started") },
+			[]
+		).addClass("grow min-w-0");
+		if (closing) {
+			const { done } = frm.year_close;
+			const total = frm.year_close.steps.length;
+			$task
+				.find(".flex-col")
+				.first()
+				.append(
+					$(`<div class="pt-1"></div>`).append(
+						frappe.ui.progress({
+							intervals: true,
+							interval_count: total,
+							size: "sm",
+							value: (done / total) * 100,
+						})
+					)
+				);
+		}
 		$(
 			`<div class="company-setup-step cursor-pointer flex items-center rounded-md mx-n2 p-2 gap-3" role="button" tabindex="0"></div>`
 		)
-			.append(
-				make_task(
-					frm,
-					step.is_needed || step.summary
-						? step
-						: { ...step, summary: __("Optional · not started") },
-					[]
-				).addClass("grow min-w-0")
-			)
+			.append($task)
 			.append(
 				$(`<span class="shrink-0 text-ink-gray-5"></span>`).html(
 					frappe.utils.icon("chevron-right", "sm")
@@ -319,7 +365,9 @@ function make_task_card(frm, step) {
 	if (frm.posting?.[posting_party]) {
 		step = { ...step, is_posting: true, summary: get_posting_text(frm, posting_party) };
 	}
-	const $card = $(`<div class="contact-box mb-0"></div>`).append(make_task(frm, step, buttons));
+	const $card = $(`<div class="contact-box mb-0"></div>`)
+		.attr("data-company-setup-card", step.name)
+		.append(make_task(frm, step, buttons));
 	if (step.name === "check_books") {
 		if (has_posted(frm)) {
 			// the reports show only what is posted
@@ -349,8 +397,13 @@ function make_task_card(frm, step) {
 				.addClass("text-ink-gray-5");
 		}
 		const reminders = get_books_reminders(frm);
-		if (reminders.length) {
-			$card.append($(`<div class="ps-8 pt-3"></div>`).append(make_alerts(reminders)));
+		if (reminders.length || frm.year_close) {
+			$card.append(
+				$(`<div class="flex flex-col gap-3 ps-8 pt-3"></div>`).append(
+					make_year_close_alert(frm),
+					reminders.length ? make_alerts(reminders) : []
+				)
+			);
 		}
 	}
 	if (step.name === "fixed_assets" && get_hand_after_alerts(frm).length) {
@@ -846,8 +899,21 @@ function make_where_box(places, title) {
 }
 
 // Status icon, title, one line on what's done or left, and the buttons
+// a disabled button takes no pointer, so the reason it is disabled shows from a wrapper
+function make_button(opts) {
+	if (!opts.disabled || !opts.tooltip) return frappe.ui.button(opts);
+	return frappe.ui.tooltip(
+		$(`<span class="inline-flex" tabindex="0"></span>`)
+			.attr("aria-label", opts.tooltip)
+			.append(frappe.ui.button({ ...opts, tooltip: undefined })),
+		{ text: opts.tooltip }
+	);
+}
+
 function make_task(frm, step, buttons) {
-	const [icon, color] = step.is_posting
+	const [icon, color] = step.is_closing
+		? ["loader-circle", "text-ink-blue-7"]
+		: step.is_posting
 		? ["loader-circle", "text-ink-gray-8"]
 		: step.is_complete
 		? ["circle-check", "text-ink-gray-8"]
@@ -879,7 +945,7 @@ function make_task(frm, step, buttons) {
 	if (buttons.length) {
 		const $actions = $(`<div class="flex flex-wrap items-center justify-end gap-2 ms-auto"></div>`);
 		buttons.forEach((opts) =>
-			$actions.append(opts.jquery || opts instanceof Element ? opts : frappe.ui.button(opts))
+			$actions.append(opts.jquery || opts instanceof Element ? opts : make_button(opts))
 		);
 		$task.append($actions);
 	}
@@ -1018,6 +1084,17 @@ function show_migration_date(frm) {
 
 	show_where();
 	dialog.get_field("where").$wrapper.append($where);
+	// Escape closes an open calendar, not the window: before the calendar's own handler hides it
+	dialog.$wrapper[0].addEventListener(
+		"keydown",
+		(event) => {
+			const picker = dialog.get_field("migration_date").datepicker;
+			if (event.key !== "Escape" || !picker?.visible) return;
+			picker.hide();
+			event.stopPropagation();
+		},
+		true
+	);
 	dialog.show();
 }
 
@@ -1093,60 +1170,42 @@ function see_books_button(frm) {
 // accounts set; for Check your books and Go live
 function get_books_reminders(frm) {
 	const reminders = frm.doc.__onload?.books_reminders || {};
-	const currency = erpnext.get_currency(frm.doc.company);
 	// ERPNext closes a year only after the one before it: the years with a profit each get a line,
 	// and the button on the oldest closes the years before it with entries but no profit too
-	const years = reminders.unclosed_years || [];
+	const years = frm.year_close ? [] : reminders.unclosed_years || [];
 	const first = years.findIndex((year) => flt(year.profit, 2));
 	const alerts = years
 		.filter((year) => flt(year.profit, 2))
 		.map((year, index) => {
-			const before = index ? [] : years.slice(0, first).map((other) => other.fiscal_year);
-			const stock =
-				(index
-					? year.stock
-					: years.slice(0, first + 1).find((y) => y.stock?.needed && !y.stock.done)?.stock) || {};
-			const year_end = frappe.datetime.str_to_user(year.year_end_date);
-			const closing_stock = stock.needed && ["Queued", "In Progress"].includes(stock.status);
-			if (closing_stock) {
-				// the closing builds in the background: look again until it is done
-				watch_stock_job(
-					frm,
-					"closing_stock_timer",
-					20000,
-					{ year_end: year.year_end_date },
-					(status) => ["Queued", "In Progress"].includes(status.closing)
-				);
-			}
+			const steps = index ? [] : get_year_close_steps(years.slice(0, first + 1));
+			const blocker = years.slice(0, first + 1).find((y) => y.stock?.needed && !y.stock.done)
+				?.stock.blocker;
 			return {
 				theme: "yellow",
-				title: __("Last year's profit is not closed"),
+				title:
+					year.profit > 0
+						? __("Last year's profit is not closed")
+						: __("Last year's loss is not closed"),
 				description: [
 					__(
-						"{0} of {1} is still in income and expenses, so the Balance Sheet shows the year as not closed. Close it once every opening entry is posted: entries on or before {2} can't be posted or undone after.",
-						[format_currency(year.profit, currency), year.fiscal_year, year_end]
+						"{0} has {1} still in income and expenses, so the Balance Sheet shows the year as not closed. Close it once every opening entry is posted: entries on or before {2} can't be posted or undone after.",
+						[
+							year.fiscal_year,
+							profit_words(frm, year.profit),
+							frappe.datetime.str_to_user(year.year_end_date),
+						]
 					),
-					before.length
-						? __("{0} is closed first: it has entries, like old invoices, but no profit.", [
-								before.join(", "),
-						  ])
-						: null,
-					stock.needed && !stock.done
-						? stock.blocker ||
-						  (closing_stock
-								? __("Closing stock… This updates by itself when done.")
-								: __("Your stock is closed first; then the year."))
-						: null,
+					index ? null : blocker,
 				]
 					.filter(Boolean)
 					.join(" "),
 				buttons:
-					index || stock.blocker || closing_stock
+					index || blocker
 						? []
 						: [
 								{
 									label: __("Close {0}", [year.fiscal_year]),
-									onclick: () => close_year(frm, year, before, stock),
+									onclick: () => close_year(frm, year, steps),
 								},
 						  ],
 			};
@@ -1162,17 +1221,6 @@ function get_books_reminders(frm) {
 			),
 			description: gaps.map((gap) => __("{0}: {1}", [gap.label, gap.reason])).join(" · "),
 			buttons: [
-				// a receivable or payable default other than the biggest line: one click to change it
-				...gaps
-					.filter((gap) => gap.account)
-					.map((gap) => ({
-						label: __("Use {0}", [short_account(frm, gap.account)]),
-						onclick: () =>
-							call_method(frm, "set_default_party_account", {
-								fieldname: gap.fieldname,
-								account: gap.account,
-							}).then(() => reload_fresh(frm)),
-					})),
 				{
 					label: __("Open company"),
 					onclick: () => frappe.set_route("Form", "Company", frm.doc.company),
@@ -1186,11 +1234,27 @@ function get_books_reminders(frm) {
 	return alerts;
 }
 
-// Close a year from Check your books: its stock first when the company keeps stock, then the
-// profit into the account picked
-function close_year(frm, year, before = [], stock = year.stock) {
-	const stock_first = stock?.needed && !stock.done;
+// A year's profit or loss as words, like "a loss of ₹ 20,66,837"
+function profit_words(frm, profit) {
+	return profit > 0
+		? __("a profit of {0}", [money(frm, profit)])
+		: __("a loss of {0}", [money(frm, Math.abs(profit))]);
+}
+
+// What closing the last of years takes, in order, as the server's get_year_close_steps gives it:
+// each year's stock to its end when it isn't closed yet, then the year
+function get_year_close_steps(years) {
+	return years.flatMap((year) => [
+		...(year.stock?.needed && !year.stock.done ? [{ stock: year.year_end_date }] : []),
+		{ fiscal_year: year.fiscal_year },
+	]);
+}
+
+// Close a year from Check your books: one click closes the stock and the years before it too, in
+// order, in the background
+function close_year(frm, year, steps) {
 	const year_end = frappe.datetime.str_to_user(year.year_end_date);
+	const label = year.profit > 0 ? __("Profit goes to") : __("Loss goes to");
 	const dialog = new frappe.ui.Dialog({
 		title: __("Close {0}", [year.fiscal_year]),
 		fields: [
@@ -1199,11 +1263,10 @@ function close_year(frm, year, before = [], stock = year.stock) {
 				fieldname: "closing_account",
 				fieldtype: "Link",
 				options: "Account",
-				label: __("Profit goes to"),
-				// asked only on the step that closes the year
-				reqd: !stock_first,
-				hidden: stock_first,
+				label: label,
+				reqd: 1,
 				only_select: 1,
+				description: __("An equity account, usually Reserves & Surplus."),
 				get_query: () => ({
 					filters: {
 						company: frm.doc.company,
@@ -1214,52 +1277,185 @@ function close_year(frm, year, before = [], stock = year.stock) {
 				}),
 			},
 		],
-		primary_action_label: stock_first ? __("Close stock") : __("Close {0}", [year.fiscal_year]),
+		primary_action_label: __("Close {0}", [year.fiscal_year]),
 		primary_action: (values) =>
 			call_method(
 				frm,
 				"close_year",
 				{ fiscal_year: year.fiscal_year, closing_account: values.closing_account },
 				{ freeze: true }
-			).then((r) => {
-				close_and_reload(frm, dialog);
-				frappe.ui.toast({
-					type: "success",
-					message:
-						r.message === "stock"
-							? __(
-									"Stock is being closed to {0}. Come back in a few minutes to close the year.",
-									[year_end]
-							  )
-							: __("{0} is closed. The Balance Sheet shows it in a few minutes.", [
-									year.fiscal_year,
-							  ]),
-					duration: 10000,
-				});
-			}),
+			).then(() => close_and_reload(frm, dialog)),
 	});
+	const years = Object.fromEntries(
+		(frm.doc.__onload?.books_reminders?.unclosed_years || []).map((row) => [row.fiscal_year, row])
+	);
+	const note = (step) =>
+		step.stock
+			? __("ERPNext needs this before a year with stock is closed.")
+			: step.fiscal_year === year.fiscal_year
+			? year.profit > 0
+				? __("The profit goes to the account below.")
+				: __("The loss goes to the account below.")
+			: flt(years[step.fiscal_year]?.profit, 2)
+			? __("It has {0}; years close in order.", [profit_words(frm, years[step.fiscal_year].profit)])
+			: __("It has entries, like old invoices; years close in order.");
 	dialog
 		.get_field("note")
 		.$wrapper.append(
+			$(`<div class="text-base text-ink-gray-8 mb-2"></div>`).text(
+				__(
+					"{0} has {1}. Closing moves it out of income and expenses, dated {2}. One click does all of this, in order, in the background:",
+					[year.fiscal_year, profit_words(frm, year.profit), year_end]
+				)
+			),
+			$(`<div class="flex flex-col gap-2 border rounded-md p-3 mb-2"></div>`).append(
+				steps.map((step, index) =>
+					make_year_close_step(
+						`${index + 1}. ${year_close_step_label(step, "waiting")}`,
+						"waiting",
+						note(step)
+					)
+				)
+			),
 			grey_line(
-				stock_first
-					? __(
-							"ERPNext closes the stock to {0} first, in the background. Then come back and close the year.",
-							[year_end]
-					  )
-					: __(
-							"Moves {0} of income and expenses to the account below, dated {1}. Opening entries on or before {1} can't be posted or undone after.",
-							[money(frm, year.profit), year_end]
-					  )
-			).addClass("mb-3"),
-			before.length
-				? grey_line(
-						__("{0} is closed first, as ERPNext closes years in order.", [before.join(", ")])
-				  ).addClass("mb-3")
-				: []
+				__("After this, opening entries on or before {0} can't be posted or undone.", [year_end])
+			).addClass("mb-3")
 		);
 	dialog.show();
 	dialog.set_value("closing_account", year.closing_account || "");
+	// typing replaces the suggested account instead of adding to it
+	const $closing = dialog.get_field("closing_account").$input;
+	$closing?.on("focus", () => setTimeout(() => $closing.select()));
+}
+
+// A step of a year close as it reads done, running or waiting
+function year_close_step_label(step, status) {
+	const date = step.stock && frappe.datetime.str_to_user(step.stock);
+	const labels = step.stock
+		? {
+				done: __("Stock closed to {0}", [date]),
+				running: __("Closing stock to {0}", [date]),
+				waiting: __("Close stock to {0}", [date]),
+		  }
+		: {
+				done: __("{0} closed", [step.fiscal_year]),
+				running: __("Closing {0}", [step.fiscal_year]),
+				waiting: __("Close {0}", [step.fiscal_year]),
+		  };
+	return labels[status];
+}
+
+function make_year_close_step(label, status, note) {
+	const [icon, color] = {
+		done: ["circle-check", "text-ink-green-6"],
+		running: ["loader-circle", "text-ink-blue-7"],
+		waiting: ["circle-dashed", "text-ink-gray-5"],
+	}[status];
+	return $(`<div class="flex items-start gap-2"></div>`).append(
+		$(`<span class="shrink-0 ${color}"></span>`).html(frappe.utils.icon(icon, "sm")),
+		$(`<div class="flex flex-col min-w-0"></div>`).append(
+			$(`<span class="text-base text-ink-gray-8"></span>`).text(label),
+			note ? grey_line(note) : []
+		)
+	);
+}
+
+// A year closing in the background, on Check your books: each step ticks as it is done; one that
+// failed says why and tries again from there
+function make_year_close_alert(frm) {
+	const state = frm.year_close;
+	if (!state) return [];
+	const year = (frm.doc.__onload?.books_reminders?.unclosed_years || []).find(
+		(row) => row.fiscal_year === state.fiscal_year
+	);
+	const steps = state.steps.map((step, index) => {
+		const status = index < state.done ? "done" : index === state.done ? "running" : "waiting";
+		const failed = state.error && index === state.done;
+		const label = year_close_step_label(step, failed ? "waiting" : status);
+		const last = step.fiscal_year === state.fiscal_year && status !== "done" && year;
+		return make_year_close_step(
+			last
+				? __("{0} · {1} to {2}", [label, profit_words(frm, year.profit), state.closing_account])
+				: label,
+			failed ? "waiting" : status
+		);
+	});
+	return frappe.ui.alert({
+		theme: state.error ? "red" : "blue",
+		icon: state.error ? undefined : "loader-circle",
+		title: state.error
+			? __("Closing {0} stopped", [state.fiscal_year])
+			: __("Closing {0} in the background", [state.fiscal_year]),
+		description: state.error || __("You can keep working; this updates by itself."),
+		footer: () =>
+			$(`<div class="flex flex-col gap-2"></div>`).append(
+				steps,
+				state.error
+					? $(`<div class="flex gap-2 pt-1"></div>`).append(
+							frappe.ui.button({
+								label: __("Try again"),
+								onclick: () =>
+									call_method(
+										frm,
+										"close_year",
+										{
+											fiscal_year: state.fiscal_year,
+											closing_account: state.closing_account,
+										},
+										{ freeze: true }
+									).then(() => reload_fresh(frm)),
+							})
+					  )
+					: []
+			),
+	});
+}
+
+// The Overview row of Check your books while a year closes: which step of how many
+function get_year_close_summary(frm) {
+	const state = frm.year_close;
+	const step = state.steps[state.done];
+	return __("Closing {0} in the background · step {1} of {2}: {3}", [
+		state.fiscal_year,
+		state.done + 1,
+		state.steps.length,
+		step ? year_close_step_label(step, "running").toLowerCase() : "",
+	]);
+}
+
+// The year close as the server has it now: the card and the Overview row show it in place, and
+// the page reloads once it is done
+function update_year_close(frm, state) {
+	if (cur_frm !== frm) return;
+	const was = frm.year_close;
+	frm.year_close = state;
+	if (!state) {
+		frappe.ui.toast({
+			type: "success",
+			message: __("{0} is closed. The Balance Sheet shows it in a few minutes.", [was?.fiscal_year]),
+		});
+		return frm.reload_doc();
+	}
+	const steps = get_steps(frm);
+	$("[data-company-setup-checklist]").replaceWith(make_checklist(frm, steps));
+	const books = steps.find((step) => step.name === "check_books");
+	if (books) $("[data-company-setup-card='check_books']").replaceWith(make_task_card(frm, books));
+	watch_year_close(frm);
+}
+
+// the realtime event can be missed: while a year closes, look again now and then
+function watch_year_close(frm) {
+	if (!frm.year_close || frm.year_close.error || frm.year_close_timer) return;
+	frm.year_close_timer = setTimeout(() => {
+		get_data(frm, "get_year_close").then((r) => {
+			frm.year_close_timer = null;
+			if (cur_frm !== frm || !frm.year_close) return;
+			if (JSON.stringify(r.message) !== JSON.stringify(frm.year_close)) {
+				return update_year_close(frm, r.message);
+			}
+			watch_year_close(frm);
+		});
+	}, 15000);
 }
 
 // What is left, as reminders only: nothing here stops going live
@@ -2763,6 +2959,12 @@ function get_difference_caption(frm, difference) {
 		if (!covered) return __("Waiting for your customer invoices, supplier bills and stock to be posted.");
 		const left = flt(difference + covered, 2);
 		if (Math.abs(left) < 1) return __("Covered by the invoices, bills and stock posted.");
+		if (Math.sign(left) !== Math.sign(difference)) {
+			return __(
+				"The invoices, bills and stock posted are {0} more than this. Check them or the trial balance.",
+				[money(frm, Math.abs(left))]
+			);
+		}
 		return __("{0} not covered yet by the invoices, bills and stock posted.", [
 			money(frm, Math.abs(left)),
 		]);
@@ -2770,6 +2972,11 @@ function get_difference_caption(frm, difference) {
 	if (!invoices) return __("Waiting for your customer invoices and supplier bills to be posted.");
 	const left = flt(difference + invoices, 2);
 	if (Math.abs(left) < 1) return __("Covered by the customer invoices and supplier bills posted.");
+	if (Math.sign(left) !== Math.sign(difference)) {
+		return __("The invoices and bills posted are {0} more than this. Check them or the trial balance.", [
+			money(frm, Math.abs(left)),
+		]);
+	}
 	return __("{0} not covered yet by the invoices and bills posted.", [money(frm, Math.abs(left))]);
 }
 
@@ -3011,11 +3218,21 @@ function make_temporary_sum(preview, temporary, money) {
 			),
 		});
 	}
+	// below zero, more is posted than the trial balance has
 	const lines = [
-		[__("Customers owe you"), waiting.Receivable, 1],
-		[__("You owe suppliers"), waiting.Payable, -1],
-		[__("Stock"), waiting.Stock, 1],
-	].filter(([, amount]) => flt(amount, 2));
+		[__("Customers owe you"), __("Customer invoices more than the trial balance"), waiting.Receivable, 1],
+		[__("You owe suppliers"), __("Supplier bills more than the trial balance"), waiting.Payable, -1],
+		[__("Stock"), __("Stock more than the trial balance"), waiting.Stock, 1],
+	]
+		.filter(([, , amount]) => flt(amount, 2))
+		.map(([label, over_label, amount, sign]) => [
+			amount < 0 ? over_label : label,
+			Math.abs(amount),
+			amount < 0 ? 1 : sign,
+		]);
+	const amounts = [waiting.Receivable, waiting.Payable, waiting.Stock].filter((amount) => flt(amount, 2));
+	const over = amounts.some((amount) => amount < 0);
+	const all_over = amounts.length && amounts.every((amount) => amount < 0);
 	const $table = $(`<div class="flex flex-col border rounded-lg"></div>`).append(
 		lines.map(([label, amount, sign], index) =>
 			$(
@@ -3032,9 +3249,11 @@ function make_temporary_sum(preview, temporary, money) {
 		$(
 			`<div class="flex justify-between gap-3 px-3 py-2 text-base-medium text-ink-gray-8 border-t"></div>`
 		).append(
-			$(`<span></span>`).text(__("Waits in Temporary Opening")),
+			$(`<span></span>`).text(
+				all_over ? __("More than the trial balance") : __("Waits in Temporary Opening")
+			),
 			$(`<span class="flex items-center gap-1"></span>`).append(
-				$(`<span></span>`).text(money(temporary.balance)),
+				$(`<span></span>`).text(money(Math.abs(temporary.balance))),
 				$(`<span class="flex text-ink-green-7"></span>`)
 					.attr("title", __("As expected"))
 					.html(frappe.utils.icon("check", "sm"))
@@ -3043,7 +3262,11 @@ function make_temporary_sum(preview, temporary, money) {
 	);
 	return $(`<div class="flex flex-col gap-2"></div>`).append(
 		$table,
-		grey_line(__("It goes to zero once the opening invoices, bills and stock are posted."))
+		grey_line(
+			over
+				? __("Check the invoices, bills or stock over your trial balance, or the trial balance.")
+				: __("It goes to zero once the opening invoices, bills and stock are posted.")
+		)
 	);
 }
 
@@ -3103,6 +3326,7 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 		},
 	};
 	const posted_temporary = flt(frm.doc.__onload?.stats?.temporary_opening);
+	const over = (frm.doc.__onload?.temporary_parts || []).filter((part) => part.over);
 	if (books_dialog && posted_temporary) {
 		$body.append(
 			make_alerts([
@@ -3111,9 +3335,11 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 					title: __("Temporary Opening is {0}", [money(Math.abs(posted_temporary))]),
 					description:
 						left_out ||
-						__(
-							"It waits there until your customer invoices, supplier bills and opening stock, or a balance missing from your sheet, are in. Then it goes to zero."
-						),
+						(over.length
+							? __("{0}. Check them or the trial balance.", [get_waiting_text(over, currency)])
+							: __(
+									"It waits there until your customer invoices, supplier bills and opening stock, or a balance missing from your sheet, are in. Then it goes to zero."
+							  )),
 					buttons: left_out ? [open_invoices] : [],
 				},
 			])
@@ -4133,6 +4359,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 			? frappe.datetime.str_to_user(value)
 			: "";
 	let only_unread = false;
+	// a ledger whose rows set on it are the only ones shown, from the post confirm's Show rows
+	let only_account = null;
 	// names confirmed in this window, shown as Confirmed in the names list
 	const confirmed = new Set();
 	const day_before = day_before_text(frm);
@@ -4611,10 +4839,12 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 				),
 				$(`<div class="flex flex-wrap gap-2"></div>`).append(
 					count("new") && frappe.model.can_create("Data Import")
-						? frappe.ui.button({
+						? make_button({
 								label: is_customer ? __("Import customers") : __("Import suppliers"),
 								icon: "import",
 								variant: "subtle",
+								disabled: !!import_blocked(frm, party_type),
+								tooltip: import_blocked(frm, party_type),
 								onclick: () => {
 									if (!dialog.get_values()) return;
 									save().then(() => {
@@ -4714,6 +4944,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		}
 		$review.append(make_waiting_alerts(all));
 		$review.append(make_unread_dates_alert(all));
+		$review.append(make_account_rows_alert(all));
 		if (state.review.length) make_review_box(state);
 	};
 	// rows whose sheet dates could not be read: one box for all of them, and a way to see just those
@@ -4760,10 +4991,43 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 			})
 			.addClass("mb-3");
 	};
+	const is_set_to_only_account = (row) =>
+		row.status !== "Created" && row.account_by_hand && row.account === only_account;
 	const show_only_unread = () => {
 		for (const grid_row of grid.grid_rows || []) {
-			grid_row.wrapper.toggle(!only_unread || has_unread_date(grid_row.doc));
+			grid_row.wrapper.toggle(
+				(!only_unread || has_unread_date(grid_row.doc)) &&
+					(!only_account || is_set_to_only_account(grid_row.doc))
+			);
 		}
+	};
+	// the rows with a ledger set on them that put it over its trial balance line, from the post confirm
+	const make_account_rows_alert = (all) => {
+		const rows = only_account ? all.filter(is_set_to_only_account) : [];
+		if (!rows.length) only_account = null;
+		show_only_unread();
+		if (!rows.length) return [];
+		return frappe.ui
+			.alert({
+				theme: "yellow",
+				title: plural(
+					rows.length,
+					__("1 row has {0} set on it", [short_account(frm, rows[0].account)]),
+					__("{0} rows have {1} set on them", [rows.length, short_account(frm, rows[0].account)])
+				),
+				description: __(
+					"Their sheet's ledger column or a pick in the table set it, so Post to doesn't change them. Change the account on the rows that belong elsewhere."
+				),
+				footer: () =>
+					frappe.ui.button({
+						label: __("Show all"),
+						onclick: () => {
+							only_account = null;
+							refresh_state();
+						},
+					}),
+			})
+			.addClass("mb-3");
 	};
 	// rows that stay drafts whatever the names say: a disabled customer's, or in another currency
 	const make_waiting_alerts = (all) => {
@@ -5214,6 +5478,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 				disabled_parties: [...post_disabled],
 				post_to: sheet_account,
 				before_post: () => dialog.hide(),
+				show_rows: (account) => {
+					only_account = account;
+					// first, so they are on the table's first page
+					const all = dialog.get_value("invoices") || [];
+					dialog.fields_dict.invoices.df.data = [
+						...all.filter(is_set_to_only_account),
+						...all.filter((row) => !is_set_to_only_account(row)),
+					];
+					grid.refresh();
+					refresh_state();
+				},
 			})
 		);
 	};
@@ -5305,7 +5580,7 @@ function upload_opening_invoices(frm, party_type, dialog) {
 function post_opening_invoices(
 	frm,
 	party_type,
-	{ rows, names = {}, disabled_parties = [], post_to = null, before_post }
+	{ rows, names = {}, disabled_parties = [], post_to = null, before_post, show_rows }
 ) {
 	const is_customer = party_type === "Customer";
 	const currency = erpnext.get_currency(frm.doc.company);
@@ -5522,6 +5797,18 @@ function post_opening_invoices(
 								]),
 								ledger_over_hint(frm, party_type, over.account, fixes),
 							].join(" "),
+							buttons:
+								show_rows && get_rows_set_to(frm, party_type, over.account).length
+									? [
+											{
+												label: __("Show rows"),
+												onclick: () => {
+													confirm.hide();
+													show_rows(over.account);
+												},
+											},
+									  ]
+									: [],
 						}))
 				  ).addClass("mb-3")
 				: []
@@ -5811,23 +6098,29 @@ function ledger_over_hint(frm, party_type, account, fixes) {
 			tick.clash.kind === "own" ? __("Use Post to for these") : clash_fix_label(tick.clash, party_type),
 		]);
 	}
-	const by_hand = (frm.doc[PARTY[party_type].table] || []).filter(
-		(row) => row.status !== "Created" && row.account_by_hand && row.account === account
-	);
-	if (by_hand.length) {
-		return by_hand.length === 1
-			? __("1 row was set to {0} by hand: {1}. Change its account back in the window.", [
+	const set_rows = get_rows_set_to(frm, party_type, account);
+	if (set_rows.length) {
+		return set_rows.length === 1
+			? __("1 row has {0} set on it: {1}. Change its account in the window.", [
 					short_account(frm, account),
-					[by_hand[0].party || by_hand[0].party_name, by_hand[0].invoice_number]
+					[set_rows[0].party || set_rows[0].party_name, set_rows[0].invoice_number]
 						.filter(Boolean)
 						.join(" · "),
 			  ])
-			: __("{0} rows were set to {1} by hand. Change their account back in the window.", [
-					by_hand.length,
+			: __("{0} rows have {1} set on them. Change their account in the window.", [
+					set_rows.length,
 					short_account(frm, account),
 			  ]);
 	}
 	return __("Go back and pick the ledger this sheet is for in Post to.");
+}
+
+// Draft rows whose ledger is set on the row, by their sheet's ledger column or picked in the table:
+// Post to doesn't change them
+function get_rows_set_to(frm, party_type, account) {
+	return (frm.doc[PARTY[party_type].table] || []).filter(
+		(row) => row.status !== "Created" && row.account_by_hand && row.account === account
+	);
 }
 
 // The draft rows going to their customer's or supplier's own ledger rather than the sheet's Post to,
@@ -6070,9 +6363,18 @@ function import_buttons(frm, doctype, step) {
 				: doctype === "Customer"
 				? __("Import customers")
 				: __("Import suppliers"),
+			disabled: !!import_blocked(frm, doctype),
+			tooltip: import_blocked(frm, doctype),
 			onclick: () => open_party_import(frm, doctype),
 		},
 	];
+}
+
+// why this user can't import the sheet, or nothing when they can
+function import_blocked(frm, doctype) {
+	const reason = frm.doc.__onload?.import_blocked?.[doctype];
+	if (!reason || doctype !== "BOM") return reason;
+	return `${reason} ${__("Make your BOMs in BOM Creator.")}`;
 }
 
 // items with batch or serial numbers import only once Stock Settings tracks them: asked before
@@ -6113,6 +6415,9 @@ const TITLED_IMPORTS = ["Customer", "Supplier", "Item"];
 
 function open_party_import(frm, doctype, after = null, asked = false) {
 	if (!frappe.model.can_create("Data Import")) return;
+	if (import_blocked(frm, doctype)) {
+		return frappe.msgprint({ title: __("Can't import"), message: import_blocked(frm, doctype) });
+	}
 	if (doctype === "Item" && !asked && frm.doc.__onload?.serial_batch_off && !frm.doc.__onload?.has_items) {
 		return ask_serial_and_batch(frm).then(() => open_party_import(frm, doctype, after, true));
 	}
@@ -8300,6 +8605,15 @@ function download_import_sample(doctype) {
 	});
 }
 
+function import_option(frm, doctype, label) {
+	return {
+		label,
+		disabled: !!import_blocked(frm, doctype),
+		description: import_blocked(frm, doctype),
+		onclick: () => open_party_import(frm, doctype),
+	};
+}
+
 function items_import_menu(frm) {
 	if (!frappe.model.can_create("Data Import")) return [];
 	return [
@@ -8310,9 +8624,9 @@ function items_import_menu(frm) {
 				{
 					group: "",
 					options: [
-						{ label: __("Item groups"), onclick: () => open_party_import(frm, "Item Group") },
-						{ label: __("Units"), onclick: () => open_party_import(frm, "UOM") },
-						{ label: __("Items"), onclick: () => open_party_import(frm, "Item") },
+						import_option(frm, "Item Group", __("Item groups")),
+						import_option(frm, "UOM", __("Units")),
+						import_option(frm, "Item", __("Items")),
 					],
 				},
 				{
@@ -8428,9 +8742,9 @@ Object.assign(STEP_ACTIONS, {
 		},
 	],
 	boms: (frm) =>
-		frappe.model.can_create("Data Import")
+		frappe.model.can_create("Data Import") && !import_blocked(frm, "BOM")
 			? [{ label: __("Import BOMs"), onclick: () => open_party_import(frm, "BOM") }]
-			: [],
+			: [bom_creator_button()],
 });
 
 Object.assign(STEP_MORE, {
@@ -8475,14 +8789,11 @@ Object.assign(STEP_MORE, {
 				onclick: () => download_sheet(frm.doc.company, "fixed_assets.download_fixed_assets"),
 			},
 		].filter(Boolean),
-	boms: () => [
-		{
-			label: __("Open BOM Creator"),
-			icon: "arrow-up-right",
-			onclick: () => frappe.new_doc("BOM Creator"),
-		},
-		{ label: __("Download sample"), icon: "download", onclick: () => download_import_sample("BOM") },
-	],
+	boms: (frm) =>
+		[
+			!import_blocked(frm, "BOM") && { ...bom_creator_button(), icon: "arrow-up-right" },
+			{ label: __("Download sample"), icon: "download", onclick: () => download_import_sample("BOM") },
+		].filter(Boolean),
 });
 
 Object.assign(STEP_OPENERS, {
@@ -9188,7 +9499,9 @@ class SheetWindow {
 		const alert =
 			doc && this.alerts.find((alert) => alert.seen && this.is_open(alert, doc, df.fieldname));
 		if (!alert) return formatted;
-		if (!value) return frappe.ui.badge.html({ label: __("Needed"), theme: "red" });
+		if (value == null || value === "") {
+			return frappe.ui.badge.html({ label: __("Needed"), theme: "red" });
+		}
 		const badge = frappe.ui.badge.html({ label: alert.badge || __("Check"), theme: "red" });
 		return `<div class="flex items-center gap-1"><div class="truncate min-w-0">${formatted}</div><div class="shrink-0">${badge}</div></div>`;
 	}
@@ -9436,6 +9749,15 @@ class OpeningStockWindow extends SheetWindow {
 		this.result = result;
 		this.layout = [job_work, batched].join();
 		this.load(checks);
+	}
+
+	// back in front after warehouses were added in another browser tab: the checks again, unless
+	// rows are being edited
+	show(replacing) {
+		super.show(replacing);
+		const refresh = () => this.dialog.display && !this.dirty && this.refresh();
+		$(window).on("focus", refresh);
+		this.dialog.onhide = () => $(window).off("focus", refresh);
 	}
 
 	layout_changed(checks) {
@@ -10704,19 +11026,27 @@ function show_job_worker_stock(frm) {
 
 // ---------- BOMs ----------
 
+// where BOMs are made when they can't be imported
+function bom_creator_button() {
+	return { label: __("Open BOM Creator"), onclick: () => frappe.new_doc("BOM Creator") };
+}
+
 // The items made here that have no BOM; BOMs come in through Data Import
 function show_boms(frm) {
 	get_data(frm, "get_boms").then((r) => {
 		const status = r.message;
-		if (!status.without_bom.length) return open_party_import(frm, "BOM");
+		const blocked = import_blocked(frm, "BOM");
+		if (!status.without_bom.length) {
+			return blocked ? frappe.new_doc("BOM Creator") : open_party_import(frm, "BOM");
+		}
 		const dialog = new frappe.ui.Dialog({
 			title: __("BOMs"),
 			size: "large",
 			fields: [{ fieldname: "body", fieldtype: "HTML" }],
-			primary_action_label: __("Import BOMs"),
+			primary_action_label: blocked ? __("Open BOM Creator") : __("Import BOMs"),
 			primary_action: () => {
 				dialog.hide();
-				open_party_import(frm, "BOM");
+				blocked ? frappe.new_doc("BOM Creator") : open_party_import(frm, "BOM");
 			},
 			secondary_action_label: __("Close"),
 			secondary_action: () => dialog.hide(),
@@ -11069,7 +11399,11 @@ class OpenOrdersWindow extends SheetWindow {
 				),
 			],
 			missing_items: [go(__("Go to Items"), () => open_party_import(frm, "Item"))],
-			no_bom: [go(__("Import BOMs"), () => open_party_import(frm, "BOM"))],
+			no_bom: [
+				import_blocked(frm, "BOM")
+					? go(__("Open BOM Creator"), () => frappe.new_doc("BOM Creator"))
+					: go(__("Import BOMs"), () => open_party_import(frm, "BOM")),
+			],
 			no_job_worker: [go(__("Go to Warehouses"), () => show_warehouses(frm, { job_workers: true }))],
 			material_not_posted: [
 				go(__("Go to Opening stock"), () => {
@@ -11610,6 +11944,7 @@ class FixedAssetsWindow extends SheetWindow {
 			],
 			categories: set_up,
 			hsn_code: set_up,
+			bad_hsn: set_up,
 			wrong_type: set_up,
 			accounts: set_up,
 			hand: [
@@ -11885,19 +12220,23 @@ class FixedAssetsWindow extends SheetWindow {
 			].filter(Boolean),
 			primary: plural(count, __("Post 1 asset"), __("Post {0} assets", [count])),
 			on_primary: () =>
-				call_method(frm, "post_fixed_assets", {}, { freeze: true }).then((r) => {
-					this.dialog.hide();
-					after_run(
-						frm,
-						r.message,
-						__("Posting the assets in the background. This page updates when it's done."),
-						() =>
-							frappe.ui.toast({
-								type: "success",
-								message: __("{0} posted.", [count_assets(count)]),
-							})
-					);
-				}),
+				call_method(frm, "post_fixed_assets", {}, { freeze: true }).then(
+					(r) => {
+						this.dialog.hide();
+						after_run(
+							frm,
+							r.message,
+							__("Posting the assets in the background. This page updates when it's done."),
+							() =>
+								frappe.ui.toast({
+									type: "success",
+									message: __("{0} posted.", [count_assets(count)]),
+								})
+						);
+					},
+					// the confirm is stale once posting turns it down: back to the sheet and its reds
+					() => this.refresh()
+				),
 		});
 	}
 }
@@ -12123,20 +12462,15 @@ function show_tabs_cue(frm) {
 // the realtime event can be missed: while stock posts in the background, look again now and then
 function watch_stock_posting(frm) {
 	if (!(frm.doc.__onload?.posting || []).includes("Stock")) return;
-	watch_stock_job(frm, "stock_watch", 15000, {}, (status) => status.posting);
-}
-
-// Ask for the light stock status every ms while running(status), then reload the form once
-function watch_stock_job(frm, timer, ms, args, running) {
-	if (frm[timer]) return;
-	frm[timer] = setTimeout(() => {
-		get_data(frm, "get_stock_status", args).then((r) => {
-			frm[timer] = null;
+	if (frm.stock_watch) return;
+	frm.stock_watch = setTimeout(() => {
+		get_data(frm, "get_stock_status").then((r) => {
+			frm.stock_watch = null;
 			if (cur_frm !== frm) return;
-			if (running(r.message)) return watch_stock_job(frm, timer, ms, args, running);
+			if (r.message.posting) return watch_stock_posting(frm);
 			if (!frm.is_dirty()) frm.reload_doc();
 		});
-	}, ms);
+	}, 15000);
 }
 
 // A job in the background says when it is done: the page reloads, then says how it went

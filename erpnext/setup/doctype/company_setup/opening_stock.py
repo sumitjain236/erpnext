@@ -1649,7 +1649,7 @@ def make_stock_closing(company: str, to_date) -> str:
 		frappe.throw(closing.blocker, title=_("Not yet"))
 	if closing.status in ("Queued", "In Progress") or closing.done:
 		return closing.name
-	if closing.name and closing.status in ("Failed", "Completed"):
+	if closing.name and closing.status in ("Failed", "Completed", "Outdated"):
 		frappe.get_doc("Stock Closing Entry", closing.name).regenerate_closing_balance()
 		return closing.name
 	doc = (

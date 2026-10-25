@@ -116,11 +116,18 @@ def get_boms(company: str) -> dict:
 
 
 @frappe.whitelist()
-def get_stock_status(company: str, year_end: str | None = None) -> dict:
-	"""For the page to poll while stock posts or a year's stock closes in the background, without
-	loading the document: whether a stock job runs, and the status of the year's Stock Closing Entry."""
+def get_stock_status(company: str) -> dict:
+	"""For the page to poll while stock posts in the background, without loading the document."""
 	frappe.has_permission("Company Setup", "read", company, throw=True)
-	return {
-		"posting": stock.is_posting_stock(company),
-		"closing": stock.get_stock_closing(company, year_end).status if year_end else None,
-	}
+	return {"posting": stock.is_posting_stock(company)}
+
+
+@frappe.whitelist()
+def get_year_close(company: str) -> dict | None:
+	"""For the page to poll while a year closes in the background, without loading the document."""
+	from erpnext.setup.doctype.company_setup.company_setup import get_year_close
+
+	frappe.has_permission("Company Setup", "read", company, throw=True)
+	return get_year_close(
+		frappe._dict(company=company, year_close=frappe.db.get_value("Company Setup", company, "year_close"))
+	)

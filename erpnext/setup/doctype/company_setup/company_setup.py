@@ -2,13 +2,26 @@
 # For license information, please see license.txt
 
 import re
+import time
 
 import frappe
 from frappe import _
 from frappe.contacts.doctype.address.address import get_default_address
 from frappe.model import default_fields
 from frappe.model.document import Document
-from frappe.utils import cint, cstr, flt, fmt_money, formatdate, getdate, now_datetime, sbool
+from frappe.permissions import get_doctype_roles
+from frappe.utils import (
+	cint,
+	cstr,
+	flt,
+	fmt_money,
+	formatdate,
+	get_datetime,
+	getdate,
+	now_datetime,
+	sbool,
+	time_diff_in_seconds,
+)
 from frappe.utils.background_jobs import is_job_enqueued
 
 from erpnext.accounts.doctype.account.account import get_account_autoname
@@ -33,12 +46,12 @@ from erpnext.setup.doctype.company_setup.company_setup_steps import (
 	PARTY_DEFAULTS,
 	get_default_account_gaps,
 	get_missing_years,
-	get_party_ledger_pick,
 	get_step_paths,
 	get_temporary_opening,
 	get_temporary_opening_balance,
 	get_temporary_parts,
 	get_unclosed_years,
+	get_usual_party_ledger,
 	money_precision,
 )
 from erpnext.setup.doctype.company_setup.opening_invoices import (
@@ -54,6 +67,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	get_day_before,
 	get_default_dimensions,
 	get_default_node,
+	get_error_text,
 	get_exact_key,
 	get_hand_posted,
 	get_invoice_accounts,
@@ -140,6 +154,32 @@ COMPANY_FIELDS = (
 )
 # the Company's Modules Used checks the Edit dialog fills, of those the Company has
 MODULE_FIELDS = ("stock", "manufacturing", "subcontracting", "assets", "projects", "pos")
+# the sheets the steps bring in through Data Import
+IMPORTED_DOCTYPES = ("Customer", "Supplier", "Item Group", "UOM", "Item", "BOM")
+# what each step makes, as the permission it needs
+STEP_PERMISSIONS = {
+	"chart_of_accounts": [("Account", "create")],
+	"taxes": [
+		("Sales Taxes and Charges Template", "create"),
+		("Purchase Taxes and Charges Template", "create"),
+	],
+	"opening_balances": [("Journal Entry", "submit")],
+	"bank_accounts": [("Bank Account", "create"), ("Journal Entry", "submit")],
+	"customers": [("Customer", "import")],
+	"opening_sales_invoices": [("Sales Invoice", "submit")],
+	"suppliers": [("Supplier", "import")],
+	"opening_purchase_invoices": [("Purchase Invoice", "submit")],
+	"items": [("Item", "import"), ("Item Group", "import"), ("UOM", "import")],
+	"warehouses": [("Warehouse", "create")],
+	"opening_stock": [("Stock Reconciliation", "submit")],
+	"job_workers": [("Supplier", "write")],
+	"fixed_assets": [("Asset", "submit"), ("Asset Category", "create"), ("Item", "create")],
+	"boms": [("BOM", "submit")],
+	"open_sales_orders": [("Sales Order", "submit")],
+	"open_purchase_orders": [("Purchase Order", "submit")],
+	"open_work_orders": [("Work Order", "submit")],
+	"open_subcontracting_orders": [("Subcontracting Order", "submit")],
+}
 ADDRESS_FIELDS = ("address_line1", "address_line2", "city", "state", "pincode", "country")
 # accounts ERPNext posts to by itself: account type, root type, the Company default it fills, and
 # whether only automatic stock accounting needs it (every purchase invoice does then)
@@ -247,6 +287,7 @@ class CompanySetup(Document):
 		undone_orders: DF.Table[CompanySetupOpenOrder]
 		undone_purchase_invoices: DF.Table[CompanySetupOpeningInvoice]
 		undone_sales_invoices: DF.Table[CompanySetupOpeningInvoice]
+		year_close: DF.JSON | None
 		undone_stock: DF.Table[CompanySetupOpeningStock]
 		warehouses: DF.Table[CompanySetupWarehouse]
 	# end: auto-generated types
@@ -282,6 +323,8 @@ class CompanySetup(Document):
 			list(statuses.items()) != [(row.step_key, row.status) for row in self.steps],
 		)
 		self.set_onload("chart_import_blocked", get_chart_import_blocker(self.company))
+		self.set_onload("import_blocked", get_import_blockers())
+		self.set_onload("missing_roles", get_missing_roles(steps, statuses))
 		# new customers and suppliers get these groups; without one, the names review asks
 		self.set_onload(
 			"default_groups",
@@ -293,6 +336,7 @@ class CompanySetup(Document):
 			},
 		)
 		self.set_onload("posting", self.get_posting())
+		self.set_onload("year_close", get_year_close(self))
 		self.set_onload(
 			"sheet_match", {party_type: get_sheet_match(self, party_type) for party_type in TABLES}
 		)
@@ -579,6 +623,7 @@ class CompanySetup(Document):
 			or stock.is_posting_stock(self.company)
 			or orders.is_making_orders(self.company)
 			or assets.is_posting_assets(self.company)
+			or is_closing_year(self.company)
 		)
 
 	def use_latest(self):
@@ -695,7 +740,7 @@ class CompanySetup(Document):
 		set_default_bank(self.company)
 		# a default kept by name stays; one ERPNext picked for the new chart may be set again
 		ours = tuple(fieldname for fieldname in PARTY_DEFAULTS if fieldname not in kept)
-		set_default_party_accounts(self.company, {}, ours)
+		set_default_party_accounts(self.company, ours)
 		added = add_system_accounts(self.company)
 		added += stock.set_stock_defaults(self.company)
 		self.chart_of_accounts_source = "Imported"
@@ -704,7 +749,7 @@ class CompanySetup(Document):
 		self.taxes_saved = 0
 		if sheet.balances:
 			balances = sort_balances(self.company, sheet.balances)
-			self.set_sheet_totals(balances.result["left_out"], balances.left_out_accounts, ours)
+			self.set_sheet_totals(balances.result["left_out"], balances.left_out_accounts)
 			self.opening_balances = []
 			for row in balances.rows:
 				self.append("opening_balances", row | {"source": get_file_label(file_url)})
@@ -756,15 +801,13 @@ class CompanySetup(Document):
 		self.save_opening_balances(rows, get_file_label(file_url))
 		return balances.result | {"added": len(rows), "skipped": len(balances.rows) - len(rows)}
 
-	def set_sheet_totals(self, left_out: dict, by_account: dict, party_defaults: tuple | None = None):
+	def set_sheet_totals(self, left_out: dict, by_account: dict):
 		"""Keep what the sheet says customers owe, suppliers are owed and stock is worth, in all and
-		by account, to set against what their own steps post. The company's default receivable and
-		payable become the ledgers holding the most: see set_default_party_accounts."""
+		by account, to set against what their own steps post."""
 		self.sheet_receivables = flt(left_out.get("Receivable"))
 		self.sheet_payables = -flt(left_out.get("Payable"))
 		self.sheet_stock = flt(left_out.get("Stock"))
 		self.sheet_accounts = by_account
-		set_default_party_accounts(self.company, by_account, party_defaults)
 
 	def preview_opening_balances(self) -> dict:
 		"""The books on the day before the migration date as they would be after posting the drafts:
@@ -2000,23 +2043,6 @@ class CompanySetup(Document):
 			)
 
 	@frappe.whitelist()
-	def set_default_party_account(self, fieldname: str, account: str):
-		"""Make a receivable (payable) ledger the company's default, from Check your books."""
-		self.check_permission("write")
-		if fieldname not in PARTY_DEFAULTS or frappe.db.get_value(
-			"Account", account, ["company", "account_type"]
-		) != (self.company, PARTY_DEFAULTS[fieldname]):
-			frappe.throw(
-				_("{0} is not a {1} account of {2}.").format(
-					account, _(PARTY_DEFAULTS.get(fieldname, "")), self.company
-				),
-				title=_("Wrong account"),
-			)
-		company = frappe.get_doc("Company", self.company)
-		company.set(fieldname, account)
-		company.save()
-
-	@frappe.whitelist()
 	def set_dimension_default(self, dimension: str, value: str):
 		"""Set this company's default for an accounting dimension every entry needs, from the red that
 		asks for it."""
@@ -2030,35 +2056,26 @@ class CompanySetup(Document):
 		doc.save()
 
 	@frappe.whitelist()
-	def close_year(self, fiscal_year: str, closing_account: str | None = None) -> str:
-		"""Close a year whose profit is still in income and expenses, and the years before it that are
-		still open, oldest first: ERPNext closes a year only after the one before. Each needs its Stock
-		Closing Entry first when the company keeps stock; that builds in the background ("stock").
-		Returns the last voucher's name."""
+	def close_year(self, fiscal_year: str, closing_account: str) -> str:
+		"""Close a year whose profit is still in income and expenses, in the background: each year's
+		stock to its end when the company keeps stock, and the years before it still open, oldest
+		first, as ERPNext closes years in order. The steps and how far they got stay in year_close, so
+		the close goes on after a reload; one that stopped goes on from where it stopped."""
 		self.check_permission("write")
 		self.start_change()
-		years = get_unclosed_years(self)
-		index = next((index for index, row in enumerate(years) if row.fiscal_year == fiscal_year), None)
-		if index is None:
+		if not closing_account:
 			frappe.throw(
-				_("{0} has no profit or loss left to close.").format(fiscal_year), title=_("Nothing to close")
+				_("Pick the account the profit goes to, like Retained Earnings."), title=_("Account missing")
 			)
-		name = None
-		for year in years[: index + 1]:
-			closing = get_year_stock_closing(self.company, year.year_end_date)
-			if closing.needed and not closing.done:
-				messages = len(frappe.local.message_log)
-				stock.make_stock_closing(self.company, year.year_end_date)
-				# ERPNext's "queued" note: the card says the stock is closing and refreshes itself
-				del frappe.local.message_log[messages:]
-				return "stock"
-			if not closing_account:
-				frappe.throw(
-					_("Pick the account the profit goes to, like Retained Earnings."),
-					title=_("Account missing"),
-				)
-			name = make_closing_voucher(self.company, year, closing_account)
-		return name
+		state = frappe._dict(
+			frappe.parse_json(frappe.db.get_value(self.doctype, self.name, "year_close")) or {}
+		)
+		done = state.steps[: state.done] if state.fiscal_year == fiscal_year and state.error else []
+		steps = done + get_year_close_steps(self, fiscal_year)
+		state = {"fiscal_year": fiscal_year, "closing_account": closing_account, "steps": steps}
+		self.db_set("year_close", frappe.as_json(state | {"done": len(done)}), update_modified=False)
+		enqueue_year_close(self.company)
+		return "queued"
 
 	@frappe.whitelist()
 	def go_live(self, accept_temporary_opening: bool = False):
@@ -2164,6 +2181,148 @@ def make_closing_voucher(company: str, year, closing_account: str) -> str:
 	doc.save()
 	doc.submit()
 	return doc.name
+
+
+YEAR_CLOSE_JOB_ID = "company_setup_year_close::{0}"
+# the same chain picked up again while the stock closes, under its own id as the first one still ends
+YEAR_CLOSE_WAIT_JOB_ID = "company_setup_year_close_wait::{0}"
+# a stock close still running after this long is taken as stuck: ERPNext's own job gives up at 25
+STOCK_CLOSE_SECONDS = 40 * 60
+
+
+def get_year_close_steps(onboarding, fiscal_year: str) -> list[dict]:
+	"""What closing fiscal_year takes, in order: for it and each year before it still open, the stock
+	to the year end when it isn't closed yet, then the year."""
+	years = get_unclosed_years(onboarding)
+	index = next((index for index, row in enumerate(years) if row.fiscal_year == fiscal_year), None)
+	if index is None:
+		frappe.throw(
+			_("{0} has no profit or loss left to close.").format(fiscal_year), title=_("Nothing to close")
+		)
+	steps = []
+	for year in years[: index + 1]:
+		closing = get_year_stock_closing(onboarding.company, year.year_end_date)
+		if closing.needed and not closing.done:
+			if closing.blocker:
+				frappe.throw(closing.blocker, title=_("Not yet"))
+			steps.append({"stock": str(year.year_end_date)})
+		steps.append({"fiscal_year": year.fiscal_year})
+	return steps
+
+
+def get_year_close(onboarding) -> dict | None:
+	"""The year being closed in the background, for the page: its steps, how many are done, and why
+	it stopped. One no job carries on any more stopped too."""
+	state = frappe.parse_json(onboarding.year_close)
+	if not state:
+		return None
+	if not state.get("error") and not is_closing_year(onboarding.company):
+		state["error"] = _("The close stopped before it was done.")
+	return state
+
+
+def is_closing_year(company: str) -> bool:
+	return is_job_enqueued(YEAR_CLOSE_JOB_ID.format(company)) or is_job_enqueued(
+		YEAR_CLOSE_WAIT_JOB_ID.format(company)
+	)
+
+
+def enqueue_year_close(company: str, wait: bool = False):
+	frappe.enqueue(
+		run_year_close,
+		queue="long",
+		job_id=(YEAR_CLOSE_WAIT_JOB_ID if wait else YEAR_CLOSE_JOB_ID).format(company),
+		deduplicate=True,
+		timeout=1800,
+		enqueue_after_commit=True,
+		now=frappe.in_test,
+		company=company,
+		wait=wait,
+	)
+
+
+def run_year_close(company: str, wait: bool = False):
+	"""The steps of the year close in turn, each kept once done. A stock close builds in ERPNext's
+	own job: this one ends then and starts again after a while, until it is built. A step that fails
+	stops the close, with its error."""
+	state = frappe._dict(frappe.parse_json(frappe.db.get_value("Company Setup", company, "year_close")))
+	while state.steps and state.done < len(state.steps):
+		step = frappe._dict(state.steps[state.done])
+		frappe.db.savepoint("year_close")
+		try:
+			if step.stock and not close_stock_step(company, step, state):
+				save_year_close(company, state)
+				if not frappe.in_test:
+					time.sleep(5)
+					enqueue_year_close(company, wait=not wait)
+				return
+			if step.fiscal_year:
+				close_year_step(company, step.fiscal_year, state.closing_account)
+		except Exception as e:
+			frappe.db.rollback(save_point="year_close")
+			save_year_close(company, state | {"error": get_error_text(e)})
+			return
+		state.done += 1
+		state.since = None
+		save_year_close(company, state)
+	save_year_close(company, None)
+
+
+def close_stock_step(company: str, step, state) -> bool:
+	"""Whether the stock is closed to the step's date: started here when not, and then waited for."""
+	closing = get_year_stock_closing(company, step.stock)
+	if closing.done or not closing.needed:
+		return True
+	if closing.status in ("Queued", "In Progress"):
+		if (
+			state.since
+			and time_diff_in_seconds(now_datetime(), get_datetime(state.since)) > STOCK_CLOSE_SECONDS
+		):
+			frappe.throw(
+				_("Closing stock to {0} is taking too long. See Stock Closing Entry {1}.").format(
+					formatdate(step.stock), closing.name
+				)
+			)
+		return False
+	if state.since:
+		frappe.throw(
+			_("Closing stock to {0} failed. See Stock Closing Entry {1} and the Error Log.").format(
+				formatdate(step.stock), closing.name
+			)
+		)
+	stock.make_stock_closing(company, step.stock)
+	state.since = str(now_datetime())
+	return False
+
+
+def close_year_step(company: str, fiscal_year: str, closing_account: str):
+	if frappe.db.exists(
+		"Period Closing Voucher", {"company": company, "fiscal_year": fiscal_year, "docstatus": 1}
+	):
+		return
+	year = frappe.db.get_value(
+		"Fiscal Year",
+		fiscal_year,
+		["name as fiscal_year", "year_start_date", "year_end_date"],
+		as_dict=True,
+	)
+	make_closing_voucher(company, year, closing_account)
+
+
+def save_year_close(company: str, state: dict | None):
+	"""Keep how far the close got, and tell the open page."""
+	frappe.db.set_value(
+		"Company Setup", company, "year_close", state and frappe.as_json(state), update_modified=False
+	)
+	# each step done stays done when a later one fails; a test runs the job inline and keeps no data
+	if not frappe.in_test:
+		frappe.db.commit()
+	frappe.publish_realtime(
+		"company_setup_year_close",
+		{"company": company, "state": state},
+		doctype="Company Setup",
+		docname=company,
+	)
 
 
 def get_year_stock_closing(company: str, year_end) -> frappe._dict:
@@ -2431,26 +2590,16 @@ def set_default_bank(company: str):
 	)
 
 
-def set_default_party_accounts(company: str, by_account: dict, fields: tuple | None = None):
-	"""With more than one receivable (payable) ledger, the company's default becomes the one holding
-	the most in the trial balance, by_account as sort_balances gives it, else the one with the usual
-	name, like Sundry Debtors; not the first the chart happens to have. Only while the default is
-	empty or as a chart import left it, and no opening invoice (bill) is posted: else Check your books
-	points it out. fields: the defaults to set whatever they are now, like those ERPNext just picked
-	for a new chart; the others are left."""
-	for fieldname, account_type in PARTY_DEFAULTS.items():
-		if fields is not None and fieldname not in fields:
-			continue
-		pick = get_party_ledger_pick(company, account_type, (by_account or {}).get(account_type))
-		if not pick:
-			continue
-		current = frappe.db.get_value("Company", company, fieldname)
-		if current and fields is None and current not in (pick.usual, pick.first):
-			continue
+def set_default_party_accounts(company: str, fields: tuple):
+	"""The receivable (payable) defaults ERPNext just picked for a new chart (fields) become the
+	ledger with the usual name, like Sundry Debtors, not the first the chart happens to have; with
+	several and none of that name, empty for the user to pick. Not once an opening invoice (bill)
+	is posted."""
+	for fieldname in fields:
+		account_type = PARTY_DEFAULTS[fieldname]
 		doctype = "Sales Invoice" if account_type == "Receivable" else "Purchase Invoice"
-		if frappe.db.exists(doctype, {"company": company, "is_opening": "Yes", "docstatus": 1}):
-			continue
-		set_company_defaults(company, {fieldname: pick.biggest or pick.usual})
+		if not frappe.db.exists(doctype, {"company": company, "is_opening": "Yes", "docstatus": 1}):
+			set_company_defaults(company, {fieldname: get_usual_party_ledger(company, account_type)})
 
 
 def get_party_account_names(company: str) -> list[dict]:
@@ -2955,6 +3104,47 @@ def get_chart_import_blocker(company: str) -> str | None:
 			"This company already has accounting entries, so its chart can't be replaced. Edit it instead."
 		)
 	return None
+
+
+def get_import_blockers() -> dict[str, str]:
+	"""Why each sheet the steps import can't be imported by this user, for the ones that can't.
+	Data Import needs the import permission, which create doesn't give."""
+	blocked = {}
+	for doctype in IMPORTED_DOCTYPES:
+		if frappe.has_permission(doctype, "import"):
+			continue
+		roles = [_(role) for role in get_doctype_roles(doctype, "import")]
+		blocked[doctype] = (
+			_("To import {0}, you need the {1} role.").format(_(doctype), " / ".join(roles))
+			if roles
+			else _("No role can import {0}.").format(_(doctype))
+		)
+	return blocked
+
+
+def get_missing_roles(steps: dict, statuses: dict) -> list[dict]:
+	"""The roles this user lacks for the steps not done yet, each with the steps it is for. A missing
+	permission takes a role already named when one gives it, else the role that gives the most."""
+	gaps = {}
+	for key, step in steps.items():
+		if statuses[key] != "Not Started":
+			continue
+		for need in STEP_PERMISSIONS.get(key.rsplit(".", 1)[-1], ()):
+			if not frappe.has_permission(*need):
+				gaps.setdefault(need, []).append(step["title"])
+
+	givers = {need: [role for role in get_doctype_roles(*need) if role != "Administrator"] for need in gaps}
+	roles = {}
+	for need, titles in gaps.items():
+		role = next((role for role in givers[need] if role in roles), None) or max(
+			givers[need],
+			key=lambda role: sum(role in other for other in givers.values()),
+			default=None,
+		)
+		if role:
+			named = roles.setdefault(role, [])
+			named.extend(title for title in titles if title not in named)
+	return [{"role": role, "steps": titles} for role, titles in roles.items()]
 
 
 def get_company_fields() -> list[str]:

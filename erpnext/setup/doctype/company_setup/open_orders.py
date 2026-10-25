@@ -571,15 +571,21 @@ def get_failing_rows(order_type: str, prepared: list) -> dict[str, list]:
 		"no_wip": lambda row: order_type == "Work Order" and not row.wip_warehouse,
 		"no_warehouse": lambda row: not row.warehouse,
 		"no_job_worker": lambda row: subcontracting and row.party and not row.supplier_warehouse,
-		"not_subcontracted": lambda row: subcontracting and row.item_code and not row.subcontracted,
-		"job_work_setup": lambda row: subcontracting
+		# saving Set up job work marks the item subcontracted too
+		"not_subcontracted": lambda row: subcontracting
 		and row.item_code
-		and (not row.service_item or (row.short_material and not row.job_work_bom)),
+		and not row.subcontracted
+		and not needs_job_work_setup(row),
+		"job_work_setup": lambda row: subcontracting and row.item_code and needs_job_work_setup(row),
 		"material_not_posted": lambda row: subcontracting and row.unposted_material,
 		"material_not_at_job_worker": lambda row: subcontracting and row.job_work_bom and row.short_material,
 		"backflush_transferred": lambda row: backflush,
 	}
 	return {key: [row for row in prepared if check(row)] for key, check in checks.items()}
+
+
+def needs_job_work_setup(row) -> bool:
+	return not row.service_item or bool(row.short_material and not row.job_work_bom)
 
 
 def get_red_text(order_type: str, key: str, failing: list) -> str:
@@ -1183,6 +1189,10 @@ def set_job_work_bom(
 			"service_item_uom": frappe.get_cached_value("Item", service_item, "stock_uom"),
 		}
 	)
+	if not frappe.db.get_value("Item", item_code, "is_sub_contracted_item"):
+		item = frappe.get_doc("Item", item_code)
+		item.is_sub_contracted_item = 1
+		item.save()
 	subcontracting_bom.save()
 	return bom_name
 

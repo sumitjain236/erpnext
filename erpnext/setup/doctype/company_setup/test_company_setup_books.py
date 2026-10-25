@@ -4,7 +4,11 @@
 import frappe
 from frappe.utils import getdate
 
-from erpnext.setup.doctype.company_setup.company_setup import get_account_parent, suggest_balance_accounts
+from erpnext.setup.doctype.company_setup.company_setup import (
+	get_account_parent,
+	run_year_close,
+	suggest_balance_accounts,
+)
 from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	SHEET,
@@ -224,7 +228,8 @@ class TestBooks(ERPNextTestSuite):
 		)
 
 		# closed from here: dated the year end, into the account picked
-		voucher = frappe.get_doc("Period Closing Voucher", self.doc.close_year(year["fiscal_year"], retained))
+		self.assertEqual(self.doc.close_year(year["fiscal_year"], retained), "queued")
+		voucher = frappe.get_last_doc("Period Closing Voucher", {"company": self.company})
 		self.assertEqual(
 			(voucher.docstatus, getdate(voucher.transaction_date), voucher.closing_account_head),
 			(1, getdate("2025-12-31"), retained),
@@ -253,12 +258,26 @@ class TestBooks(ERPNextTestSuite):
 
 		(year,) = self.get_unclosed_years()
 		self.assertTrue(year["stock"]["needed"])
-		self.assertEqual(self.doc.close_year(year["fiscal_year"], year["closing_account"]), "stock")
-		self.assertTrue(
-			frappe.db.exists(
-				"Stock Closing Entry", {"company": self.company, "to_date": "2025-12-31", "docstatus": 1}
-			)
+		self.doc.close_year(year["fiscal_year"], year["closing_account"])
+		closing = frappe.get_last_doc("Stock Closing Entry", {"company": self.company, "docstatus": 1})
+		# the year waits for ERPNext's own job to build the stock closing
+		self.assertEqual(
+			(self.get_year_close()["steps"], self.get_year_close()["done"]),
+			([{"stock": "2025-12-31"}, {"fiscal_year": year["fiscal_year"]}], 0),
 		)
+
+		# a stock closing that fails stops the close before the year
+		closing.db_set("status", "Failed")
+		run_year_close(self.company)
+		self.assertIn(closing.name, self.get_year_close()["error"])
+		self.assertFalse(frappe.db.exists("Period Closing Voucher", {"company": self.company}))
+
+		# tried again, it builds the stock again, then closes the year once that is done
+		self.doc.close_year(year["fiscal_year"], year["closing_account"])
+		closing.db_set("status", "Completed")
+		run_year_close(self.company)
+		self.assertIsNone(self.get_year_close())
+		self.assertTrue(frappe.db.exists("Period Closing Voucher", {"company": self.company, "docstatus": 1}))
 
 	def test_years_close_in_order_with_an_earlier_year_of_entries_but_no_profit(self):
 		cash = get_account(self.company, account_type="Cash")
@@ -301,39 +320,38 @@ class TestBooks(ERPNextTestSuite):
 		)
 		self.assertEqual(self.get_unclosed_years(), [])
 
-	def test_default_party_accounts_follow_the_trial_balance(self):
+	def test_default_party_accounts_never_follow_the_biggest_line(self):
 		sheet = [
 			*SHEET,
-			"Debtors - Retainers,Current Assets,1135,1100,0,Receivable,Asset,INR,5000,",
+			"Debtors - Retainers,Current Assets,1135,1100,0,Receivable,Asset,INR,500000,",
+			"Creditors - Capital Goods,Liabilities,2105,2000,0,Payable,Liability,INR,,500000",
+			"Creditors - Import,Liabilities,2110,2000,0,Payable,Liability,INR,,1000",
 		]
 		self.doc.import_chart(make_sheet(sheet))
-		# Sundry Debtors holds 95,000, Retainers 5,000: the one holding the most is the default
+		# Retainers holds the most, but Sundry Debtors has the usual name
 		self.assertEqual(
 			frappe.db.get_value("Company", self.company, "default_receivable_account"),
 			"1130 - Sundry Debtors - _TOC",
 		)
 
-		# a default the user picks in the company stays; Check your books points out the bigger line
-		retainers = "1135 - Debtors - Retainers - _TOC"
-		frappe.db.set_value("Company", self.company, "default_receivable_account", retainers)
-		self.doc.import_opening_balances(
-			make_sheet(["Account Name,Debit,Credit", "Sundry Debtors,95000,", "Owner Capital,,95000"])
-		)
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "default_receivable_account"), retainers
-		)
+		# no usual name among the payables: left for the user to pick, not the biggest line
+		self.doc.import_chart(make_sheet([row for row in sheet if not row.startswith("Sundry Creditors")]))
+		self.assertFalse(frappe.db.get_value("Company", self.company, "default_payable_account"))
 		self.doc.run_method("onload")
-		(gap,) = (
-			gap
-			for gap in self.doc.get_onload().books_reminders["default_account_gaps"]
-			if gap["fieldname"] == "default_receivable_account"
+		self.assertIn(
+			"default_payable_account",
+			[gap["fieldname"] for gap in self.doc.get_onload().books_reminders["default_account_gaps"]],
 		)
-		self.assertEqual(gap["account"], "1130 - Sundry Debtors - _TOC")
-		self.doc.set_default_party_account(gap["fieldname"], gap["account"])
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "default_receivable_account"),
-			"1130 - Sundry Debtors - _TOC",
-		)
+
+	def test_the_roles_the_steps_left_need_are_named_once(self):
+		frappe.set_user("Administrator")
+		frappe.set_user(make_user("onboarding.roles@example.com", "Accounts Manager"))
+		self.doc.run_method("onload")
+		roles = {row["role"]: row["steps"] for row in self.doc.get_onload().missing_roles}
+		# purchase tax templates need a role an Accounts Manager lacks; journal entries don't
+		self.assertIn("Taxes", roles["Purchase Master Manager"])
+		self.assertNotIn("Accounts Manager", roles)
+		self.assertNotIn("Opening balances", [step for steps in roles.values() for step in steps])
 
 	def test_a_new_account_goes_under_the_group_of_its_type_and_side(self):
 		group = lambda name: frappe.db.get_value(  # noqa: E731
@@ -373,6 +391,10 @@ class TestBooks(ERPNextTestSuite):
 			[get_amount(value) for value in ("1.200,50", "1,20,000", "25,00,000.00 Cr", "(1.234,5)")],
 			[1200.5, 120000, 2500000, -1234.5],
 		)
+
+	def get_year_close(self):
+		self.doc.reload()
+		return frappe.parse_json(self.doc.year_close)
 
 	def get_unclosed_years(self):
 		self.doc.run_method("onload")

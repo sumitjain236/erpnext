@@ -74,6 +74,7 @@
   "undone_assets",
   "stock_difference",
   "stock_like_kept",
+  "year_close",
   "stock_difference_entry",
   "assets_tab",
   "assets_section",
@@ -588,12 +589,19 @@
    "fieldtype": "JSON",
    "hidden": 1,
    "label": "Stock-like Lines Kept as Balances"
+  },
+  {
+   "description": "The steps of a year being closed in the background, how far they got and why one stopped.",
+   "fieldname": "year_close",
+   "fieldtype": "JSON",
+   "hidden": 1,
+   "label": "Year Close"
   }
  ],
  "grid_page_length": 50,
  "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-24 16:00:00.000000",
+ "modified": "2026-10-25 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",

@@ -421,10 +421,8 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			"service_item": "_Test Setup Dyeing",
 		}
 		self.doc.save_open_orders("Subcontracting Order", [row])
-		self.assertEqual(
-			self.doc.get_open_orders("Subcontracting Order")["reds"][0]["key"], "not_subcontracted"
-		)
-		self.assertEqual(self.doc.mark_items_subcontracted(), [self.dyed])
+		self.assertEqual(self.doc.get_open_orders("Subcontracting Order")["reds"][0]["key"], "job_work_setup")
+		frappe.db.set_value("Item", self.dyed, "is_sub_contracted_item", 1)
 		# the default BOM also has yarn, added in-house after the job work
 		with as_administrator():
 			job_work_bom = frappe.db.get_value("Item", self.dyed, "default_bom")
@@ -470,6 +468,8 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			[{"warehouse_name": "Velan Job Works", "kind": "Job worker", "job_worker": "_Test Setup Velan"}]
 		)
 		frappe.db.set_value("Item", self.fabric, "is_sub_contracted_item", 1)
+		# saving the setup marks it subcontracted, so only the setup is asked for
+		frappe.db.set_value("Item", self.dyed, "is_sub_contracted_item", 0)
 		with as_administrator():
 			bom = frappe.copy_doc(
 				frappe.get_doc("BOM", frappe.db.get_value("Item", self.dyed, "default_bom"))
@@ -488,9 +488,10 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			"Subcontracting Order",
 			[{**order, "item_name": self.fabric, "qty": 5}, {**order, "item_name": self.dyed, "qty": 12}],
 		)
+		reds = self.doc.get_open_orders("Subcontracting Order")["reds"]
 		self.assertEqual(
-			self.doc.get_open_orders("Subcontracting Order")["blocker"],
-			"2 items need job-work setup: _Test Setup Dyed Fabric, _Test Setup Fabric",
+			[red["text"] for red in reds if red["key"] in ("not_subcontracted", "job_work_setup")],
+			["2 items need job-work setup: _Test Setup Dyed Fabric, _Test Setup Fabric"],
 		)
 		setups = self.doc.get_job_work_setups([self.dyed, self.fabric])
 		self.assertEqual(
@@ -509,6 +510,7 @@ class TestOpenOrderRows(ERPNextTestSuite):
 			(frappe.get_all("BOM Item", {"parent": dyed_bom}, pluck="item_code"), fabric_bom),
 			([self.fabric], self.bom),
 		)
+		self.assertTrue(frappe.db.get_value("Item", self.dyed, "is_sub_contracted_item"))
 		# saved again with the same materials: the same BOM, no new copy
 		again = self.doc.set_job_work_setups(
 			[{"item_code": self.dyed, "materials": [self.fabric], "service_item": "_Test Setup Dyeing"}]

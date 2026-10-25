@@ -466,11 +466,15 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, tab
 		)
 	# done once all is posted and adds up to what the trial balance says, when there is one
 	match = get_sheet_match(onboarding, "Customer" if doctype == "Sales Invoice" else "Supplier")
-	matches = not match or all(
-		abs(flt(line["sheet"]) - flt(line["entered"])) < 1
-		for line in match["lines"] or [{"sheet": match["sheet"], "entered": match["entered"]}]
-	)
-	done = bool(totals.count) and not drafts and not hand and matches
+	off = [
+		line
+		for line in (match and (match["lines"] or [{"sheet": match["sheet"], "entered": match["entered"]}]))
+		or []
+		if abs(flt(line["sheet"]) - flt(line["entered"])) >= 1
+	]
+	done = bool(totals.count) and not drafts and not hand and not off
+	if totals.count and not drafts and not hand and off:
+		text = " · ".join([text, get_off_text(off, currency)])
 	return {
 		"title": title,
 		"description": description,
@@ -481,6 +485,26 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, tab
 		"tab": tab,
 		"required": has_party_lines(onboarding, "Customer" if doctype == "Sales Invoice" else "Supplier"),
 	}
+
+
+def get_off_text(lines: list[dict], currency: str) -> str:
+	"""Like "Debtors - Domestic is ₹5,30,000 more than the trial balance", or "2 ledgers don't match
+	the trial balance"."""
+	if len(lines) > 1:
+		return _("{0} ledgers don't match the trial balance").format(len(lines))
+	line = lines[0]
+	off = flt(line["entered"]) - flt(line["sheet"])
+	amount = fmt_money(abs(off), currency=currency, precision=0)
+	if line.get("account"):
+		text = (
+			_("{0} is {1} more than the trial balance")
+			if off > 0
+			else _("{0} is {1} short of the trial balance")
+		)
+		return text.format(line["account"], amount)
+	return (_("{0} more than the trial balance") if off > 0 else _("{0} short of the trial balance")).format(
+		amount
+	)
 
 
 def get_invoice_blocker(onboarding, doctype: str) -> str | None:
@@ -757,11 +781,8 @@ def fixed_assets(onboarding) -> dict:
 		summary = _(
 			"Optional · no fixed assets in your opening balances · add the asset list if you have any"
 		)
-	done = (
-		bool(status.posted)
-		and not status.drafts
-		and bool(match and match["matches"] and not match["hand_after"])
-	)
+	# a register off from the lines was pointed out before posting; it doesn't keep the step open
+	done = bool(status.posted) and not status.drafts and not (match and match["hand_after"])
 	return {
 		"title": _("Fixed assets"),
 		"description": _("The asset register behind your asset lines, so depreciation runs from here."),
@@ -863,18 +884,17 @@ def check_books(onboarding) -> dict:
 	stock = get_stock_match(onboarding)
 	stock_matches = not stock or not stock["line"] or stock["matches"]
 	assets = get_assets_status(onboarding).match
+	parts = get_temporary_parts(onboarding)
 	if waiting:
 		summary = _("{0} still to post").format(frappe.utils.comma_and(waiting, add_quotes=False))
 	elif not banks_match:
 		summary = _("{0} of {1} bank accounts match their lines").format(bank["matched"], bank["total"])
-	elif to_come := [part for part in get_temporary_parts(onboarding) if part.get("to_come")]:
-		currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
-		summary = _("Waiting for: {0}").format(
-			" · ".join(
-				f"{part['label']} {fmt_money(abs(part['amount']), currency=currency, precision=0)}"
-				for part in to_come
-			)
+	elif over := [part for part in parts if part.get("over")]:
+		summary = _("More than your trial balance: {0} · check them or the trial balance").format(
+			get_parts_text(onboarding, over)
 		)
+	elif to_come := [part for part in parts if part.get("to_come")]:
+		summary = _("Waiting for: {0}").format(get_parts_text(onboarding, to_come))
 	elif not stock_matches and abs(stock["off"]) < 1:
 		summary = _("Stock is on the wrong accounts")
 	elif not stock_matches:
@@ -920,10 +940,18 @@ def go_live(onboarding) -> dict:
 	}
 
 
+def get_parts_text(onboarding, parts: list[dict]) -> str:
+	"""Like "customer invoices ₹26,06,833 · stock ₹4,000"."""
+	currency = frappe.get_cached_value("Company", onboarding.company, "default_currency")
+	return " · ".join(
+		f"{part['label']} {fmt_money(abs(part['amount']), currency=currency, precision=0)}" for part in parts
+	)
+
+
 def get_temporary_parts(onboarding) -> list[dict]:
 	"""What Temporary Opening is still waiting for, with what each takes of it now: the draft
 	opening balances, the stock not posted (or its difference, once every row is posted), and the
-	invoices and bills short of the trial balance. Once all are posted it is zero."""
+	invoices and bills short of the trial balance, or over it. Once all are posted it is zero."""
 	parts = []
 	drafts = flt(
 		sum(
@@ -936,11 +964,13 @@ def get_temporary_parts(onboarding) -> list[dict]:
 	stock = get_stock_match(onboarding)
 	if stock and stock["line"] and abs(stock["off"]) >= 1:
 		all_posted = stock["books"] and not any(row.status != "Posted" for row in onboarding.opening_stock)
+		over = not all_posted and stock["off"] < 0
 		parts.append(
 			{
 				"label": _("stock difference") if all_posted else _("stock"),
 				"amount": stock["off"],
-				"to_come": not all_posted,
+				"to_come": not all_posted and not over,
+				"over": over,
 			}
 		)
 	for party_type, label, sign in (
@@ -957,7 +987,14 @@ def get_temporary_parts(onboarding) -> list[dict]:
 		)
 		short = flt(match["sheet"] - posted, money_precision())
 		if abs(short) >= 0.01:
-			parts.append({"label": label, "amount": flt(sign * short, money_precision()), "to_come": True})
+			parts.append(
+				{
+					"label": label,
+					"amount": flt(sign * short, money_precision()),
+					"to_come": short > 0,
+					"over": short < 0,
+				}
+			)
 	return parts
 
 
@@ -1094,26 +1131,6 @@ def get_default_account_gaps(onboarding) -> list[dict]:
 		value = company.get(fieldname)
 		if not value:
 			gaps.append({"fieldname": fieldname, "label": label, "reason": _("not set")})
-		elif (
-			(party := PARTY_DEFAULTS.get(fieldname))
-			and (
-				pick := get_party_ledger_pick(
-					onboarding.company, party, (frappe.parse_json(onboarding.sheet_accounts) or {}).get(party)
-				)
-			)
-			and pick.biggest
-			and value != pick.biggest
-		):
-			gaps.append(
-				{
-					"fieldname": fieldname,
-					"label": label,
-					"reason": _("{0}; your biggest {1} line in the trial balance is {2}").format(
-						value, _(party).lower(), pick.biggest
-					),
-					"account": pick.biggest,
-				}
-			)
 		elif fieldname == "default_bank_account" and (
 			frappe.get_cached_value("Account", value, "root_type") != "Asset"
 		):
@@ -1136,10 +1153,9 @@ PARTY_LEDGER_NAMES = {
 }
 
 
-def get_party_ledger_pick(company: str, account_type: str, amounts: dict | None) -> frappe._dict | None:
-	"""With more than one receivable (payable) ledger: the one holding the most in the trial balance
-	(biggest, by amounts as sort_balances gives them), and the one a chart import picks, by its usual
-	name like Sundry Debtors, else the first (usual). None with one ledger or none."""
+def get_usual_party_ledger(company: str, account_type: str) -> str | None:
+	"""The company's receivable (payable) ledger in its currency, of several the one with the usual
+	name, like Sundry Debtors. None when none has it: the user picks then, never the biggest line."""
 	currency = frappe.get_cached_value("Company", company, "default_currency")
 	ledgers = frappe.get_all(
 		"Account",
@@ -1153,23 +1169,16 @@ def get_party_ledger_pick(company: str, account_type: str, amounts: dict | None)
 		fields=["name", "account_name"],
 		order_by="lft",
 	)
-	if len(ledgers) < 2:
-		return None
-	amounts = amounts or {}
-	held = [ledger.name for ledger in ledgers if flt(amounts.get(ledger.name), money_precision())]
-	usual = next(
+	if len(ledgers) == 1:
+		return ledgers[0].name
+	return next(
 		(
 			ledger.name
 			for name in PARTY_LEDGER_NAMES[account_type]
 			for ledger in ledgers
 			if normalize_account_name(ledger.account_name) == name
 		),
-		ledgers[0].name,
-	)
-	return frappe._dict(
-		biggest=max(held, key=lambda name: abs(flt(amounts[name])), default=None),
-		usual=usual,
-		first=ledgers[0].name,
+		None,
 	)
 
 

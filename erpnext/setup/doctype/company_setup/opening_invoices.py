@@ -1090,13 +1090,15 @@ def get_account_clashes(onboarding, party_type: str) -> list[dict]:
 			for other in (set(posted) | {saved}) - {account, None}:
 				if not (said or other == saved or any(row.account for row in posted.get(other, []))):
 					continue
+				# posted rows whose ledger was set on them, by their sheet or an earlier move, stay
+				movable = [row for row in posted.get(other, []) if not row.account_by_hand]
 				if (
 					is_short(account)
 					and is_over(other)
-					and posted.get(other)
-					and caused_by_posted(other, posted[other], account)
+					and movable
+					and caused_by_posted(other, movable, account)
 				):
-					kind, target, moving = "posted", account, posted[other]
+					kind, target, moving = "posted", account, movable
 				elif is_short(other) and is_over(account):
 					kind, target, moving = "draft", other, these
 				else:
@@ -1162,7 +1164,7 @@ def get_split_clashes(onboarding, party_type: str, match: dict) -> list[dict]:
 		if gap.get(home, 0) <= 0.005:
 			continue
 		for account, these in on.items():
-			strays = [row for row in these if row.status == "Created"]
+			strays = [row for row in these if row.status == "Created" and not row.account_by_hand]
 			if account == home or not strays or (account in in_sheet and gap[account] >= -0.005):
 				continue
 			# this upload's own strays there explain the gap: those are the rows to look at
@@ -1258,6 +1260,7 @@ def fix_account_clashes(onboarding, party_type: str, fixes: list[dict]):
 			if (
 				row.party in parties
 				and row.status == "Created"
+				and not row.account_by_hand
 				and posted_accounts.get(row.invoice) == clash["from_account"]
 			):
 				by_source.setdefault(row.source or "", []).append(row.invoice)

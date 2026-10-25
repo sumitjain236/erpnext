@@ -3114,7 +3114,7 @@ class TestOpeningStock(ERPNextTestSuite):
 		self.doc.run_method("onload")
 		self.assertEqual(
 			self.doc.get_onload().temporary_parts,
-			[{"label": "stock difference", "amount": 100, "to_come": False}],
+			[{"label": "stock difference", "amount": 100, "to_come": False, "over": False}],
 		)
 		self.assertEqual([line["difference"] for line in self.doc.get_stock_difference()["lines"]], [100])
 		entry = self.doc.post_stock_difference()
@@ -3240,8 +3240,8 @@ class TestOpeningStock(ERPNextTestSuite):
 			doc.get_onload().temporary_parts,
 			[
 				{"label": "opening balances", "amount": -4000},
-				{"label": "stock", "amount": 46000, "to_come": True},
-				{"label": "customer invoices", "amount": 10000, "to_come": True},
+				{"label": "stock", "amount": 46000, "to_come": True, "over": False},
+				{"label": "customer invoices", "amount": 10000, "to_come": True, "over": False},
 			],
 		)
 		self.assertEqual(
@@ -3669,14 +3669,17 @@ class TestFixedAssets(ERPNextTestSuite):
 		)
 		doc = get_setup(self.company)
 		doc.run_method("onload")
-		self.assertTrue(doc.get_onload().asset_match["matches"])
+		match = doc.get_onload().asset_match
+		self.assertEqual((match["books_cost"], match["books_depreciation"]), (120000, 35000))
+		# Plant and Machinery's line has no asset posted yet: the register doesn't match the lines
+		self.assertFalse(match["matches"])
 
 		# booked by hand again after the assets were added: pointed out, left out of the match
 		book_by_hand(1000, "2026-03-31")
 		doc = get_setup(self.company)
 		doc.run_method("onload")
 		match = doc.get_onload().asset_match
-		self.assertEqual((match["hand_after"], match["matches"]), (1000, True))
+		self.assertEqual((match["hand_after"], match["books_depreciation"]), (1000, 35000))
 		self.assertIn(
 			"booked by hand after they were added",
 			doc.get_onload().steps[step_key(doc, "fixed_assets")]["summary"],

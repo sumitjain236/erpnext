@@ -175,7 +175,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 			[("Desk 1", 5000), ("Desk 2", 0)],
 		)
 		self.assertEqual(get_balance(self.accumulated), -35000)
-		self.assertTrue(self.match()["matches"])
+		self.assertEqual(self.match()["books_depreciation"], 35000)
 
 	def test_hand_depreciation_credited_to_a_net_value_line_stays_with_its_category(self):
 		self.book_by_hand(4000, "2026-02-28", self.plant)
@@ -354,7 +354,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 	def test_a_live_asset_purchase_keeps_the_register_matched(self):
 		self.upload([("Office Desk", "Furniture and Fixtures", "2024-04-01", 120000, 30000, "SLM", 10)])
 		self.post()
-		self.assertTrue(self.match()["matches"])
+		self.assertEqual(self.match()["books_cost"], 120000)
 		frappe.set_user("Administrator")
 		je = frappe.get_doc(
 			{
@@ -372,7 +372,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		).insert()
 		je.submit()
 		frappe.set_user(USER)
-		self.assertTrue(self.match()["matches"])
+		self.assertEqual(self.match()["books_cost"], 120000)
 
 	def test_rows_with_their_own_life_keep_it_and_the_category_fills_the_rest(self):
 		self.upload(
@@ -407,12 +407,11 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		self.upload([("Office Desk", "Furniture and Fixtures", "2024-04-01", 120000, 30000, "SLM", 10)])
 		self.assertEqual([red["key"] for red in self.checks()["reds"]], ["hsn_code"])
 		self.doc.save_asset_categories([{"asset_account": self.furniture, "hsn_code": "94033010"}])
-		# opening the window makes nothing; a code ERPNext does not know stops the post, nothing made
-		self.assertIsNone(self.checks()["blocker"])
-		# a request rolls back on the error, as this savepoint does
-		frappe.db.savepoint("post")
-		self.assertRaisesRegex(frappe.ValidationError, "item for Furniture and Fixtures", self.post)
-		frappe.db.rollback(save_point="post")
+		# a code ERPNext does not know is a red in the window, before posting; checking makes nothing
+		self.assertEqual(
+			self.checks()["blocker"],
+			"Furniture and Fixtures: Could not find Customs Tariff Number: 94033010",
+		)
 		self.assertFalse(frappe.db.exists("Asset Category", "Furniture and Fixtures"))
 		self.assertFalse(frappe.db.exists("Item", "Furniture and Fixtures - Asset"))
 
@@ -433,7 +432,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		self.upload([("Office Desk", "Furniture and Fixtures", "2024-04-01", 120000, 30000, "SLM", 10)])
 		self.assertEqual(
 			self.checks()["blocker"],
-			"Posting makes Item records, which needs the Item Manager role. Ask your System Manager for it.",
+			"Posting makes Item records, which needs the Item Manager role. Ask an Administrator to add it in User.",
 		)
 		frappe.set_user("Administrator")
 		make_user(USER, "Item Manager")
@@ -492,7 +491,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		self.post()
 		self.assertEqual([row.hand_booked for row in self.doc.fixed_assets], [0, 0])
 		match = self.match()
-		self.assertEqual((match["hand_after"], match["matches"]), (1000, True))
+		self.assertEqual((match["hand_after"], match["books_depreciation"]), (1000, 30000))
 		# named to the user to cancel; the step waits for it
 		self.assertEqual(
 			match["hand_after_entries"],
@@ -523,6 +522,36 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		self.assertRaisesRegex(
 			frappe.ValidationError, "Nothing to spread|left to share", self.doc.spread_hand_booked
 		)
+
+	def test_a_category_checks_against_its_own_draft_lines_before_they_are_posted(self):
+		group = frappe.get_cached_value("Account", self.furniture, "parent_account")
+		computers = add_account(self.company, "Computers", "Fixed Asset", "Asset", parent=group)
+		own_line = add_account(
+			self.company,
+			"Acc. Depreciation - Computers",
+			"Accumulated Depreciation",
+			"Asset",
+			parent=frappe.get_cached_value("Account", self.accumulated, "parent_account"),
+		)
+		capital = get_account(self.company, root_type="Equity", account_type=("!=", "Temporary"))
+		self.doc.save_opening_balances(
+			[
+				{"account": computers, "debit": 50000},
+				{"account": own_line, "credit": 10000},
+				{"account": capital, "credit": 40000},
+			]
+		)
+		self.upload([("Laptop", "Computers", "2025-04-01", 50000, 10000, "SLM", 3)])
+		self.assertEqual(self.doc.asset_categories[0].accumulated_account, own_line)
+		checks = self.checks()
+		self.assertEqual((checks["off"], checks["depreciation_off"]), ({}, {}))
+
+	def test_posted_assets_off_from_their_line_finish_the_step(self):
+		self.upload([("Office Desk", "Furniture and Fixtures", "2024-04-01", 100000, 25000, "SLM", 10)])
+		self.assertEqual(self.checks()["off"], {self.furniture: 20000})
+		self.post()
+		self.assertFalse(self.match()["matches"])
+		self.assertTrue(self.asset_step()["done"])
 
 	def test_untyped_depreciation_ledgers_are_guessed_and_marked(self):
 		frappe.db.set_value(

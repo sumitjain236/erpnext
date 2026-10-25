@@ -22,7 +22,7 @@ class TestCompanySetupApi(ERPNextTestSuite):
 		frappe.set_user(make_user("onboarding.api@example.com", "Accounts Manager"))
 		doc = frappe.get_doc("Company Setup", self.company)
 		self.assertEqual(api.get_taxes(self.company), doc.get_taxes())
-		self.assertEqual(api.get_stock_status(self.company), {"posting": False, "closing": None})
+		self.assertEqual(api.get_stock_status(self.company), {"posting": False})
 
 	def test_a_user_who_cannot_read_the_setup_is_refused(self):
 		frappe.set_user(make_user("onboarding.api.stock@example.com", "Stock User"))

@@ -463,6 +463,65 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 		match = get_sheet_match(self.doc, "Customer")
 		self.assertEqual((match["entered"], match["outside"]), (500, {"count": 1, "amount": 200}))
 
+	def test_invoices_over_the_trial_balance_are_not_waited_for(self):
+		self.doc.migration_date = "2026-04-01"
+		receivable = get_party_account("Customer", self.customer.name, self.company)
+		self.doc.sheet_accounts = frappe.as_json({"Receivable": {receivable: 500}})
+		self.doc.save()
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				{
+					"party_name": self.customer.customer_name,
+					"invoice_date": "2026-03-01",
+					"invoice_number": "OB-O-1",
+					"outstanding_amount": 800,
+				}
+			],
+		)
+		self.doc.create_opening_invoices("Customer")
+		doc = base.get_setup(self.company)
+		self.assertEqual(
+			company_setup_steps.get_temporary_parts(doc),
+			[{"label": "customer invoices", "amount": -300, "to_come": False, "over": True}],
+		)
+		self.assertTrue(
+			company_setup_steps.check_books(doc)["summary"].startswith("More than your trial balance")
+		)
+		# all posted, but over the line: the step says so rather than only "All posted"
+		step = company_setup_steps.opening_sales_invoices(doc)
+		self.assertFalse(step["done"])
+		self.assertIn("is ₹ 300 more than the trial balance", step["summary"])
+
+	def test_a_posted_row_whose_ledger_was_set_is_not_moved_back(self):
+		default, retainers = self.add_receivable_account("Debtors - Retainers")
+		self.doc.migration_date = "2026-04-01"
+		self.doc.sheet_accounts = frappe.as_json({"Receivable": {default: 100, retainers: 100}})
+		self.doc.save()
+		row = {"party_name": self.customer.customer_name, "invoice_date": "2026-03-01"}
+		self.doc.save_opening_invoices(
+			"Customer", [row | {"invoice_number": "OB-F-1", "outstanding_amount": 100, "account": retainers}]
+		)
+		self.doc.create_opening_invoices("Customer")
+		self.doc.reload()
+		self.doc.sheet_accounts = frappe.as_json({"Receivable": {default: 200}})
+		self.doc.save()
+		self.doc.save_opening_invoices(
+			"Customer",
+			[
+				*[r.as_dict() for r in self.doc.opening_sales_invoices],
+				row | {"invoice_number": "OB-F-2", "outstanding_amount": 100, "account": default},
+			],
+		)
+		(clash,) = self.doc.get_account_clashes("Customer")
+		self.assertEqual((clash["kind"], clash["account"]), ("posted", default))
+
+		# set on the row, by its sheet or an earlier move: it stays where it is
+		posted = next(r for r in self.doc.opening_sales_invoices if r.invoice_number == "OB-F-1")
+		frappe.db.set_value(posted.doctype, posted.name, "account_by_hand", 1)
+		self.doc.reload()
+		self.assertEqual(self.doc.get_account_clashes("Customer"), [])
+
 	def test_zoho_bill_numbers_and_a_name_confirmed_before_an_undo(self):
 		supplier = frappe.get_all("Supplier", pluck="name", limit=1)[0]
 		self.doc.migration_date = "2026-04-01"
