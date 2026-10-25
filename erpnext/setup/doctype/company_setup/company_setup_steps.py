@@ -778,7 +778,16 @@ def fixed_assets(onboarding) -> dict:
 	elif match and match["matches"]:
 		summary = _("{0} · matches your asset lines as on today").format(assets)
 	elif match:
-		summary = _("{0} · off from your asset lines as on today").format(assets)
+		off = abs(flt(match["cost"] - match["books_cost"], 2)) or abs(
+			flt(match["depreciation"] - match["books_depreciation"], 2)
+		)
+		summary = (
+			_("{0} · off by {1} from your asset lines as on today").format(
+				assets, fmt_money(off, currency=currency, precision=0)
+			)
+			if off
+			else _("{0} · off from your asset lines as on today").format(assets)
+		)
 	elif skipped:
 		summary = _("Skipped · add assets before your first depreciation run")
 	elif status.line_total:

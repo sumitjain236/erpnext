@@ -430,7 +430,14 @@ function add_sheet_match(frm, party_type, $card) {
 		.find(".text-base-medium")
 		.first()
 		.addClass("flex flex-wrap items-center gap-2")
-		.append(frappe.ui.badge({ label: label, theme: theme }));
+		.append(
+			frappe.ui.badge({
+				label: label,
+				theme: theme,
+				title: label,
+				css_class: "company-setup-fit-badge",
+			})
+		);
 	const is_customer = party_type === "Customer";
 	const open = {
 		label: party_type === "Customer" ? __("Open invoices") : __("Open bills"),
@@ -910,6 +917,43 @@ function make_button(opts) {
 	);
 }
 
+// A window closed by its X, Esc or a click outside while is_dirty() asks first: Save draft keeps
+// the changes with save() and closes, Discard closes without them. Closing from code isn't asked.
+function ask_before_closing(dialog, is_dirty, save) {
+	const ask = (e) => {
+		if (e.isDefaultPrevented() || !is_dirty()) return;
+		e.preventDefault();
+		e.stopImmediatePropagation();
+		const confirm = new frappe.ui.Dialog({
+			title: __("You have unsaved changes"),
+			size: "small",
+			primary_action_label: __("Save draft"),
+			primary_action: () =>
+				Promise.resolve(save()).then(() => {
+					confirm.hide();
+					dialog.hide();
+				}),
+			secondary_action_label: __("Discard"),
+			secondary_action: () => {
+				confirm.hide();
+				dialog.hide();
+			},
+		});
+		confirm.show();
+	};
+	dialog.get_close_btn().on("click", ask);
+	dialog.$wrapper.on("keydown", (e) => {
+		if (e.key === "Escape" && !dialog.$wrapper.find(".grid-row-open").length) ask(e);
+	});
+	dialog.$wrapper.on("click", (e) => e.target === e.currentTarget && ask(e));
+}
+
+// A table's rows as text, to tell whether they changed since: the order of the rows doesn't count
+function get_rows_key(grid, rows = grid.df.data || []) {
+	const fields = grid.docfields.map((df) => df.fieldname);
+	return JSON.stringify(rows.map((row) => JSON.stringify(fields.map((f) => row[f] ?? null))).sort());
+}
+
 function make_task(frm, step, buttons) {
 	const [icon, color] = step.is_closing
 		? ["loader-circle", "text-ink-blue-7"]
@@ -1180,6 +1224,9 @@ function get_books_reminders(frm) {
 			const steps = index ? [] : get_year_close_steps(years.slice(0, first + 1));
 			const blocker = years.slice(0, first + 1).find((y) => y.stock?.needed && !y.stock.done)
 				?.stock.blocker;
+			const drafts = year.drafts?.length
+				? __("Can't close yet: {0} still drafts.", [year.drafts.join(" · ")])
+				: null;
 			return {
 				theme: "yellow",
 				title:
@@ -1196,9 +1243,7 @@ function get_books_reminders(frm) {
 						]
 					),
 					index ? null : blocker,
-					index || !year.drafts?.length
-						? null
-						: __("Can't close yet: {0} still drafts.", [year.drafts.join(" · ")]),
+					index ? null : drafts,
 				]
 					.filter(Boolean)
 					.join(" "),
@@ -1208,6 +1253,8 @@ function get_books_reminders(frm) {
 						: [
 								{
 									label: __("Close {0}", [year.fiscal_year]),
+									disabled: Boolean(drafts),
+									tooltip: drafts,
 									onclick: () => close_year(frm, year, steps),
 								},
 						  ],
@@ -2045,7 +2092,7 @@ function make_alerts(alerts) {
 			footer: alert.buttons?.length
 				? () =>
 						$(`<div class="flex gap-2"></div>`).append(
-							alert.buttons.map((button) => frappe.ui.button(button))
+							alert.buttons.map((button) => make_button(button))
 						)
 				: undefined,
 		});
@@ -2311,9 +2358,16 @@ function show_opening_balances(frm, result, replacing) {
 				const grid = dialog.fields_dict.balances.grid;
 				grid.df.data = get_drafts().map((row) => ({ ...row, name: undefined }));
 				grid.refresh();
+				saved_key = get_rows_key(grid);
 				update_totals();
 				frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
 			});
+	let saved_key = get_rows_key(dialog.fields_dict.balances.grid);
+	ask_before_closing(
+		dialog,
+		() => get_rows_key(dialog.fields_dict.balances.grid) !== saved_key,
+		() => save_rows().then(() => reload_fresh(frm))
+	);
 
 	const $intro = dialog.get_field("intro").$wrapper;
 	$(`<div class="flex flex-wrap items-center justify-between gap-2 mb-3"></div>`)
@@ -4380,6 +4434,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 	const party_accounts = { ...names.party_accounts };
 	// a ledger saved on the customer or supplier, or on its group, for a sheet with no "Post to"
 	const own_accounts = names.own_accounts || {};
+	// the ledger a row goes to: its own, its customer's or supplier's, else the company's default
+	const account_of = (row) => row.account || party_accounts[row.party] || names.default_account;
 	// dates the sheet had that could not be read: what it said, by row and field, until typed in
 	const unread = {};
 	for (const bad of result?.bad_dates || []) {
@@ -4619,6 +4675,16 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 	const in_sheet = (row) => !result?.source || !row.source || row.source === result.source;
 	if (accounts.length > 1) {
 		const used = [...new Set(data.map((row) => row.account).filter(Boolean))];
+		// the trial balance's ledgers, when it has them: a ledger with no line is never the sheet's
+		const line_accounts = ledger_lines.map((line) => line.account).filter((a) => accounts.includes(a));
+		// a sheet's ledger shows again only while rows are on it in place of their own ledger
+		const moved = data.some(
+			(row) =>
+				row.account &&
+				!row.account_by_hand &&
+				row.account !==
+					(own_accounts[row.party] || party_accounts[row.party] || names.default_account)
+		);
 		const post_to = frappe.ui.form.make_control({
 			df: {
 				fieldtype: "Link",
@@ -4644,7 +4710,9 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 				]
 					.filter(Boolean)
 					.join(" "),
-				get_query: () => ({ filters: { name: ["in", accounts] } }),
+				get_query: () => ({
+					filters: { name: ["in", line_accounts.length ? line_accounts : accounts] },
+				}),
 				filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
 				change: () => {
 					const value = post_to.get_value() || null;
@@ -4661,7 +4729,13 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 			parent: $post_to,
 			render_input: true,
 		});
-		const picked = result?.post_to || (used.length === 1 ? used[0] : null);
+		// typing replaces the picked ledger instead of adding to it
+		post_to.$input.on("focus", () => setTimeout(() => post_to.$input.select()));
+		// with no rows yet it starts on the trial balance's only ledger line; with several, the user picks
+		const picked =
+			result?.post_to ||
+			(used.length === 1 && moved ? used[0] : null) ||
+			(!data.length && line_accounts.length === 1 ? line_accounts[0] : null);
 		if (picked) {
 			sheet_account = picked;
 			post_to.set_value(picked);
@@ -5065,6 +5139,10 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		grid.refresh();
 	};
 	const show_rows_on = (account) => {
+		// rows with no ledger set go to the default one: named on them so the filter finds them
+		for (const row of dialog.get_value("invoices") || []) {
+			if (account && !row.account && account_of(row) === account) row.account = account;
+		}
 		filter_account(account);
 		refresh_state();
 	};
@@ -5073,7 +5151,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		if (accounts.length < 2) return [];
 		const moved = {};
 		const add = (row, sign) => {
-			const account = row.account || party_accounts[row.party];
+			const account = account_of(row);
 			if (
 				row.status === "Created" ||
 				!account ||
@@ -5093,16 +5171,18 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		if (accounts.includes(shown) && !overs.some((over) => over.account === shown)) filter_account(null);
 		show_only_unread();
 		if (!overs.length) return [];
+		const all = dialog.get_value("invoices") || [];
 		return make_alerts(
 			overs.map((over) => {
 				const only = over.account === shown;
 				const count = grid.data.length;
+				const has_rows = all.some(
+					(row) => row.status !== "Created" && account_of(row) === over.account
+				);
+				const posted = flt(over.entered - over.draft, 2);
 				return {
 					theme: "red",
-					title: __("{0} would be {1} over its trial balance line", [
-						short_account(frm, over.account),
-						format_currency(over.entered - flt(over.sheet), currency),
-					]),
+					title: ledger_over_title(frm, over, currency),
 					description: [
 						only
 							? plural(
@@ -5117,14 +5197,23 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 										currency
 									),
 							  ]),
-						__("Tick the rows that belong to another ledger, pick it, and Apply."),
-					].join(" "),
-					buttons: [
-						{
-							label: only ? __("Show all") : __("Show rows"),
-							onclick: () => show_rows_on(only ? null : over.account),
-						},
-					],
+						posted >= 1 &&
+							(!has_rows || posted - flt(over.sheet) >= 1) &&
+							(is_customer
+								? __("{0} is in posted invoices.", [format_currency(posted, currency)])
+								: __("{0} is in posted bills.", [format_currency(posted, currency)])),
+						has_rows && __("Tick the rows that belong to another ledger, pick it, and Apply."),
+					]
+						.filter(Boolean)
+						.join(" "),
+					buttons: has_rows
+						? [
+								{
+									label: only ? __("Show all") : __("Show rows"),
+									onclick: () => show_rows_on(only ? null : over.account),
+								},
+						  ]
+						: [],
 				};
 			})
 		).addClass("mb-3");
@@ -5667,10 +5756,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 	const save_draft = () => {
 		if (!dialog.get_values()) return;
 		save().then(() => {
+			saved_key = get_rows_key(grid);
 			if (dialog.get_field("names_view").df.hidden) refresh_state();
 			frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
 		});
 	};
+	let saved_key = get_rows_key(grid);
+	ask_before_closing(
+		dialog,
+		() => !posting && get_rows_key(grid) !== saved_key,
+		() => (dialog.get_values() ? save() : Promise.reject())
+	);
 
 	if (posting) {
 		frm.posting_dialog = Object.assign(dialog, { party_type: party_type });
@@ -5950,10 +6046,7 @@ function post_opening_invoices(
 				? make_alerts(
 						overs.map((over) => ({
 							theme: "red",
-							title: __("{0} would be {1} over its trial balance line", [
-								short_account(frm, over.account),
-								format_currency(over.entered - flt(over.sheet), currency),
-							]),
+							title: ledger_over_title(frm, over, currency),
 							description: [
 								__("{0} is {1} short.", [
 									over.short.map((line) => short_account(frm, line.account)).join(", "),
@@ -6227,6 +6320,15 @@ function make_old_dates_choice(dates, party_type, currency, day_before, on_chang
 
 // What to do about a ledger going over its line: the tick below that moves rows off it, else moving
 // its rows in the window
+function ledger_over_title(frm, over, currency) {
+	return over.sheet === null
+		? __("{0} has no line in your trial balance", [short_account(frm, over.account)])
+		: __("{0} would be {1} over its trial balance line", [
+				short_account(frm, over.account),
+				format_currency(over.entered - flt(over.sheet), currency),
+		  ]);
+}
+
 function ledger_over_hint(frm, party_type, account, fixes) {
 	const tick = fixes.find(
 		({ clash, check }) => clash.from_account === account && clash.kind !== "posted" && !check.get_value()
@@ -7462,7 +7564,9 @@ class BankAccountsWindow {
 			root_type: row.root_type,
 		}));
 		// no default yet: the only account that isn't overdrawn or owed is ticked, to change if need be
-		const in_credit = this.accounts.filter((row) => row.root_type === "Asset" && flt(row.book) >= 0);
+		const in_credit = this.accounts.filter(
+			(row) => row.bank && row.root_type === "Asset" && flt(row.book) >= 0
+		);
 		if (!this.accounts.some((row) => row.is_default) && in_credit.length === 1) {
 			in_credit[0].is_default = 1;
 		}
@@ -7709,6 +7813,14 @@ class BankAccountsWindow {
 		setup_dialog_grid(this.accounts_grid);
 		this.cheques_grid = this.dialog.fields_dict.cheques.grid;
 		setup_dialog_grid(this.cheques_grid, () => this.refresh_cheques());
+		ask_before_closing(
+			this.dialog,
+			() => this.saved_key !== undefined && this.get_draft_key() !== this.saved_key,
+			() =>
+				this.view === "cheques"
+					? this.save_cheques().then(() => reload_fresh(this.frm))
+					: this.save_accounts(true)
+		);
 		this.$back = $(`<div class="hide"></div>`)
 			.append(frappe.ui.button({ label: __("Back"), onclick: () => this.show_accounts() }))
 			.appendTo(this.dialog.custom_actions);
@@ -7725,13 +7837,32 @@ class BankAccountsWindow {
 			},
 			view
 		);
+		this.view = view;
 		this.$back.toggleClass("hide", view !== "cheques");
 		this.dialog.get_primary_btn().removeAttr("data-theme");
 	}
 
+	// what Save draft keeps in the view shown, to tell whether it changed since it was saved
+	get_draft_key() {
+		if (this.view === "cheques") return get_rows_key(this.cheques_grid, this.sync());
+		if (this.view !== "accounts") return this.saved_key;
+		return JSON.stringify([
+			this.get_account_rows(),
+			// the answer saved fills the question only once the window shows
+			this.dialog.get_value("has_uncleared_cheques") || this.details.has_uncleared_cheques || null,
+		]);
+	}
+
 	// one default bank: ticking one unticks the others
 	set_default(row) {
-		if (row?.is_default) {
+		if (row?.is_default && !row.bank) {
+			row.is_default = 0;
+			this.accounts_grid.refresh();
+			frappe.ui.toast({
+				type: "error",
+				message: __("Pick a bank for {0} first.", [short_account(this.frm, row.account)]),
+			});
+		} else if (row?.is_default) {
 			for (const other of this.accounts) if (other !== row) other.is_default = 0;
 			this.accounts_grid.refresh();
 		}
@@ -7745,10 +7876,16 @@ class BankAccountsWindow {
 		this.dialog.set_secondary_action_label(__("Save draft"));
 		this.dialog.set_secondary_action(() => this.save_accounts(true));
 		this.refresh_accounts();
+		this.saved_key = this.get_draft_key();
 	}
 
 	refresh_accounts() {
 		const rows = this.accounts;
+		const no_bank_default = rows.find((row) => row.is_default && !row.bank);
+		if (no_bank_default) {
+			no_bank_default.is_default = 0;
+			this.accounts_grid.refresh();
+		}
 		const $head = this.dialog.get_field("accounts_head").$wrapper.empty();
 		$head.append(
 			make_sheet_head(
@@ -7959,6 +8096,7 @@ class BankAccountsWindow {
 			reload_fresh(this.frm).then(() => {
 				if (draft) {
 					this.refresh_accounts();
+					this.saved_key = this.get_draft_key();
 					frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
 				} else if (answer === "Yes") {
 					this.show_cheques();
@@ -8008,11 +8146,13 @@ class BankAccountsWindow {
 			const with_rows = this.checks.banks.find((bank) =>
 				this.cheques.some((row) => row.bank_account === bank.account)
 			);
+			const added = this.checks.banks.filter((bank) => bank.bank);
+			const default_bank = this.frm.doc.__onload?.bank?.default_bank;
 			this.picked =
 				account ||
 				with_rows?.account ||
-				this.frm.doc.__onload?.bank?.default_bank ||
-				this.checks.banks[0]?.account;
+				added.find((bank) => bank.account === default_bank)?.account ||
+				(added[0] || this.checks.banks[0])?.account;
 			this.set_view("cheques");
 			this.dialog.set_title(__("Bank accounts"));
 			this.dialog.set_primary_action(__("Post to books"), () => this.post());
@@ -8025,6 +8165,7 @@ class BankAccountsWindow {
 			);
 			this.make_cheques_head();
 			this.show_bank_rows();
+			this.saved_key = this.get_draft_key();
 		});
 	}
 
@@ -8481,6 +8622,7 @@ class BankAccountsWindow {
 				this.checks = r.message;
 				this.cheques = this.get_drafts();
 				this.show_bank_rows();
+				this.saved_key = this.get_draft_key();
 				if (this.checks.blocker) {
 					frappe.ui.toast({ type: "error", message: this.checks.blocker });
 				} else if (this.cheques.length) {
@@ -9245,7 +9387,8 @@ function show_taxes(frm) {
 const WAREHOUSE_KINDS = ["Our warehouse", "Job worker", "Work in progress"];
 
 // Every warehouse with its kind, job worker and stock line; the ones only on a stock sheet are new
-function show_warehouses(frm, { job_workers = false } = {}) {
+// after: what to open again once the window closes, saved or not
+function show_warehouses(frm, { job_workers = false, after = null } = {}) {
 	Promise.all([
 		get_data(frm, "get_warehouses"),
 		frappe.db.get_list("Supplier", { fields: ["name"], limit: 0 }),
@@ -9331,6 +9474,8 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 		const grid = dialog.fields_dict.rows.grid;
 		setup_dialog_grid(grid, refresh);
 		const rows = () => grid.df.data || [];
+		let reloaded = null;
+		if (after) dialog.onhide = () => (reloaded || Promise.resolve()).then(after);
 		const save = () => {
 			const visible = rows();
 			const kept = all.filter((row) => !shown.includes(row));
@@ -9340,7 +9485,8 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 				{ rows: [...kept, ...visible].filter((row) => row.warehouse_name) },
 				{ freeze: true }
 			).then(() => {
-				close_and_reload(frm, dialog);
+				reloaded = reload_fresh(frm);
+				dialog.hide();
 				frappe.ui.toast({ type: "success", message: __("Warehouses saved.") });
 			});
 		};
@@ -9576,6 +9722,11 @@ class SheetWindow {
 		if (where) fill_where(frm, this.dialog, where);
 		this.grid = this.dialog.fields_dict.rows.grid;
 		setup_dialog_grid(this.grid, () => this.changed());
+		ask_before_closing(
+			this.dialog,
+			() => this.dirty,
+			() => this.save().then(() => (this.dirty = false))
+		);
 		this.$back = $(`<div class="hide"></div>`).appendTo(this.dialog.custom_actions);
 		this.views = {
 			sheet: ["head", "stats", "alerts", "rows", "notes", "where_section"],
@@ -10080,6 +10231,7 @@ class OpeningStockWindow extends SheetWindow {
 				open();
 			},
 		});
+		const reopen = () => show_opening_stock(frm);
 		// the server's reds, in order; a few get a button to the step that fixes them
 		const actions = {
 			posting_blocker: checks.posting_fix
@@ -10091,8 +10243,8 @@ class OpeningStockWindow extends SheetWindow {
 					onclick: () => call_method(frm, "turn_on_perpetual_inventory").then(() => this.refresh()),
 				},
 			],
-			missing_warehouses: [go(__("Go to Warehouses"), () => show_warehouses(frm))],
-			wrong_lines: [go(__("Go to Warehouses"), () => show_warehouses(frm))],
+			missing_warehouses: [go(__("Go to Warehouses"), () => show_warehouses(frm, { after: reopen }))],
+			wrong_lines: [go(__("Go to Warehouses"), () => show_warehouses(frm, { after: reopen }))],
 			no_serials: [
 				{
 					label: __("Make serial numbers"),
@@ -10240,7 +10392,7 @@ class OpeningStockWindow extends SheetWindow {
 				),
 				buttons: [
 					go(__("Posted stock"), () => show_posted_stock(frm)),
-					go(__("Go to Warehouses"), () => show_warehouses(frm)),
+					go(__("Go to Warehouses"), () => show_warehouses(frm, { after: reopen })),
 				],
 			});
 		}
@@ -11555,7 +11707,14 @@ class OpenOrdersWindow extends SheetWindow {
 					? go(__("Open BOM Creator"), () => frappe.new_doc("BOM Creator"))
 					: go(__("Import BOMs"), () => open_party_import(frm, "BOM")),
 			],
-			no_job_worker: [go(__("Go to Warehouses"), () => show_warehouses(frm, { job_workers: true }))],
+			no_job_worker: [
+				go(__("Go to Warehouses"), () =>
+					show_warehouses(frm, {
+						job_workers: true,
+						after: () => show_open_orders(frm, order_type),
+					})
+				),
+			],
 			material_not_posted: [
 				go(__("Go to Opening stock"), () => {
 					show_tab(frm, "stock_tab");
@@ -11917,6 +12076,7 @@ class FixedAssetsWindow extends SheetWindow {
 						list_column("asset_category", "Data", __("Category"), 2),
 						list_column("method", "Select", __("Method"), 2, {
 							options: ["", "Straight Line", "Written Down Value"],
+							reqd: 1,
 						}),
 						list_column("life", "Int", __("Life (years)"), 1),
 						list_column("rate", "Float", __("Rate %"), 1),
@@ -12278,8 +12438,17 @@ class FixedAssetsWindow extends SheetWindow {
 		const count = this.get_rows().length;
 		this.dialog.set_primary_action(
 			count ? plural(count, __("Apply to 1 row"), __("Apply to {0} rows", [count])) : __("Apply"),
-			() =>
-				this.save()
+			() => {
+				const no_method = (grid.df.data || []).filter((row) => !row.method);
+				if (no_method.length) {
+					return frappe.ui.toast({
+						type: "error",
+						message: __("Pick a Method for {0}.", [
+							no_method.map((row) => row.asset_category || row.asset_account).join(", "),
+						]),
+					});
+				}
+				return this.save()
 					.then(() =>
 						call_method(this.frm, "save_asset_categories", {
 							rows: (grid.df.data || []).map(({ net_value, ...row }) =>
@@ -12287,7 +12456,8 @@ class FixedAssetsWindow extends SheetWindow {
 							),
 						})
 					)
-					.then(() => this.refresh())
+					.then(() => this.refresh());
+			}
 		);
 	}
 

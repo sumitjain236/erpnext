@@ -493,6 +493,9 @@ doc_events = {
 	"Journal Entry": {
 		"on_cancel": "erpnext.setup.doctype.company_setup.company_setup.release_posted_rows",
 	},
+	"Stock Closing Entry": {
+		"on_change": "erpnext.setup.doctype.company_setup.company_setup.resume_year_close_on_stock_close",
+	},
 	"Payment Entry": {
 		"on_trash": "erpnext.regional.check_deletion_permission",
 	},

@@ -207,6 +207,37 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 		self.doc.create_opening_invoices("Customer")
 		self.assertEqual((get_balance(sundry, "OB-A-1"), get_balance(retainers, "OB-A-1")), (300, 0))
 
+	def test_a_post_to_cleared_stays_cleared_when_the_sheet_comes_again(self):
+		default, retainers = self.add_receivable_account("Debtors - Retainers")
+		sheet = [
+			"Bills Receivable,,,",
+			"Ledger: Debtors - Retainers   1-Apr-2025 to 31-Mar-2026,,,",
+			"Date,Ref. No.,Party's Name,Pending Amount",
+			f"2026-03-01,OB-C-1,{self.customer.customer_name},300",
+		]
+		self.assertEqual(
+			self.doc.import_opening_invoices("Customer", make_file("retainers.csv", sheet))["post_to"],
+			retainers,
+		)
+		# Post to cleared in the window: the rows go back to the customer's own ledger
+		self.doc.reload()
+		rows = [row.as_dict() | {"account": default} for row in self.doc.opening_sales_invoices]
+		self.doc.save_opening_invoices("Customer", rows)
+		result = self.doc.import_opening_invoices("Customer", make_file("retainers.csv", sheet))
+		self.doc.reload()
+		self.assertEqual(
+			(result["post_to"], [row.account for row in self.doc.opening_sales_invoices]), (None, [None])
+		)
+
+	def test_a_file_that_is_not_a_sheet_is_refused_in_words(self):
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			r"Upload an Excel \(\.xlsx\) or CSV file",
+			self.doc.import_opening_invoices,
+			"Customer",
+			make_file("bills.xlsx", ["not a sheet"]),
+		)
+
 	def test_post_to_moves_only_its_own_sheets_rows(self):
 		sundry, retainers = self.add_receivable_account("Debtors - Retainers")
 		row = {"party_name": self.customer.customer_name}

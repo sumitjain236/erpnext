@@ -294,8 +294,8 @@ class TestBooks(ERPNextTestSuite):
 
 		# tried again, it builds the stock again, then closes the year once that is done
 		self.doc.close_year(year["fiscal_year"], year["closing_account"])
+		# a finished stock closing carries the close on without the scheduler
 		closing.db_set("status", "Completed")
-		run_year_close(self.company)
 		self.assertIsNone(self.get_year_close())
 		self.assertTrue(frappe.db.exists("Period Closing Voucher", {"company": self.company, "docstatus": 1}))
 

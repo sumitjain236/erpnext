@@ -10,6 +10,7 @@ closing columns, of which the closing ones are used.
 import csv
 import re
 from io import BytesIO, StringIO
+from zipfile import is_zipfile
 
 import frappe
 from frappe import _
@@ -458,6 +459,9 @@ def read_report(file_url: str) -> list[frappe._dict]:
 	indent, as Frappe's reader trims its values."""
 	file_doc, extension = get_file(file_url)
 	content = file_doc.get_content()
+	is_text = isinstance(content, str)
+	if (is_text and extension != "csv") or (extension == "xlsx" and not is_zipfile(BytesIO(content))):
+		frappe.throw(_("Upload an Excel (.xlsx) or CSV file."), title=_("Not a sheet"))
 	if extension == "xlsx":
 		sheet = load_workbook(BytesIO(content), data_only=True).active
 		return [

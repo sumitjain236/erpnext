@@ -1151,8 +1151,16 @@ class CompanySetup(Document):
 		self.check_permission("write")
 		sheet = read_invoice_sheet(file_url, party_type)
 		unknown_ledgers = set_ledger_accounts(self.company, party_type, sheet.invoices)
-		post_to = get_title_account(self.company, party_type, sheet.titles)
 		source = get_file_label(file_url)
+		post_to = get_sheet_post_to(self, party_type, sheet.titles)
+		# the sheet uploaded again: its ledger only while its drafts still sit on it
+		earlier = [
+			row
+			for row in self.get(get_table(party_type))
+			if row.status != "Created" and row.source == source and not row.account_by_hand
+		]
+		if post_to and earlier and any(row.account != post_to for row in earlier):
+			post_to = None
 		left_out = self.save_opening_invoices(party_type, sheet.invoices, source, post_to)
 		return {
 			"added": len(sheet.invoices) - left_out.skipped - left_out.repeated,
@@ -1243,6 +1251,10 @@ class CompanySetup(Document):
 			}
 			if len(accounts) > 1
 			else {},
+			# where a row with no ledger of its own goes, as the sheet match counts it
+			"default_account": get_party_account(party_type, None, self.company)
+			if len(accounts) > 1
+			else None,
 			# a ledger saved on the customer or supplier or its group, which "Post to" doesn't change
 			"own_accounts": {
 				party: account
@@ -2290,12 +2302,20 @@ def resume_year_closes():
 		enqueue_year_close(company)
 
 
+def resume_year_close_on_stock_close(doc, method=None):
+	"""Carry on a year close waiting for this stock close as soon as it is built."""
+	if doc.status == "Completed" and frappe.db.get_value(
+		"Company Setup", {"name": doc.company, "year_close": ("like", '%"waiting": 1%')}
+	):
+		enqueue_year_close(doc.company)
+
+
 def run_year_close(company: str):
 	"""The steps of the year close in turn, each kept once done. A stock close builds in ERPNext's
-	own job: this one ends then as waiting, and resume_year_closes starts it again, until it is built
-	or STOCK_CLOSE_SECONDS pass. ERPNext enqueues that job before the commit, so a closing whose job
-	lost its entry stays In Progress: the wait ends at that limit. A step that fails stops the close,
-	with its error."""
+	own job: this one ends then as waiting, and starts again once it is built, or from
+	resume_year_closes until STOCK_CLOSE_SECONDS pass. ERPNext enqueues that job before the commit,
+	so a closing whose job lost its entry stays In Progress: the wait ends at that limit. A step that
+	fails stops the close, with its error."""
 	state = frappe._dict(frappe.parse_json(frappe.db.get_value("Company Setup", company, "year_close")))
 	state.pop("waiting", None)
 	while state.steps and state.done < len(state.steps):
@@ -2442,6 +2462,22 @@ def get_window_reds(onboarding, day_before) -> dict:
 			company, day_before, undo=True, voucher_types=voucher_types
 		)
 	return reds
+
+
+def get_sheet_post_to(onboarding, party_type: str, titles: list[str]) -> str | None:
+	"""The ledger an uploaded sheet's rows go to: the trial balance's only receivable or payable line,
+	else the one the sheet's title names among its lines. Never a ledger with no line, like the
+	company's default."""
+	accounts = get_invoice_accounts(onboarding.company, party_type)
+	if len(accounts) < 2:
+		return None
+	account_type = "Receivable" if party_type == "Customer" else "Payable"
+	sheet = (frappe.parse_json(onboarding.sheet_accounts or "{}") or {}).get(account_type) or {}
+	lines = [account for account in sheet if account in accounts]
+	if len(lines) == 1:
+		return lines[0]
+	title = get_title_account(onboarding.company, party_type, titles)
+	return title if title in lines or not lines else None
 
 
 def get_file_label(file_url: str) -> str:

@@ -2180,6 +2180,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 		names = self.doc.get_invoice_names("Customer")
 		self.assertEqual(set(names["accounts"]), {receivable, export})
 		self.assertEqual(names["party_accounts"], {self.customer.name: receivable})
+		self.assertEqual(names["default_account"], receivable)
 		self.doc.create_opening_invoices("Customer")
 		self.doc.reload()
 

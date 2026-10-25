@@ -379,6 +379,13 @@ def save_bank_details(onboarding, rows: list[dict], has_uncleared_cheques: str |
 	defaults = [row for row in onboarding.bank_accounts if row.is_default]
 	if len(defaults) > 1:
 		frappe.throw(_("Pick one default bank."), title=_("More than one default"))
+	if defaults and not defaults[0].bank:
+		frappe.throw(
+			_("Pick a bank for {0}, or make another account the default.").format(
+				frappe.bold(defaults[0].account)
+			),
+			title=_("Default bank has no bank"),
+		)
 	numbers = {}
 	for row in onboarding.bank_accounts:
 		if row.bank_account_no:

@@ -710,6 +710,12 @@ body[data-route="pos"] {
 	grid-template-columns: 6rem minmax(0, 1fr);
 }
 
+// Company Setup: a long badge by a card's title ends in "…" at the card's edge
+.company-setup-fit-badge {
+	flex-shrink: 1;
+	max-width: 100%;
+}
+
 // Company Setup: a debit or credit column of a trial balance
 .company-setup-amount {
 	flex-shrink: 0;
