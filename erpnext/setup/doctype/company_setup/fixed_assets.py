@@ -1061,15 +1061,20 @@ def get_net_value_categories(onboarding, prepared: list, plan: frappe._dict) -> 
 	return moves
 
 
+def get_closed_to(company: str):
+	"""The end of the last year closed: entries on or before it can't be posted any more."""
+	return frappe.db.get_value(
+		"Period Closing Voucher", {"company": company, "docstatus": 1}, [{"MAX": "period_end_date"}]
+	)
+
+
 def get_closed_until(company: str) -> frappe._dict:
 	"""The latest of: the end of the company's last closed year, of its last Accounting Period closed
 	for journal entries (unless the user has its exempted role), and the accounts frozen date (unless
 	the user may post into it, as ERPNext checks). With the period's name, or frozen, when that one
 	is the latest."""
 	roles = frappe.get_roles()
-	year_end = frappe.db.get_value(
-		"Period Closing Voucher", {"company": company, "docstatus": 1}, [{"MAX": "period_end_date"}]
-	)
+	year_end = get_closed_to(company)
 	ends = [frappe._dict(date=getdate(year_end))] if year_end else []
 	for row in get_closed_periods(company, ("Journal Entry",)):
 		ends.append(frappe._dict(date=getdate(row.end_date), period=row.name))
@@ -1082,9 +1087,10 @@ def get_closed_until(company: str) -> frappe._dict:
 	return frappe._dict(date=latest.date, period=latest.period, frozen=bool(latest.frozen))
 
 
-def get_asset_checks(onboarding) -> dict:
+def get_asset_checks(onboarding, check_items: bool = True) -> dict:
 	"""What the Fixed assets window shows: the sheet, the books today, the reds that stop posting,
-	the yellows and greys to show, and what the confirm says."""
+	the yellows and greys to show, and what the confirm says. check_items: validate the new
+	categories' items (bad_hsn), which runs Item.validate with every app's hooks."""
 	plan = get_plan(onboarding)
 	drafts = get_drafts(onboarding)
 	prepared = prepare_assets(onboarding, drafts, plan)
@@ -1126,7 +1132,8 @@ def get_asset_checks(onboarding) -> dict:
 		bad_hsn={
 			row.asset_category: error
 			for row in new_items
-			if hsn_label
+			if check_items
+			and hsn_label
 			and row.hsn_code
 			and (error := get_asset_item_error(row.asset_category, row.hsn_code))
 		},

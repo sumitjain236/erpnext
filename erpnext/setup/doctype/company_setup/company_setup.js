@@ -1196,6 +1196,9 @@ function get_books_reminders(frm) {
 						]
 					),
 					index ? null : blocker,
+					index || !year.drafts?.length
+						? null
+						: __("Can't close yet: {0} still drafts.", [year.drafts.join(" · ")]),
 				]
 					.filter(Boolean)
 					.join(" "),
@@ -1321,6 +1324,21 @@ function close_year(frm, year, steps) {
 				__("After this, opening entries on or before {0} can't be posted or undone.", [year_end])
 			).addClass("mb-3")
 		);
+	if (year.drafts?.length) {
+		dialog.get_field("note").$wrapper.prepend(
+			make_alerts([
+				{
+					theme: "red",
+					title: __("Post or remove the opening drafts first"),
+					description: __("{0}. After the close, entries on or before {1} can't be posted.", [
+						year.drafts.join(" · "),
+						year_end,
+					]),
+				},
+			]).addClass("mb-3")
+		);
+		dialog.get_primary_btn().prop("disabled", true);
+	}
 	dialog.show();
 	dialog.set_value("closing_account", year.closing_account || "");
 	// typing replaces the suggested account instead of adding to it
@@ -1478,6 +1496,30 @@ function show_go_live(frm) {
 		open_step(frm, step);
 	};
 	const alerts = [
+		reminders.closed_drafts?.length && {
+			theme: "red",
+			title: __("These opening drafts can no longer be posted"),
+			description: __(
+				"{0}. They are dated on or before {1}, and that year is closed. Remove them, or enter them as normal entries after the migration date.",
+				[reminders.closed_drafts.join(" · "), frappe.datetime.str_to_user(reminders.closed_to)]
+			),
+			buttons: [
+				{
+					label: __("Remove drafts"),
+					onclick: () =>
+						frappe.confirm(
+							__("Remove these opening drafts: {0}?", [
+								frappe.utils.escape_html(reminders.closed_drafts.join(" · ")),
+							]),
+							() =>
+								call_method(frm, "remove_closed_drafts", {}, { freeze: true }).then(() => {
+									dialog.hide();
+									reload_fresh(frm).then(() => show_go_live(frm));
+								})
+						),
+				},
+			],
+		},
 		temporary && {
 			theme: "red",
 			title: __("Temporary Opening is {0}, so it is not zero.", [
@@ -1498,9 +1540,12 @@ function show_go_live(frm) {
 				opening_sales_invoices: "Customer",
 				opening_purchase_invoices: "Supplier",
 			}[step.name];
+			const table = party_type && PARTY[party_type].table;
 			const drafts =
 				party_type &&
-				(frm.doc[PARTY[party_type].table] || []).filter((row) => row.status !== "Created").length;
+				(frm.doc[table] || []).filter((row) => row.status !== "Created").length -
+					flt(reminders.closed_draft_counts?.[table]);
+			if (party_type && !drafts && reminders.closed_draft_counts?.[table]) return null;
 			if (!drafts) {
 				return {
 					title: __("{0} is not done.", [step.title]),
@@ -4333,7 +4378,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 	// several receivable or payable accounts: each invoice shows the one it goes to, and can change
 	const accounts = names.accounts || [];
 	const party_accounts = { ...names.party_accounts };
-	// a ledger saved on the customer or supplier, or on its group, wins over the sheet's "Post to"
+	// a ledger saved on the customer or supplier, or on its group, for a sheet with no "Post to"
 	const own_accounts = names.own_accounts || {};
 	// dates the sheet had that could not be read: what it said, by row and field, until typed in
 	const unread = {};
@@ -4359,8 +4404,6 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 			? frappe.datetime.str_to_user(value)
 			: "";
 	let only_unread = false;
-	// a ledger whose rows set on it are the only ones shown, from the post confirm's Show rows
-	let only_account = null;
 	// names confirmed in this window, shown as Confirmed in the names list
 	const confirmed = new Set();
 	const day_before = day_before_text(frm);
@@ -4406,7 +4449,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 							const row = this.doc;
 							if (row && row.party && !row.party_name) row.party_name = row.party;
 							if (row) {
-								row.account = own_accounts[row.party] || sheet_account;
+								row.account = (in_sheet(row) && sheet_account) || own_accounts[row.party];
 								row.account_by_hand = 0;
 								row.create_party = 0;
 							}
@@ -4511,10 +4554,11 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		if (row.status !== "Created")
 			draft_sources[row.source || ""] = (draft_sources[row.source || ""] || 0) + 1;
 	}
-	const remove_source = (source, count) => {
+	const remove_rows = (gone, count) => {
 		dialog.fields_dict.invoices.df.data = (dialog.get_value("invoices") || []).filter(
-			(row) => (row.source || "") !== source
+			(row) => !gone(row)
 		);
+		grid.wrapper.find(".grid-heading-row .grid-row-check").prop("checked", false);
 		grid.refresh();
 		refresh_state();
 		frappe.ui.toast({
@@ -4532,7 +4576,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 					? __("Remove {0} · 1 row", [source || __("rows typed in")])
 					: __("Remove {0} · {1} rows", [source || __("rows typed in"), count]),
 			icon: "trash-2",
-			onclick: () => remove_source(source, count),
+			onclick: () => remove_rows((row) => (row.source || "") === source, count),
 		})),
 		...invoice_menu(frm, party_type).filter((item) => item.icon === "download"),
 		names.new?.length &&
@@ -4571,6 +4615,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 	const $post_to = $(`<div class="max-w-sm"></div>`).appendTo($intro);
 	// the ledger picked for the whole sheet: every row goes there, names confirmed later too
 	let sheet_account = null;
+	// after an upload, Post to is for that sheet's rows and rows typed in, not another sheet's
+	const in_sheet = (row) => !result?.source || !row.source || row.source === result.source;
 	if (accounts.length > 1) {
 		const used = [...new Set(data.map((row) => row.account).filter(Boolean))];
 		const post_to = frappe.ui.form.make_control({
@@ -4594,7 +4640,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 									"Your trial balance has {0} payable ledgers. Pick the one this sheet is for.",
 									[ledger_lines.length]
 							  )),
-					__("Post to sets rows that have no account."),
+					__("Post to moves every row, except rows the sheet's Ledger column or you set."),
 				]
 					.filter(Boolean)
 					.join(" "),
@@ -4602,10 +4648,11 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 				filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
 				change: () => {
 					const value = post_to.get_value() || null;
+					if (value === sheet_account) return;
 					sheet_account = value;
 					for (const row of dialog.get_value("invoices") || []) {
-						if (row.account_by_hand) continue;
-						row.account = own_accounts[row.party] || value || party_accounts[row.party];
+						if (row.account_by_hand || !in_sheet(row)) continue;
+						row.account = value || own_accounts[row.party] || party_accounts[row.party];
 					}
 					grid.refresh();
 					refresh_state();
@@ -4903,7 +4950,13 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		$sheet_buttons.toggle(!empty);
 		$post_to.toggle(!empty);
 		grid.wrapper.closest(".frappe-control").toggle(!empty);
-		dialog.get_primary_btn().prop("disabled", empty);
+		const overs = get_window_overs(all);
+		// posted rows on an over ledger: the post confirm may offer to move them
+		const can_move = (frm.doc[party.table] || []).some(
+			(row) => row.status === "Created" && overs.some((over) => over.account === row.account)
+		);
+		dialog.get_primary_btn().prop("disabled", empty || (overs.length && !can_move));
+		update_bulk();
 		dialog.get_secondary_btn().toggle(!empty);
 		// shown with the table, rows or not, so the table doesn't move down on the first pick
 		$stats
@@ -4944,7 +4997,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 		}
 		$review.append(make_waiting_alerts(all));
 		$review.append(make_unread_dates_alert(all));
-		$review.append(make_account_rows_alert(all));
+		$review.append(make_over_alerts(overs));
 		if (state.review.length) make_review_box(state);
 	};
 	// rows whose sheet dates could not be read: one box for all of them, and a way to see just those
@@ -4991,44 +5044,174 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 			})
 			.addClass("mb-3");
 	};
-	const is_set_to_only_account = (row) =>
-		row.status !== "Created" && row.account_by_hand && row.account === only_account;
+	const is_shown = (row) => !only_unread || has_unread_date(row);
 	const show_only_unread = () => {
 		for (const grid_row of grid.grid_rows || []) {
-			grid_row.wrapper.toggle(
-				(!only_unread || has_unread_date(grid_row.doc)) &&
-					(!only_account || is_set_to_only_account(grid_row.doc))
-			);
+			grid_row?.wrapper.toggle(is_shown(grid_row.doc));
 		}
 	};
-	// the rows with a ledger set on them that put it over its trial balance line, from the post confirm
-	const make_account_rows_alert = (all) => {
-		const rows = only_account ? all.filter(is_set_to_only_account) : [];
-		if (!rows.length) only_account = null;
-		show_only_unread();
-		if (!rows.length) return [];
-		return frappe.ui
-			.alert({
-				theme: "yellow",
-				title: plural(
-					rows.length,
-					__("1 row has {0} set on it", [short_account(frm, rows[0].account)]),
-					__("{0} rows have {1} set on them", [rows.length, short_account(frm, rows[0].account)])
-				),
-				description: __(
-					"Their sheet's ledger column or a pick in the table set it, so Post to doesn't change them. Change the account on the rows that belong elsewhere."
-				),
-				footer: () =>
-					frappe.ui.button({
-						label: __("Show all"),
-						onclick: () => {
-							only_account = null;
-							refresh_state();
-						},
-					}),
-			})
-			.addClass("mb-3");
+	// a ledger's rows only, in the table's own Account filter
+	const filter_account = (account) => {
+		if (account) {
+			grid.filter.account = {
+				df: grid.docfields.find((df) => df.fieldname === "account"),
+				value: account,
+			};
+		} else {
+			delete grid.filter.account;
+		}
+		grid.header_search?.search_columns.account?.find("input").val(account || "");
+		grid.grid_pagination.go_to_page(1);
+		grid.refresh();
 	};
+	const show_rows_on = (account) => {
+		filter_account(account);
+		refresh_state();
+	};
+	// the ledgers over their trial balance line with the rows as they are in the window, saved or not
+	const get_window_overs = (all) => {
+		if (accounts.length < 2) return [];
+		const moved = {};
+		const add = (row, sign) => {
+			const account = row.account || party_accounts[row.party];
+			if (
+				row.status === "Created" ||
+				!account ||
+				(!row.party && !row.create_party) ||
+				other_currency[row.party] ||
+				disabled.has(row.party)
+			)
+				return;
+			moved[account] = (moved[account] || 0) + sign * flt(row.outstanding_amount);
+		};
+		all.forEach((row) => add(row, 1));
+		(frm.doc[party.table] || []).forEach((row) => add(row, -1));
+		return get_ledger_overs(frm, party_type, [], disabled, moved);
+	};
+	const make_over_alerts = (overs) => {
+		const shown = grid.filter.account?.value;
+		if (accounts.includes(shown) && !overs.some((over) => over.account === shown)) filter_account(null);
+		show_only_unread();
+		if (!overs.length) return [];
+		return make_alerts(
+			overs.map((over) => {
+				const only = over.account === shown;
+				const count = grid.data.length;
+				return {
+					theme: "red",
+					title: __("{0} would be {1} over its trial balance line", [
+						short_account(frm, over.account),
+						format_currency(over.entered - flt(over.sheet), currency),
+					]),
+					description: [
+						only
+							? plural(
+									count,
+									__("Showing only the 1 row on it."),
+									__("Showing only the {0} rows on it.", [count])
+							  )
+							: __("{0} is {1} short.", [
+									over.short.map((line) => short_account(frm, line.account)).join(", "),
+									format_currency(
+										over.short.reduce((sum, line) => sum + line.sheet - line.entered, 0),
+										currency
+									),
+							  ]),
+						__("Tick the rows that belong to another ledger, pick it, and Apply."),
+					].join(" "),
+					buttons: [
+						{
+							label: only ? __("Show all") : __("Show rows"),
+							onclick: () => show_rows_on(only ? null : over.account),
+						},
+					],
+				};
+			})
+		).addClass("mb-3");
+	};
+	// the rows ticked in the table: set their ledger at once
+	const $bulk = $(`<div class="flex flex-wrap items-center gap-2 p-2 mb-2 border rounded-lg"></div>`)
+		.hide()
+		.prependTo(grid.wrapper);
+	const $bulk_text = $(`<span class="text-base text-ink-gray-8"></span>`).appendTo($bulk);
+	const bulk_account = frappe.ui.form.make_control({
+		df: {
+			fieldtype: "Link",
+			fieldname: "bulk_account",
+			options: "Account",
+			only_select: 1,
+			placeholder: __("Pick a ledger"),
+			get_query: () => ({ filters: { name: ["in", accounts] } }),
+			filter_description: is_customer ? __("Receivable ledgers") : __("Payable ledgers"),
+			change: () => update_bulk(),
+		},
+		parent: $(`<div class="w-64"></div>`).appendTo($bulk),
+		render_input: true,
+	});
+	const $apply = frappe.ui
+		.button({ label: __("Apply"), variant: "solid", onclick: () => apply_bulk() })
+		.appendTo($bulk);
+	// the table's own Delete is hidden while rows are ticked, so a ledger change deletes nothing
+	frappe.ui
+		.button({
+			label: __("Delete"),
+			icon: "trash-2",
+			variant: "ghost",
+			onclick: () => {
+				const ticked = grid.get_selected_children();
+				remove_rows((row) => ticked.includes(row), ticked.length);
+			},
+		})
+		.addClass("ml-auto")
+		.appendTo($bulk);
+	const update_bulk = () => {
+		const count = accounts.length > 1 ? grid.get_selected_children().length : 0;
+		$bulk.toggle(!!count);
+		grid.wrapper.toggleClass("company-setup-bulk-ledger", !!count);
+		if (!count) return;
+		$bulk_text.text(
+			plural(
+				count,
+				__("1 row selected · Set its ledger to"),
+				__("{0} rows selected · Set their ledger to", [count])
+			)
+		);
+		$apply
+			.prop("disabled", !bulk_account.get_value())
+			.find(".es-button__label")
+			.text(plural(count, __("Apply to 1 row"), __("Apply to {0} rows", [count])));
+	};
+	const apply_bulk = () => {
+		const account = bulk_account.get_value();
+		const ticked = grid.get_selected_children();
+		if (!account || !ticked.length) return;
+		for (const row of ticked) {
+			Object.assign(row, { account: account, account_by_hand: 1, __checked: 0 });
+		}
+		grid.wrapper.find(".grid-heading-row .grid-row-check").prop("checked", false);
+		grid.refresh();
+		refresh_state();
+		frappe.ui.toast({
+			type: "success",
+			message: plural(
+				ticked.length,
+				__("1 row moved to {0}. Save draft to keep it.", [short_account(frm, account)]),
+				__("{0} rows moved to {1}. Save draft to keep it.", [
+					ticked.length,
+					short_account(frm, account),
+				])
+			),
+		});
+	};
+	// the header tick takes every row shown, on all pages
+	grid.wrapper.on("click", ".grid-row-check", (e) => {
+		const $check = $(e.currentTarget);
+		if ($check.closest(".grid-heading-row").length) {
+			for (const row of grid.data) row.__checked = $check.prop("checked") && is_shown(row) ? 1 : 0;
+			for (const grid_row of grid.grid_rows || []) grid_row?.refresh_check();
+		}
+		update_bulk();
+	});
 	// rows that stay drafts whatever the names say: a disabled customer's, or in another currency
 	const make_waiting_alerts = (all) => {
 		const alerts = [];
@@ -5420,7 +5603,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 						? own_accounts[name.party]
 						: names.group_accounts?.[group || default_group];
 				rows.filter((row) => !row.account_by_hand).forEach(
-					(row) => (row.account = account || sheet_account)
+					(row) => (row.account = (in_sheet(row) && sheet_account) || account)
 				);
 				confirmed.add(name.name_on_sheet);
 				done += 1;
@@ -5476,19 +5659,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result, replacing)
 				rows: values.invoices || [],
 				names: { ...names, disabled: [...disabled] },
 				disabled_parties: [...post_disabled],
-				post_to: sheet_account,
 				before_post: () => dialog.hide(),
-				show_rows: (account) => {
-					only_account = account;
-					// first, so they are on the table's first page
-					const all = dialog.get_value("invoices") || [];
-					dialog.fields_dict.invoices.df.data = [
-						...all.filter(is_set_to_only_account),
-						...all.filter((row) => !is_set_to_only_account(row)),
-					];
-					grid.refresh();
-					refresh_state();
-				},
+				show_rows: show_rows_on,
 			})
 		);
 	};
@@ -5580,7 +5752,7 @@ function upload_opening_invoices(frm, party_type, dialog) {
 function post_opening_invoices(
 	frm,
 	party_type,
-	{ rows, names = {}, disabled_parties = [], post_to = null, before_post, show_rows }
+	{ rows, names = {}, disabled_parties = [], before_post, show_rows }
 ) {
 	const is_customer = party_type === "Customer";
 	const currency = erpnext.get_currency(frm.doc.company);
@@ -5718,11 +5890,8 @@ function post_opening_invoices(
 		primary_action: () => {
 			confirm.hide();
 			before_post?.();
-			const use_post_to = fixes
-				.filter(({ check, clash }) => clash.kind === "own" && check.get_value())
-				.flatMap(({ clash }) => clash.rows);
 			const account_fixes = fixes
-				.filter(({ check, clash }) => clash.kind !== "own" && check.get_value())
+				.filter(({ check }) => check.get_value())
 				.map(({ clash }) => ({
 					kind: clash.kind,
 					account: clash.account,
@@ -5736,8 +5905,6 @@ function post_opening_invoices(
 					account_fixes: account_fixes,
 					keep_old_dates: keep_old_dates ? 1 : 0,
 					disabled_parties: disabled_parties,
-					use_post_to: use_post_to,
-					post_to: post_to,
 				},
 				{ freeze: true, freeze_message: __("Posting…") }
 			).then((r) => {
@@ -5797,18 +5964,17 @@ function post_opening_invoices(
 								]),
 								ledger_over_hint(frm, party_type, over.account, fixes),
 							].join(" "),
-							buttons:
-								show_rows && get_rows_set_to(frm, party_type, over.account).length
-									? [
-											{
-												label: __("Show rows"),
-												onclick: () => {
-													confirm.hide();
-													show_rows(over.account);
-												},
+							buttons: show_rows
+								? [
+										{
+											label: __("Show rows"),
+											onclick: () => {
+												confirm.hide();
+												show_rows(over.account);
 											},
-									  ]
-									: [],
+										},
+								  ]
+								: [],
 						}))
 				  ).addClass("mb-3")
 				: []
@@ -5884,34 +6050,6 @@ function post_opening_invoices(
 					.get_primary_btn()
 					.text(moving ? __("Post {0}, move {1}", [posting.length, moving]) : __("Post to books"));
 			});
-			check.$input.on("change", check_ledgers);
-			fixes.push({ clash, check });
-			$clashes.addClass("mt-4").append($box);
-		}
-		// rows going to their customer's or supplier's own ledger, not the sheet's Post to
-		for (const clash of get_own_ledger_rows(frm, party_type, post_to, why_waiting)) {
-			const $box = $(`<div class="flex flex-col gap-1"></div>`).append(
-				$(`<div class="text-base-medium text-ink-gray-8"></div>`).text(
-					clash.rows.length === 1
-						? __("1 row goes to {0}, its own ledger", [short_account(frm, clash.from_account)])
-						: __("{0} rows go to {1}, their own ledger", [
-								clash.rows.length,
-								short_account(frm, clash.from_account),
-						  ])
-				),
-				$(`<div class="text-p-sm text-ink-gray-6"></div>`).text(
-					__("{0} · not {1}, this sheet's Post to.", [
-						format_currency(clash.parties[0].amount, currency),
-						short_account(frm, post_to),
-					])
-				)
-			);
-			const check = frappe.ui.form.make_control({
-				df: { fieldtype: "Check", fieldname: "use_post_to", label: __("Use Post to for these") },
-				parent: $box,
-				render_input: true,
-			});
-			check.$wrapper.addClass("mb-0 mt-1");
 			check.$input.on("change", check_ledgers);
 			fixes.push({ clash, check });
 			$clashes.addClass("mt-4").append($box);
@@ -6087,75 +6225,20 @@ function make_old_dates_choice(dates, party_type, currency, day_before, on_chang
 	);
 }
 
-// What to do about a ledger going over its line: the tick below that moves rows off it, else the rows
-// picked on it by hand, else the sheet's Post to
+// What to do about a ledger going over its line: the tick below that moves rows off it, else moving
+// its rows in the window
 function ledger_over_hint(frm, party_type, account, fixes) {
 	const tick = fixes.find(
 		({ clash, check }) => clash.from_account === account && clash.kind !== "posted" && !check.get_value()
 	);
-	if (tick) {
-		return __('Tick "{0}" below.', [
-			tick.clash.kind === "own" ? __("Use Post to for these") : clash_fix_label(tick.clash, party_type),
-		]);
-	}
-	const set_rows = get_rows_set_to(frm, party_type, account);
-	if (set_rows.length) {
-		return set_rows.length === 1
-			? __("1 row has {0} set on it: {1}. Change its account in the window.", [
-					short_account(frm, account),
-					[set_rows[0].party || set_rows[0].party_name, set_rows[0].invoice_number]
-						.filter(Boolean)
-						.join(" · "),
-			  ])
-			: __("{0} rows have {1} set on them. Change their account in the window.", [
-					set_rows.length,
-					short_account(frm, account),
-			  ]);
-	}
-	return __("Go back and pick the ledger this sheet is for in Post to.");
-}
-
-// Draft rows whose ledger is set on the row, by their sheet's ledger column or picked in the table:
-// Post to doesn't change them
-function get_rows_set_to(frm, party_type, account) {
-	return (frm.doc[PARTY[party_type].table] || []).filter(
-		(row) => row.status !== "Created" && row.account_by_hand && row.account === account
-	);
-}
-
-// The draft rows going to their customer's or supplier's own ledger rather than the sheet's Post to,
-// by ledger, as moves the confirm can tick
-function get_own_ledger_rows(frm, party_type, post_to, stays = () => false) {
-	if (!post_to) return [];
-	const by_account = {};
-	for (const row of frm.doc[PARTY[party_type].table] || []) {
-		if (
-			row.status === "Created" ||
-			row.account_by_hand ||
-			!row.account ||
-			row.account === post_to ||
-			stays(row)
-		)
-			continue;
-		(by_account[row.account] ||= []).push(row);
-	}
-	return Object.entries(by_account).map(([account, list]) => ({
-		kind: "own",
-		from_account: account,
-		account: post_to,
-		rows: list.map((row) => row.name),
-		parties: [
-			{
-				amount: list.reduce((sum, row) => sum + flt(row.outstanding_amount), 0),
-				count: list.length,
-			},
-		],
-	}));
+	if (tick) return __('Tick "{0}" below.', [clash_fix_label(tick.clash, party_type)]);
+	return __("Tick the rows that belong to another ledger, pick it, and Apply.");
 }
 
 // The ledgers the drafts would put above their trial balance line while another is short, as the
-// server checks it, with the account fixes ticked moving their amounts
-function get_ledger_overs(frm, party_type, ticked = [], disabled = new Set()) {
+// server checks it, with the account fixes ticked moving their amounts and moved ({account: amount})
+// the window's changes not saved yet
+function get_ledger_overs(frm, party_type, ticked = [], disabled = new Set(), moved = {}) {
 	const match = frm.doc.__onload?.sheet_match?.[party_type];
 	if (!match?.by_account) return [];
 	const lines = {};
@@ -6174,9 +6257,13 @@ function get_ledger_overs(frm, party_type, ticked = [], disabled = new Set()) {
 		const from = line_of(clash.from_account);
 		const to = line_of(clash.account);
 		from.entered -= amount;
-		if (clash.kind === "draft" || clash.kind === "own") from.draft -= amount;
+		if (clash.kind === "draft") from.draft -= amount;
 		to.entered += amount;
 		to.draft += amount;
+	}
+	for (const [account, amount] of Object.entries(moved)) {
+		line_of(account).entered += amount;
+		line_of(account).draft += amount;
 	}
 	const all = Object.values(lines);
 	const short = all.filter((line) => line.sheet !== null && line.sheet - line.entered >= 1);
@@ -7514,6 +7601,8 @@ class BankAccountsWindow {
 						{ fieldname: "account_currency", fieldtype: "Link", options: "Currency", hidden: 1 },
 					],
 				},
+				// under the rows: a box that comes or goes while a statement is typed doesn't move them
+				{ fieldname: "accounts_alerts", fieldtype: "HTML" },
 				{
 					fieldname: "has_uncleared_cheques",
 					fieldtype: "Select",
@@ -7630,7 +7719,7 @@ class BankAccountsWindow {
 		show_view_fields(
 			this.dialog,
 			{
-				accounts: ["accounts_head", "accounts", "has_uncleared_cheques"],
+				accounts: ["accounts_head", "accounts", "accounts_alerts", "has_uncleared_cheques"],
 				cheques: ["cheques_head", "cheques", "cheques_notes", "where_section"],
 				confirm: ["confirm"],
 			},
@@ -7785,6 +7874,19 @@ class BankAccountsWindow {
 					.join(" "),
 			});
 		}
+		const no_bank = rows.filter((row) => !cstr(row.bank).trim());
+		if (no_bank.length && no_bank.length < rows.length) {
+			alerts.push({
+				theme: "yellow",
+				title:
+					no_bank.length === 1
+						? __("{0}: pick its bank to add it.", [short_account(this.frm, no_bank[0].account)])
+						: __("{0}: pick their bank to add them.", [
+								no_bank.map((row) => short_account(this.frm, row.account)).join(", "),
+						  ]),
+				description: __("A row with no bank is left out when you save."),
+			});
+		}
 		if (rows.length && !defaults) {
 			alerts.push({
 				theme: "yellow",
@@ -7824,7 +7926,10 @@ class BankAccountsWindow {
 				],
 			});
 		}
-		$head.append(make_alerts(alerts).addClass("mb-3"));
+		this.dialog
+			.get_field("accounts_alerts")
+			.$wrapper.empty()
+			.append(make_alerts(alerts).addClass("mb-3"));
 		this.dialog.set_df_property("accounts", "hidden", rows.length ? 0 : 1);
 		set_primary_disabled(this.dialog, !rows.length || alerts.some((alert) => alert.theme === "red"));
 	}
@@ -7993,6 +8098,11 @@ class BankAccountsWindow {
 									this.frm.doc.company,
 									"bank_accounts.download_uncleared_cheques"
 								),
+						},
+						{
+							label: cheque_words(__("None after all: answer No")),
+							variant: "ghost",
+							onclick: () => this.answer_no(),
 						},
 					],
 				})
@@ -8279,6 +8389,25 @@ class BankAccountsWindow {
 				)
 			);
 		set_primary_disabled(this.dialog, !rows.length || reds.length > 0);
+	}
+
+	// Yes was picked, but there are none to add: the question is answered No, so the step can finish
+	answer_no() {
+		this.dialog.set_value("has_uncleared_cheques", "No");
+		return call_method(
+			this.frm,
+			"save_bank_accounts",
+			{ rows: this.get_account_rows(), has_uncleared_cheques: "No" },
+			{ freeze: true }
+		).then(() =>
+			reload_fresh(this.frm).then(() => {
+				this.dialog.hide();
+				frappe.ui.toast({
+					type: "success",
+					message: cheque_words(__("Bank details saved. No uncleared cheques.")),
+				});
+			})
+		);
 	}
 
 	save_cheques() {
@@ -8876,6 +9005,7 @@ function show_taxes(frm) {
 							label: __("Rate %"),
 							in_list_view: 1,
 							columns: 1,
+							reqd: 1,
 						},
 					],
 				},
@@ -8903,22 +9033,30 @@ function show_taxes(frm) {
 				]),
 			],
 			primary_action_label: __("Save taxes"),
+			// a cell still being typed in is taken first: a typed account is checked on the server
 			primary_action: () =>
-				call_method(
-					frm,
-					"save_taxes",
-					{
-						rows: dialog.get_value("rows") || [],
-						defaults: {
-							Sales: dialog.get_value("default_sales"),
-							Purchase: dialog.get_value("default_purchase"),
-						},
-					},
-					{ freeze: true }
-				).then(() => {
-					close_and_reload(frm, dialog);
-					frappe.ui.toast({ type: "success", message: __("Taxes saved.") });
-				}),
+				new Promise((resolve) => {
+					document.activeElement?.blur();
+					frappe.after_ajax(resolve);
+				})
+					.then(() =>
+						call_method(
+							frm,
+							"save_taxes",
+							{
+								rows: dialog.get_value("rows") || [],
+								defaults: {
+									Sales: dialog.get_value("default_sales"),
+									Purchase: dialog.get_value("default_purchase"),
+								},
+							},
+							{ freeze: true }
+						)
+					)
+					.then(() => {
+						close_and_reload(frm, dialog);
+						frappe.ui.toast({ type: "success", message: __("Taxes saved.") });
+					}),
 			secondary_action_label: __("Close"),
 			secondary_action: () => dialog.hide(),
 		});
@@ -9005,6 +9143,18 @@ function show_taxes(frm) {
 				),
 				frappe.ui.button({ label: __("Add tax account"), icon: "plus", onclick: add_tax_account })
 			),
+			taxes.chart_replaced &&
+				taxes.country === "India" &&
+				!taxes.rows.length &&
+				!taxes.other_templates?.length
+				? $(`<div class="mb-3"></div>`).append(
+						frappe.ui.alert({
+							theme: "blue",
+							title: __("The chart import removed the old tax templates"),
+							description: __("Add your GST templates here, like GST 18%."),
+						})
+				  )
+				: [],
 			taxes.from_existing
 				? $(`<div></div>`).append(
 						frappe.ui.alert({
@@ -11198,7 +11348,8 @@ function job_work_fields(setup, i) {
 			label: __("Service item"),
 			reqd: 1,
 			default: setup.service_item,
-			get_query: () => ({ filters: { is_stock_item: 0, disabled: 0 } }),
+			get_query: () => ({ filters: { is_stock_item: 0, is_fixed_asset: 0, disabled: 0 } }),
+			filter_description: __("Only services are listed: no stock or asset items."),
 		},
 		{ fieldtype: "Column Break" },
 		{
@@ -11274,7 +11425,7 @@ class OpenOrdersWindow extends SheetWindow {
 			});
 		const fields = {
 			"Work Order": [
-				list_column("order_no", "Data", __("Job card no"), 1),
+				list_column("order_no", "Data", __("Order no"), 1),
 				list_column("item_name", "Data", __("Item to make"), 2),
 				list_column("bom", "Link", __("BOM"), 2, { options: "BOM" }),
 				list_column("qty", "Float", __("Qty left"), 1),
@@ -11610,7 +11761,7 @@ function show_made_orders(frm, order_type) {
 			{
 				fieldname: "order_no",
 				fieldtype: "Data",
-				label: order_type === "Work Order" ? __("Job card no") : __("Order no"),
+				label: __("Order no"),
 				columns: party ? 1 : 2,
 			},
 			...(party ? [{ fieldname: "party_name", fieldtype: "Data", label: party, columns: 2 }] : []),

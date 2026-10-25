@@ -699,6 +699,11 @@ body[data-route="pos"] {
 	display: none;
 }
 
+// Company Setup: rows ticked to set their ledger have their own Delete
+.company-setup-bulk-ledger :is(.grid-remove-rows, .grid-remove-all-rows) {
+	display: none;
+}
+
 // Company Setup: a software name beside where its report is
 .company-setup-where {
 	display: grid;

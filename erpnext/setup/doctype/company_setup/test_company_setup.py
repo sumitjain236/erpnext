@@ -24,6 +24,7 @@ from erpnext.setup.doctype.company_setup.company_setup import (
 	get_chart_import_blocker,
 )
 from erpnext.setup.doctype.company_setup.company_setup_steps import HOOK_NAME, get_step_paths
+from erpnext.setup.doctype.company_setup.company_setup_steps import warehouses as warehouses_step
 from erpnext.setup.doctype.company_setup.opening_invoices import (
 	BACKGROUND_FROM,
 	add_account,
@@ -1547,6 +1548,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 					"bad_dates": [],
 					"unknown_ledgers": [],
 					"post_to": None,
+					"source": "receivables.csv",
 				},
 			)
 			self.assertEqual(
@@ -1597,6 +1599,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 					"bad_dates": [],
 					"unknown_ledgers": [],
 					"post_to": None,
+					"source": "bills.csv",
 				},
 			)
 			self.assertEqual(
@@ -2303,6 +2306,7 @@ class TestOpeningInvoices(ERPNextTestSuite):
 				"bad_dates": [],
 				"unknown_ledgers": [],
 				"post_to": None,
+				"source": "receivables.csv",
 			},
 		)
 		self.assertEqual(
@@ -3031,6 +3035,12 @@ class TestOpeningStock(ERPNextTestSuite):
 	def checks(self) -> dict:
 		self.doc.reload()
 		return self.doc.get_opening_stock()
+
+	def test_warehouses_are_done_once_reviewed(self):
+		self.assertNotEqual(step_status(get_setup(self.company))["warehouses"], "Done")
+		self.assertTrue(warehouses_step(self.doc)["summary"].endswith("· review them"))
+		self.doc.save_warehouses(self.doc.get_warehouses()["rows"])
+		self.assertEqual(step_status(get_setup(self.company))["warehouses"], "Done")
 
 	def test_opening_stock_posts_per_warehouse_against_temporary_opening(self):
 		temporary = get_temporary_account(self.company, create=True)

@@ -7,8 +7,10 @@ from frappe.utils import getdate
 from erpnext.setup.doctype.company_setup.company_setup import (
 	get_account_parent,
 	run_year_close,
+	save_year_close,
 	suggest_balance_accounts,
 )
+from erpnext.setup.doctype.company_setup.company_setup_steps import get_draft_rows_by
 from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	SHEET,
@@ -227,6 +229,17 @@ class TestBooks(ERPNextTestSuite):
 			(getdate("2025-12-31"), 5000, retained, False),
 		)
 
+		# a draft dated in the year stops the close: it could never be posted after
+		self.doc.save_opening_balances([{"account": cash, "debit": 10}, {"account": sales, "credit": 10}])
+		self.doc.run_method("onload")
+		self.assertEqual(
+			self.doc.get_onload().books_reminders["unclosed_years"][0]["drafts"], ["2 opening balances"]
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError, "2 opening balances", self.doc.close_year, year["fiscal_year"], retained
+		)
+		self.doc.save_opening_balances([])
+
 		# closed from here: dated the year end, into the account picked
 		self.assertEqual(self.doc.close_year(year["fiscal_year"], retained), "queued")
 		voucher = frappe.get_last_doc("Period Closing Voucher", {"company": self.company})
@@ -236,6 +249,13 @@ class TestBooks(ERPNextTestSuite):
 		)
 		self.doc.run_method("onload")
 		self.assertEqual(self.doc.get_onload().books_reminders["unclosed_years"], [])
+
+		# drafts left in a closed year can't be posted: Go live offers to remove them
+		self.doc.save_opening_balances([{"account": cash, "debit": 10}, {"account": sales, "credit": 10}])
+		self.doc.run_method("onload")
+		self.assertEqual(self.doc.get_onload().go_live_reminders["closed_drafts"], ["2 opening balances"])
+		self.assertEqual(self.doc.remove_closed_drafts(), 2)
+		self.assertEqual([row.status for row in self.doc.opening_balances], ["Posted", "Posted"])
 
 	def test_a_year_with_stock_closes_its_stock_first(self):
 		frappe.set_user("Administrator")
@@ -278,6 +298,18 @@ class TestBooks(ERPNextTestSuite):
 		run_year_close(self.company)
 		self.assertIsNone(self.get_year_close())
 		self.assertTrue(frappe.db.exists("Period Closing Voucher", {"company": self.company, "docstatus": 1}))
+
+	def test_a_save_from_an_older_page_keeps_the_finished_year_close(self):
+		save_year_close(self.company, {"steps": [{"fiscal_year": "2025"}], "done": 0})
+		older = frappe.get_doc("Company Setup", self.company)
+		save_year_close(self.company, None)
+		older.save()
+		self.assertIsNone(frappe.db.get_value("Company Setup", self.company, "year_close"))
+
+	def test_a_draft_with_no_date_yet_is_not_dated_before_a_close(self):
+		self.doc.migration_date = None
+		self.doc.append("opening_sales_invoices", {"party_name": "No Date Yet", "outstanding_amount": 10})
+		self.assertEqual(get_draft_rows_by(self.doc, "2025-12-31"), {})
 
 	def test_years_close_in_order_with_an_earlier_year_of_entries_but_no_profit(self):
 		cash = get_account(self.company, account_type="Cash")
@@ -326,8 +358,16 @@ class TestBooks(ERPNextTestSuite):
 			"Debtors - Retainers,Current Assets,1135,1100,0,Receivable,Asset,INR,500000,",
 			"Creditors - Capital Goods,Liabilities,2105,2000,0,Payable,Liability,INR,,500000",
 			"Creditors - Import,Liabilities,2110,2000,0,Payable,Liability,INR,,1000",
+			"Input CGST,Current Assets,1140,1100,0,,Asset,INR,,",
 		]
 		self.doc.import_chart(make_sheet(sheet))
+		# a GST ledger with no type is a tax account, so tax templates can pick it
+		self.assertEqual(
+			frappe.db.get_value(
+				"Account", {"company": self.company, "account_name": "Input CGST"}, "account_type"
+			),
+			"Tax",
+		)
 		# Retainers holds the most, but Sundry Debtors has the usual name
 		self.assertEqual(
 			frappe.db.get_value("Company", self.company, "default_receivable_account"),

@@ -54,6 +54,7 @@ from erpnext.setup.doctype.company_setup.opening_invoices import (
 	get_missing_fiscal_year,
 	get_posting_reds,
 	get_sheet_match,
+	has_fiscal_year,
 	normalize_account_name,
 	number,
 )
@@ -284,6 +285,13 @@ def bank_accounts(onboarding) -> dict:
 		).format(accounts)
 	elif status.added < status.accounts:
 		summary = _("{0} of {1} bank accounts added.").format(status.added, status.accounts)
+		if status.no_bank:
+			first = frappe.get_cached_value("Account", status.no_bank[0], "account_name")
+			summary = _("{0} of {1} bank accounts added · {2}: pick its bank to add it").format(
+				status.added, status.accounts, first
+			)
+			if len(status.no_bank) > 1:
+				summary += " · " + _("{0} more").format(len(status.no_bank) - 1)
 	elif not status.default_bank:
 		summary = _("{0} · pick a default bank").format(accounts)
 	elif status.has_uncleared_cheques == "Yes" and status.drafts:
@@ -531,10 +539,9 @@ def items(onboarding) -> dict:
 			count_text(status.item_count, _("1 item"), _("{0} items")), number(status.missing)
 		)
 	elif status.item_count:
-		stock_items = status.item_count - status.services
 		summary = " · ".join(
 			[
-				count_text(stock_items, _("1 stock item"), _("{0} stock items"))
+				count_text(status.stock_items, _("1 stock item"), _("{0} stock items"))
 				+ " · "
 				+ count_text(status.services, _("1 service"), _("{0} services"))
 				if status.services
@@ -560,13 +567,16 @@ def items(onboarding) -> dict:
 
 
 def warehouses(onboarding) -> dict:
-	"""Needed when there is stock to add."""
+	"""Needed when there is stock to add. Done once the window is saved: the default warehouses are
+	there to review, not to take as they are."""
 	status = get_warehouses_status(onboarding)
 	warehouse_count = count_text(status.warehouses, _("1 warehouse"), _("{0} warehouses"))
 	if status.missing:
 		summary = _("{0} · {1} on your stock sheet are not in ERPNext").format(
 			warehouse_count, number(status.missing)
 		)
+	elif not status.saved:
+		summary = _("{0} · review them").format(warehouse_count) if status.warehouses else None
 	else:
 		parts = [warehouse_count]
 		if status.job_workers:
@@ -793,7 +803,11 @@ def fixed_assets(onboarding) -> dict:
 		and not status.posting
 		and onboarding.migration_date
 		and get_blocker_line(
-			[red["text"] for red in get_asset_checks(onboarding)["reds"] if red["key"] != "empty"]
+			[
+				red["text"]
+				for red in get_asset_checks(onboarding, check_items=False)["reds"]
+				if red["key"] != "empty"
+			]
 		),
 		"tab": "assets_tab",
 		# money in the trial balance waits for this step: Go live points it out even when skipped
@@ -1011,6 +1025,66 @@ def get_waiting(onboarding) -> list[str]:
 		if count:
 			waiting.append(one if count == 1 else many.format(number(count)))
 	return waiting
+
+
+DRAFT_LABELS = {
+	"opening_sales_invoices": (_("1 opening invoice"), _("{0} opening invoices")),
+	"opening_purchase_invoices": (_("1 opening bill"), _("{0} opening bills")),
+	"opening_balances": (_("1 opening balance"), _("{0} opening balances")),
+	"opening_stock": (_("1 stock line"), _("{0} stock lines")),
+	"fixed_assets": (_("1 asset"), _("{0} assets")),
+	"uncleared_cheques": (_("1 uncleared cheque"), _("{0} uncleared cheques")),
+}
+
+
+def get_dated_drafts(onboarding) -> dict[str, list[tuple]]:
+	"""Each table's opening drafts, with the date each would post on (None when it has none yet):
+	invoices on their own date where ERPNext has its year, the rest on the day before migration."""
+	day_before = get_day_before(onboarding)
+	years = {}
+
+	def get_date(row):
+		own = row.invoice_date and getdate(row.invoice_date)
+		if own and own not in years:
+			years[own] = has_fiscal_year(own, onboarding.company)
+		return own if own and years[own] else day_before
+
+	dated = {}
+	for table in DRAFT_LABELS:
+		if table in TABLES.values():
+			dated[table] = [(row, get_date(row)) for row in onboarding.get(table) if row.status != "Created"]
+		else:
+			dated[table] = [(row, day_before) for row in onboarding.get(table) if row.status != "Posted"]
+	return dated
+
+
+def get_draft_rows_by(onboarding, date, dated: dict | None = None) -> dict[str, list]:
+	"""The opening drafts, by table, that would be dated on or before date: once the year to date is
+	closed they can never be posted. dated: get_dated_drafts, when already known."""
+	date = getdate(date)
+	if dated is None:
+		dated = get_dated_drafts(onboarding)
+	rows = {table: [row for row, on in drafts if on and on <= date] for table, drafts in dated.items()}
+	return {table: found for table, found in rows.items() if found}
+
+
+def get_drafts_by(onboarding, date, dated: dict | None = None) -> list[str]:
+	return get_draft_lines(get_draft_rows_by(onboarding, date, dated))
+
+
+def get_draft_lines(rows_by_table: dict[str, list]) -> list[str]:
+	"""get_draft_rows_by as lines, like "625 opening invoices in Delhi sheet" and "2 assets"."""
+	lines = []
+	for table, rows in rows_by_table.items():
+		one, many = DRAFT_LABELS[table]
+		sheets = {}
+		for row in rows:
+			sheet = row.source if table in TABLES.values() else None
+			sheets[sheet] = sheets.get(sheet, 0) + 1
+		for sheet, count in sheets.items():
+			text = count_text(count, one, many)
+			lines.append(_("{0} in {1}").format(text, sheet) if sheet else text)
+	return lines
 
 
 def has_opening_invoices(company: str) -> bool:

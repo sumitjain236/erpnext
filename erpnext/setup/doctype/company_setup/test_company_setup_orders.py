@@ -713,6 +713,11 @@ class TestTaxTemplates(ERPNextTestSuite):
 			{"tax_type": "Sales", "title": "GST 18%", "account": sgst, "rate": 9},
 		]
 		self.assertRaisesRegex(frappe.ValidationError, "twice", self.doc.save_taxes, [rows[0], rows[0]])
+		# a row whose name and account were not taken yet is not dropped, nor one with no rate
+		half = rows[:1] + [{"tax_type": "Sales", "rate": 9}]
+		self.assertRaisesRegex(frappe.ValidationError, "Name the template", self.doc.save_taxes, half)
+		no_rate = rows[:1] + [rows[1] | {"rate": None}]
+		self.assertRaisesRegex(frappe.ValidationError, "rate", self.doc.save_taxes, no_rate)
 		self.doc.save_taxes(rows, {"Sales": "GST 18%"})
 		(template,) = {row.template for row in self.doc.tax_templates}
 		self.assertEqual(

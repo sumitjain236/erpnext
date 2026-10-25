@@ -2,7 +2,6 @@
 # For license information, please see license.txt
 
 import re
-import time
 
 import frappe
 from frappe import _
@@ -13,6 +12,7 @@ from frappe.permissions import get_doctype_roles
 from frappe.utils import (
 	cint,
 	cstr,
+	escape_html,
 	flt,
 	fmt_money,
 	formatdate,
@@ -44,7 +44,11 @@ from erpnext.setup.doctype.company_setup.chart_sheet import (
 from erpnext.setup.doctype.company_setup.company_setup_steps import (
 	LAST_STEP,
 	PARTY_DEFAULTS,
+	get_dated_drafts,
 	get_default_account_gaps,
+	get_draft_lines,
+	get_draft_rows_by,
+	get_drafts_by,
 	get_missing_years,
 	get_step_paths,
 	get_temporary_opening,
@@ -358,6 +362,9 @@ class CompanySetup(Document):
 				},
 			)
 		temporary = get_temporary_opening(self)
+		closed_to = assets.get_closed_to(self.company)
+		dated_drafts = get_dated_drafts(self)
+		closed_rows = get_draft_rows_by(self, closed_to, dated_drafts) if closed_to else {}
 		bank = banks.get_bank_status(self)
 		self.set_onload("bank", bank)
 		self.set_onload("bank_match", banks.get_bank_match(self))
@@ -396,6 +403,10 @@ class CompanySetup(Document):
 				"bank_accounts_without_number": bank.without_number,
 				"stock_reposts": day_before and stock.get_stock_reposts(self.company, day_before),
 				"missing_years": get_missing_years(self),
+				"closed_drafts": closed_to and get_draft_lines(closed_rows),
+				"closed_draft_counts": closed_to
+				and {table: len(rows) for table, rows in closed_rows.items()},
+				"closed_to": closed_to,
 			},
 		)
 		# what Check your books and Go live point out beyond the steps
@@ -407,6 +418,7 @@ class CompanySetup(Document):
 					| {
 						"stock": get_year_stock_closing(self.company, year.year_end_date),
 						"closing_account": get_closing_account(self.company),
+						"drafts": get_drafts_by(self, year.year_end_date, dated_drafts),
 					}
 					for year in get_unclosed_years(self)
 				],
@@ -421,6 +433,7 @@ class CompanySetup(Document):
 		)
 
 	def validate(self):
+		self.keep_year_close()
 		self.keep_posting_status()
 		assets.clear_wrong_lines(self)
 		self.validate_migration_date()
@@ -428,6 +441,12 @@ class CompanySetup(Document):
 		self.validate_opening_invoices()
 		if not self.flags.ignore_steps:
 			self.update_steps()
+
+	def keep_year_close(self):
+		"""Only the year close job writes year_close, without touching modified: a save keeps what
+		is stored, so a page loaded before the job's last step can't bring an old step back."""
+		if not self.is_new():
+			self.year_close = frappe.db.get_value(self.doctype, self.name, "year_close")
 
 	def keep_posting_status(self):
 		"""Only posting changes whether a row is posted, and a posted row stays as it was posted: a
@@ -722,7 +741,9 @@ class CompanySetup(Document):
 	@frappe.whitelist()
 	def import_chart(self, file_url: str, group_kinds: dict | str | None = None) -> dict:
 		"""Replace the chart with the sheet's. Its balances become draft opening balances, and the
-		accounts ERPNext needs that the sheet lacks are added. group_kinds: as for preview_chart."""
+		accounts ERPNext needs that the sheet lacks are added. group_kinds: as for preview_chart.
+		The replace deletes the tax templates: each company_setup_after_chart_replace hook is then
+		called with the company, so an app can make its own again."""
 		self.check_permission("write")
 		self.start_change()
 		sheet = read_chart_sheet(file_url, frappe.parse_json(group_kinds) if group_kinds else None)
@@ -747,6 +768,8 @@ class CompanySetup(Document):
 		# the replace deleted the tax templates, with the accounts they post to
 		self.tax_templates = []
 		self.taxes_saved = 0
+		for method in frappe.get_hooks("company_setup_after_chart_replace"):
+			frappe.get_attr(method)(self.company)
 		if sheet.balances:
 			balances = sort_balances(self.company, sheet.balances)
 			self.set_sheet_totals(balances.result["left_out"], balances.left_out_accounts)
@@ -1051,8 +1074,9 @@ class CompanySetup(Document):
 		"""Replace the draft opening invoices with these rows. Posted ones stay as they are. A row that
 		is one of them again is left out (skipped), and so is a row repeating one above it with the same
 		invoice number (repeated). Rows without a source of their own get this one. A row's ledger is the
-		one picked on it by hand (account_by_hand), else its customer's or supplier's own or its group's,
-		else post_to, the ledger picked for the whole sheet."""
+		one set on it (account_by_hand: by the sheet's ledger column or by the user), else post_to, the
+		ledger picked for the whole sheet, else its customer's or supplier's own or its group's. post_to
+		moves only this source's rows: another sheet's rows keep the ledger they have."""
 		self.check_permission("write")
 		self.start_change()
 		table = get_table(party_type)
@@ -1110,11 +1134,14 @@ class CompanySetup(Document):
 		own = get_party_accounts(party_type, [row.party for row in drafts], self.company)[2]
 		new = get_new_party_accounts(party_type, self.company, drafts)
 		for row in drafts:
-			account = own.get(row.party) or new.get(row.party_name)
+			if (row.source or None) == (source or None):
+				account = post_to or own.get(row.party) or new.get(row.party_name)
+			elif row.account in accounts:
+				continue
+			else:
+				account = own.get(row.party) or new.get(row.party_name)
 			if account in accounts:
 				row.account = account
-			elif post_to:
-				row.account = post_to
 		self.save()
 		return frappe._dict(skipped=skipped, repeated=repeated)
 
@@ -1125,7 +1152,8 @@ class CompanySetup(Document):
 		sheet = read_invoice_sheet(file_url, party_type)
 		unknown_ledgers = set_ledger_accounts(self.company, party_type, sheet.invoices)
 		post_to = get_title_account(self.company, party_type, sheet.titles)
-		left_out = self.save_opening_invoices(party_type, sheet.invoices, get_file_label(file_url), post_to)
+		source = get_file_label(file_url)
+		left_out = self.save_opening_invoices(party_type, sheet.invoices, source, post_to)
 		return {
 			"added": len(sheet.invoices) - left_out.skipped - left_out.repeated,
 			"advances": sheet.advances,
@@ -1135,6 +1163,7 @@ class CompanySetup(Document):
 			"bad_dates": sheet.bad_dates,
 			"unknown_ledgers": unknown_ledgers,
 			"post_to": post_to,
+			"source": source,
 		}
 
 	@frappe.whitelist()
@@ -1156,6 +1185,23 @@ class CompanySetup(Document):
 		self.set(table, [row for row in self.get(table) if row.name not in removed])
 		self.save()
 		return len(removed)
+
+	@frappe.whitelist()
+	def remove_closed_drafts(self) -> int:
+		"""Remove the opening drafts dated in a closed year: they can never be posted. Returns how
+		many were removed."""
+		self.check_permission("write")
+		self.start_change()
+		closed_to = assets.get_closed_to(self.company)
+		if not closed_to:
+			return 0
+		removed = 0
+		for table, rows in get_draft_rows_by(self, closed_to).items():
+			names = {row.name for row in rows}
+			self.set(table, [row for row in self.get(table) if row.name not in names])
+			removed += len(names)
+		self.save()
+		return removed
 
 	def get_invoice_names(self, party_type: str) -> dict:
 		"""The draft rows' names: new ones with their invoice count and total, the existing name a new
@@ -1312,29 +1358,17 @@ class CompanySetup(Document):
 		account_fixes: list | str | None = None,
 		keep_old_dates: bool = False,
 		disabled_parties: list | str | None = None,
-		use_post_to: list | str | None = None,
-		post_to: str | None = None,
 	) -> str:
 		"""Post the draft rows as opening invoices: right away, or in the background when many. The
 		names confirmed as new are added first, and the account clashes ticked are fixed first. With
 		keep_old_dates, invoices dated in a year ERPNext doesn't have add that year and keep their
 		dates, instead of going on the day before migration. The disabled customers or suppliers
-		named in disabled_parties post too, and stay disabled. The draft rows named in use_post_to go
-		to post_to, the sheet's ledger, instead of their customer's or supplier's own."""
+		named in disabled_parties post too, and stay disabled."""
 		disabled_parties = (
 			frappe.parse_json(disabled_parties) if isinstance(disabled_parties, str) else disabled_parties
 		)
 		self.check_permission("write")
 		self.start_change()
-		use_post_to = frappe.parse_json(use_post_to) if isinstance(use_post_to, str) else use_post_to
-		if use_post_to and post_to:
-			if post_to not in get_invoice_accounts(self.company, party_type):
-				frappe.throw(_("{0} is not a ledger to post to.").format(post_to), title=_("Wrong account"))
-			for row in self.get(get_table(party_type)):
-				if row.name in use_post_to and row.status != "Created":
-					row.update({"account": post_to, "account_by_hand": 1})
-			self.flags.posting = True
-			self.save()
 		if account_fixes:
 			fix_account_clashes(
 				self,
@@ -2013,6 +2047,7 @@ class CompanySetup(Document):
 	def set_job_work_setups(self, setups: list | str) -> list[str]:
 		"""Give each item a job-work BOM and service item: see open_orders.set_job_work_bom."""
 		self.check_permission("write")
+		self.start_change()
 		return orders.set_job_work_setups(self, frappe.parse_json(setups))
 
 	def get_made_orders(self, order_type: str) -> dict:
@@ -2184,8 +2219,6 @@ def make_closing_voucher(company: str, year, closing_account: str) -> str:
 
 
 YEAR_CLOSE_JOB_ID = "company_setup_year_close::{0}"
-# the same chain picked up again while the stock closes, under its own id as the first one still ends
-YEAR_CLOSE_WAIT_JOB_ID = "company_setup_year_close_wait::{0}"
 # a stock close still running after this long is taken as stuck: ERPNext's own job gives up at 25
 STOCK_CLOSE_SECONDS = 40 * 60
 
@@ -2198,6 +2231,14 @@ def get_year_close_steps(onboarding, fiscal_year: str) -> list[dict]:
 	if index is None:
 		frappe.throw(
 			_("{0} has no profit or loss left to close.").format(fiscal_year), title=_("Nothing to close")
+		)
+	drafts = get_drafts_by(onboarding, years[index].year_end_date)
+	if drafts:
+		frappe.throw(
+			_("Post or remove these opening drafts first: {0}. After the close they can't be posted.").format(
+				" · ".join(escape_html(line) for line in drafts)
+			),
+			title=_("Can't close yet"),
 		)
 	steps = []
 	for year in years[: index + 1]:
@@ -2222,39 +2263,47 @@ def get_year_close(onboarding) -> dict | None:
 
 
 def is_closing_year(company: str) -> bool:
-	return is_job_enqueued(YEAR_CLOSE_JOB_ID.format(company)) or is_job_enqueued(
-		YEAR_CLOSE_WAIT_JOB_ID.format(company)
-	)
+	if is_job_enqueued(YEAR_CLOSE_JOB_ID.format(company)):
+		return True
+	state = frappe.parse_json(frappe.db.get_value("Company Setup", company, "year_close"))
+	return bool(state and state.get("waiting"))
 
 
-def enqueue_year_close(company: str, wait: bool = False):
+def enqueue_year_close(company: str):
 	frappe.enqueue(
 		run_year_close,
 		queue="long",
-		job_id=(YEAR_CLOSE_WAIT_JOB_ID if wait else YEAR_CLOSE_JOB_ID).format(company),
+		job_id=YEAR_CLOSE_JOB_ID.format(company),
 		deduplicate=True,
 		timeout=1800,
 		enqueue_after_commit=True,
 		now=frappe.in_test,
 		company=company,
-		wait=wait,
 	)
 
 
-def run_year_close(company: str, wait: bool = False):
+def resume_year_closes():
+	"""Scheduled each minute: carry on the year closes waiting for a stock close to build."""
+	for company in frappe.get_all(
+		"Company Setup", filters={"year_close": ("like", '%"waiting": 1%')}, pluck="name"
+	):
+		enqueue_year_close(company)
+
+
+def run_year_close(company: str):
 	"""The steps of the year close in turn, each kept once done. A stock close builds in ERPNext's
-	own job: this one ends then and starts again after a while, until it is built. A step that fails
-	stops the close, with its error."""
+	own job: this one ends then as waiting, and resume_year_closes starts it again, until it is built
+	or STOCK_CLOSE_SECONDS pass. ERPNext enqueues that job before the commit, so a closing whose job
+	lost its entry stays In Progress: the wait ends at that limit. A step that fails stops the close,
+	with its error."""
 	state = frappe._dict(frappe.parse_json(frappe.db.get_value("Company Setup", company, "year_close")))
+	state.pop("waiting", None)
 	while state.steps and state.done < len(state.steps):
 		step = frappe._dict(state.steps[state.done])
 		frappe.db.savepoint("year_close")
 		try:
 			if step.stock and not close_stock_step(company, step, state):
-				save_year_close(company, state)
-				if not frappe.in_test:
-					time.sleep(5)
-					enqueue_year_close(company, wait=not wait)
+				save_year_close(company, state | {"waiting": 1})
 				return
 			if step.fiscal_year:
 				close_year_step(company, step.fiscal_year, state.closing_account)
@@ -2274,21 +2323,22 @@ def close_stock_step(company: str, step, state) -> bool:
 	if closing.done or not closing.needed:
 		return True
 	if closing.status in ("Queued", "In Progress"):
-		if (
-			state.since
-			and time_diff_in_seconds(now_datetime(), get_datetime(state.since)) > STOCK_CLOSE_SECONDS
-		):
+		if not state.since:
+			state.since = str(now_datetime())
+		elif time_diff_in_seconds(now_datetime(), get_datetime(state.since)) > STOCK_CLOSE_SECONDS:
 			frappe.throw(
 				_("Closing stock to {0} is taking too long. See Stock Closing Entry {1}.").format(
 					formatdate(step.stock), closing.name
-				)
+				),
+				title=_("Stock close stuck"),
 			)
 		return False
 	if state.since:
 		frappe.throw(
 			_("Closing stock to {0} failed. See Stock Closing Entry {1} and the Error Log.").format(
 				formatdate(step.stock), closing.name
-			)
+			),
+			title=_("Stock close failed"),
 		)
 	stock.make_stock_closing(company, step.stock)
 	state.since = str(now_datetime())

@@ -175,7 +175,7 @@ def get_company_items(company: str) -> list[frappe._dict]:
 	if frappe.db.count("Company") > 1:
 		filters["name"] = ("in", frappe.get_all("Item Default", {"company": company}, pluck="parent") or [""])
 	return frappe.get_all(
-		"Item", filters=filters, fields=["name", "item_group", "stock_uom", "is_stock_item"]
+		"Item", filters=filters, fields=["name", "item_group", "stock_uom", "is_stock_item", "is_fixed_asset"]
 	)
 
 
@@ -269,7 +269,9 @@ def read_items_status(onboarding) -> frappe._dict:
 	missing = {get_exact_key(row.item_name) for row in drafts if not match_item(index, row)[0]}
 	return frappe._dict(
 		item_count=len(items),
-		services=sum(1 for item in items if not item.is_stock_item),
+		stock_items=sum(1 for item in items if item.is_stock_item),
+		# an asset item is neither stock nor a service
+		services=sum(1 for item in items if not item.is_stock_item and not item.is_fixed_asset),
 		item_groups=len({item.item_group for item in items}),
 		units=len({item.stock_uom for item in items}),
 		missing=len(missing),

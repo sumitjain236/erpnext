@@ -64,6 +64,8 @@ def get_taxes(onboarding) -> dict:
 		# where a new tax account goes: the group of tax accounts, like Duties and Taxes
 		"tax_group": get_account_parent(onboarding.company, "Tax", "Liability"),
 		"country": frappe.get_cached_value("Company", onboarding.company, "country"),
+		# replacing the chart deletes every tax template, a compliance app's too
+		"chart_replaced": onboarding.chart_of_accounts_source == "Imported",
 	}
 
 
@@ -82,7 +84,8 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 	for row in rows:
 		row = frappe._dict(row)
 		title = " ".join(cstr(row.title).split())
-		if not title and not row.account:
+		has_rate = row.rate not in (None, "")
+		if not title and not row.account and not has_rate:
 			continue
 		if row.tax_type not in TEMPLATE_DOCTYPES:
 			frappe.throw(
@@ -90,7 +93,9 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 			)
 		if not title:
 			frappe.throw(
-				_("Name the template that uses {0}.").format(frappe.bold(row.account)),
+				_("Name the template that uses {0}.").format(
+					frappe.bold(row.account or _("the rate {0}%").format(flt(row.rate)))
+				),
 				title=_("Name missing"),
 			)
 		if row.account not in accounts:
@@ -99,6 +104,13 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 					frappe.bold(row.account or title), onboarding.company
 				),
 				title=_("Not a tax account"),
+			)
+		if not has_rate:
+			frappe.throw(
+				_("Type the rate of {0} in {1}. Type 0 for a nil rate.").format(
+					frappe.bold(row.account), frappe.bold(title)
+				),
+				title=_("Rate missing"),
 			)
 		template = templates.setdefault((row.tax_type, title.casefold()), frappe._dict(title=title, lines=[]))
 		# one agency may take two taxes, like state and county sales tax, but not the same one twice

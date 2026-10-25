@@ -583,6 +583,13 @@ def read_bank_status(onboarding) -> frappe._dict:
 	return frappe._dict(
 		accounts=len(ledgers),
 		added=len(saved),
+		# a row with no bank gets no Bank Account
+		no_bank=[
+			ledger
+			for ledger in ledgers
+			if ledger not in saved
+			and not any(row.bank for row in onboarding.bank_accounts if row.account == ledger)
+		],
 		without_number=sum(1 for bank_account in saved.values() if not bank_account.bank_account_no),
 		unmarked=len(get_unmarked_accounts(company)),
 		default_bank=frappe.get_cached_value("Company", company, "default_bank_account"),

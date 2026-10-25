@@ -57,21 +57,10 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 			),
 		)
 		self.assertEqual(result["post_to"], retainers)
-		# the customer's own ledger still wins over the title, and still overshoots: the confirm's tick
-		# sends the row to the sheet's ledger
-		self.assertRaisesRegex(
-			frappe.ValidationError, "Retainers", self.doc.create_opening_invoices, "Customer"
-		)
+		# the title's ledger wins over the customer's own
 		self.doc.reload()
 		with patch("frappe.publish_realtime") as publish:
-			self.assertEqual(
-				self.doc.create_opening_invoices(
-					"Customer",
-					use_post_to=[self.doc.opening_sales_invoices[0].name],
-					post_to=retainers,
-				),
-				"done",
-			)
+			self.assertEqual(self.doc.create_opening_invoices("Customer"), "done")
 		# a posting in this request tells no open form it is posting in the background
 		self.assertNotIn("company_setup_invoices_progress", [call.args[0] for call in publish.call_args_list])
 
@@ -218,7 +207,18 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 		self.doc.create_opening_invoices("Customer")
 		self.assertEqual((get_balance(sundry, "OB-A-1"), get_balance(retainers, "OB-A-1")), (300, 0))
 
-	def test_a_customers_own_ledger_wins_over_post_to_and_a_wrong_split_is_caught(self):
+	def test_post_to_moves_only_its_own_sheets_rows(self):
+		sundry, retainers = self.add_receivable_account("Debtors - Retainers")
+		row = {"party_name": self.customer.customer_name}
+		self.doc.save_opening_invoices(
+			"Customer", [row | {"invoice_number": "OB-S-1", "outstanding_amount": 100}], "delhi.xlsx", sundry
+		)
+		delhi = [r.as_dict() for r in self.doc.opening_sales_invoices]
+		mumbai = row | {"invoice_number": "OB-S-2", "outstanding_amount": 200}
+		self.doc.save_opening_invoices("Customer", [*delhi, mumbai], "mumbai.xlsx", retainers)
+		self.assertEqual([r.account for r in self.doc.opening_sales_invoices], [sundry, retainers])
+
+	def test_a_wrong_split_is_caught(self):
 		from erpnext.setup.doctype.company_setup.opening_invoices import get_ledger_overs
 
 		default, insurers = self.add_receivable_account("Debtors - Insurance")
@@ -242,10 +242,8 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 		)
 		self.assertEqual([over["account"] for over in get_ledger_overs(self.doc, "Customer")], [default])
 
-		# picked as the sheet's Post to: the insurer keeps its own ledger, and the lines match
-		self.doc.save_opening_invoices(
-			"Customer", [row | {"account": default} for row in rows], post_to=default
-		)
+		# no Post to: the insurer goes to its own ledger, and the lines match
+		self.doc.save_opening_invoices("Customer", [row | {"account": default} for row in rows])
 		self.assertEqual([row.account for row in self.doc.opening_sales_invoices], [default, insurers])
 		self.assertEqual(get_ledger_overs(self.doc, "Customer"), [])
 
@@ -262,7 +260,7 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 			[c for c in self.doc.get_account_clashes("Customer") if c["kind"] in ("posted", "split")]
 		)
 
-	def test_post_to_fills_only_rows_without_a_ledger_of_their_own(self):
+	def test_post_to_moves_every_row_not_set_on_purpose(self):
 		_default, related = self.add_receivable_account("Debtors - Related Parties")
 		_default, retainers = self.add_receivable_account("Debtors - Retainers")
 		frappe.set_user("Administrator")
@@ -293,9 +291,13 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 				"party_group": group.name,
 			},
 		]
+		self.doc.save_opening_invoices("Customer", rows)
+		self.assertEqual([row.account for row in self.doc.opening_sales_invoices], [related, None, related])
+		# Post to moves every row but one set on purpose, like a bulk Apply
+		rows[2] |= {"account": related, "account_by_hand": 1}
 		self.doc.save_opening_invoices("Customer", rows, post_to=retainers)
 		self.assertEqual(
-			[row.account for row in self.doc.opening_sales_invoices], [related, retainers, related]
+			[row.account for row in self.doc.opening_sales_invoices], [retainers, retainers, related]
 		)
 		# the window's Post to keeps it too
 		self.assertEqual(self.doc.get_invoice_names("Customer")["own_accounts"], {sister: related})

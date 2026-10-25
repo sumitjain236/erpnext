@@ -97,6 +97,10 @@ BUSY_GROUPS = {
 	"expenses indirect admn": ("Expenses (Indirect/Admn.)", "expenses", "Expense", None),
 }
 BALANCE_COLUMNS = ("Opening Debit", "Opening Credit")
+# a ledger named like a tax line, as Indian charts name GST, TDS and TCS ledgers
+TAX_WORDS = re.compile(r"\b(gst|cgst|sgst|igst|utgst|tds|tcs)\b", re.IGNORECASE)
+# the groups tax ledgers sit under, by their name tidied as get_group_key does
+TAX_GROUPS = ("duties taxes", "duties and taxes")
 # the charts made at setup have no Equity root, so the importer's rule for all five root types is too strict
 REQUIRED_ROOT_TYPES = ("Asset", "Liability", "Income", "Expense")
 # customers and suppliers come in as opening invoices, stock as a stock entry, and the temporary
@@ -147,6 +151,7 @@ def read_chart_sheet(file_url: str, group_kinds: dict | None = None) -> frappe._
 		validate_chart_headers(dict_rows)
 		rows = [row[:IMPORTER_COLUMNS] for row in read_rows(file_doc, extension)]
 	renamed = rename_repeated_accounts(rows, dict_rows)
+	set_tax_types(rows)
 	validate_columns(rows)
 	validate_roots(rows)
 	return frappe._dict(
@@ -156,6 +161,31 @@ def read_chart_sheet(file_url: str, group_kinds: dict | None = None) -> frappe._
 		renamed=renamed,
 		unknown_groups=unknown_groups,
 	)
+
+
+def set_tax_types(rows: list[list]):
+	"""A ledger with no type of its own that is a tax line, like Input CGST or TDS Payable, or any
+	ledger under Duties and Taxes, gets the type Tax: tax templates only offer accounts of that type.
+	Only on the balance sheet side, so an expense like GST Late Fee stays as it is."""
+	by_name = {row[0]: row for row in rows if row and row[0]}
+
+	def get_parents(row):
+		seen = set()
+		while row and row[1] and row[1] != row[0] and row[0] not in seen:
+			seen.add(row[0])
+			row = by_name.get(row[1])
+			if row:
+				yield row
+
+	for row in rows:
+		if not row or not row[0] or cint(row[4]) or cstr(row[5]).strip():
+			continue
+		parents = list(get_parents(row))
+		root_type = next((cstr(r[6]).strip() for r in [row, *parents] if cstr(r[6]).strip()), "")
+		if root_type not in ("Asset", "Liability"):
+			continue
+		if TAX_WORDS.search(row[0]) or any(get_group_key(parent[0]) in TAX_GROUPS for parent in parents):
+			row[5] = "Tax"
 
 
 def rename_repeated_accounts(rows: list[list], dict_rows: list[dict]) -> list[str]:

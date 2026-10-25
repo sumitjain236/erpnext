@@ -1148,6 +1148,13 @@ def set_job_work_bom(
 	one or the default when they match, else a new copy of the default. Returns the BOM."""
 	if not service_item:
 		frappe.throw(_("Pick the service item for {0}.").format(item_code), title=_("No service item"))
+	if any(frappe.db.get_value("Item", service_item, ["is_stock_item", "is_fixed_asset"]) or ()):
+		frappe.throw(
+			_("{0} is a stock item or a fixed asset. Pick a service item that is neither.").format(
+				service_item
+			),
+			title=_("Wrong service item"),
+		)
 	if flt(finished_good_qty) <= 0:
 		frappe.throw(
 			_("Finished goods per service unit must be more than 0."), title=_("Wrong finished goods")
