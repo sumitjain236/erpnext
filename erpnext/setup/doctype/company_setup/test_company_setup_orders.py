@@ -11,7 +11,11 @@ from openpyxl import load_workbook
 from erpnext.accounts.utils import get_fiscal_year
 from erpnext.controllers.accounts_controller import get_default_taxes_and_charges
 from erpnext.selling.doctype.sales_order.mapper import make_sales_invoice
-from erpnext.setup.doctype.company_setup import company_setup_steps
+from erpnext.setup.doctype.company_setup import (
+	company_setup_steps,
+	test_company_setup_open_orders,
+	test_company_setup_taxes,
+)
 from erpnext.setup.doctype.company_setup import test_company_setup as base
 from erpnext.setup.doctype.company_setup.open_orders import download_open_orders, read_order_sheet
 from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
@@ -33,7 +37,7 @@ def as_administrator():
 class TestOpenOrderRows(ERPNextTestSuite):
 	"""Open orders: units, re-uploads, undo and dates."""
 
-	setUp = base.TestOpenOrders.setUp
+	setUp = test_company_setup_open_orders.TestOpenOrders.setUp
 
 	def tearDown(self):
 		frappe.set_user("Administrator")
@@ -654,7 +658,7 @@ class TestOpenOrderRows(ERPNextTestSuite):
 class TestTaxTemplates(ERPNextTestSuite):
 	"""Taxes: removed rows stop taxing, and templates the step did not make are left alone."""
 
-	setUp = base.TestTaxes.setUp
+	setUp = test_company_setup_taxes.TestTaxes.setUp
 
 	def tearDown(self):
 		frappe.set_user("Administrator")

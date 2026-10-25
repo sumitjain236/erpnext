@@ -804,3 +804,8 @@ def strip_title_rows(doctype: str, file_url: str) -> str:
 		.insert()
 		.file_url
 	)
+
+
+def get_file_label(file_url: str) -> str:
+	"""An uploaded file's name, to tell the rows it brought apart from others."""
+	return frappe.db.get_value("File", {"file_url": file_url}, "file_name") or file_url.rsplit("/", 1)[-1]

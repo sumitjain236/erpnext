@@ -6,7 +6,12 @@ from unittest.mock import patch
 import frappe
 from frappe.utils import flt, getdate
 
-from erpnext.setup.doctype.company_setup import fixed_assets, posted_entries
+from erpnext.setup.doctype.company_setup import (
+	asset_checks,
+	fixed_assets,
+	posted_entries,
+	test_company_setup_fixed_assets,
+)
 from erpnext.setup.doctype.company_setup import test_company_setup as base
 from erpnext.setup.doctype.company_setup.opening_invoices import add_account
 from erpnext.setup.doctype.company_setup.test_company_setup import (
@@ -26,8 +31,8 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 	Same company as TestFixedAssets: Furniture ₹1,20,000 less ₹30,000 depreciation, Plant and
 	Machinery at net value ₹31,000, migrated on 1 Jan 2026."""
 
-	setUp = base.TestFixedAssets.setUp
-	checks = base.TestFixedAssets.checks
+	setUp = test_company_setup_fixed_assets.TestFixedAssets.setUp
+	checks = test_company_setup_fixed_assets.TestFixedAssets.checks
 
 	def tearDown(self):
 		frappe.set_user("Administrator")
@@ -402,7 +407,7 @@ class TestFixedAssetMoney(ERPNextTestSuite):
 		)
 		self.assertEqual((get_balance(self.furniture), get_balance(self.accumulated)), (120000, -30000))
 
-	@patch.object(fixed_assets, "HSN_FIELD", "customs_tariff_number")
+	@patch.object(asset_checks, "HSN_FIELD", "customs_tariff_number")
 	def test_a_code_the_items_need_is_asked_per_category_and_checked_before_posting(self):
 		self.upload([("Office Desk", "Furniture and Fixtures", "2024-04-01", 120000, 30000, "SLM", 10)])
 		self.assertEqual([red["key"] for red in self.checks()["reds"]], ["hsn_code"])

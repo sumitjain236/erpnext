@@ -7,7 +7,11 @@ import frappe
 
 from erpnext.accounts.party import get_party_account
 from erpnext.controllers.sales_and_purchase_return import make_return_doc
-from erpnext.setup.doctype.company_setup import company_setup_steps
+from erpnext.setup.doctype.company_setup import (
+	company_setup_steps,
+	test_company_setup_bank,
+	test_company_setup_opening_invoices,
+)
 from erpnext.setup.doctype.company_setup import test_company_setup as base
 from erpnext.setup.doctype.company_setup.posted_entries import get_delete_setting
 from erpnext.setup.doctype.company_setup.test_company_setup import (
@@ -22,8 +26,8 @@ from erpnext.tests.utils import ERPNextTestSuite
 class TestInvoiceLedgers(ERPNextTestSuite):
 	"""Opening invoices: the receivable ledger a sheet goes to, and the rows that wait."""
 
-	setUp = base.TestOpeningInvoices.setUp
-	add_receivable_account = base.TestOpeningInvoices.add_receivable_account
+	setUp = test_company_setup_opening_invoices.TestOpeningInvoices.setUp
+	add_receivable_account = test_company_setup_opening_invoices.TestOpeningInvoices.add_receivable_account
 
 	def tearDown(self):
 		frappe.set_user("Administrator")
@@ -582,9 +586,9 @@ class TestInvoiceLedgers(ERPNextTestSuite):
 class TestChequeReports(ERPNextTestSuite):
 	"""Uncleared cheques: the bank reconciliation reports of Tally, Busy and QuickBooks."""
 
-	setUp = base.TestBankAccounts.setUp
-	save_bank_details = base.TestBankAccounts.save_bank_details
-	post_balances = base.TestBankAccounts.post_balances
+	setUp = test_company_setup_bank.TestBankAccounts.setUp
+	save_bank_details = test_company_setup_bank.TestBankAccounts.save_bank_details
+	post_balances = test_company_setup_bank.TestBankAccounts.post_balances
 
 	def tearDown(self):
 		frappe.set_user("Administrator")
@@ -761,7 +765,7 @@ class TestChequeReports(ERPNextTestSuite):
 class TestUndoDeletes(ERPNextTestSuite):
 	"""Undo deletes what Company Setup posted, when nothing else holds it, so posting again keeps names."""
 
-	setUp = base.TestOpeningInvoices.setUp
+	setUp = test_company_setup_opening_invoices.TestOpeningInvoices.setUp
 
 	def tearDown(self):
 		frappe.set_user("Administrator")
