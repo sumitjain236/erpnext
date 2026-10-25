@@ -274,6 +274,8 @@ def save_open_orders(
 		)
 	for order in prepare_orders(onboarding, order_type):
 		order.row.warehouse = order.warehouse
+		if order_type == "Work Order":
+			order.row.bom = order.bom
 	return frappe._dict(skipped=skipped)
 
 

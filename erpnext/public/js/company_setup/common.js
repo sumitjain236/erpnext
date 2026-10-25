@@ -38,7 +38,9 @@ export function ask_before_closing(dialog, is_dirty, save) {
 	dialog.$wrapper.on("keydown", (e) => {
 		if (e.key === "Escape" && !dialog.$wrapper.find(".grid-row-open").length) ask(e);
 	});
-	dialog.$wrapper.on("click", (e) => e.target === e.currentTarget && ask(e));
+	dialog.$wrapper.on("click", (e) => {
+		if (e.target === e.currentTarget) ask(e);
+	});
 }
 
 // A table's rows as text, to tell whether they changed since: the order of the rows doesn't count
@@ -261,12 +263,16 @@ export function pick_sheet(on_success) {
 }
 
 export function upload_sheet(frm, method, args, { replaces, after }) {
+	// a wrong sheet's error goes with the next upload or with the window
+	const $window = window.cur_dialog?.$wrapper;
+	frappe.hide_msgprint();
 	const choose = () => {
 		// the window is drawn again once the upload's own dialog is gone, so it ends on top
 		let closed;
 		const uploader = pick_sheet((file) =>
-			call_method(frm, method, { ...args, file_url: file.file_url }).then((r) =>
-				Promise.all([reload_fresh(frm), closed]).then(() => after(r.message))
+			call_method(frm, method, { ...args, file_url: file.file_url }).then(
+				(r) => Promise.all([reload_fresh(frm), closed]).then(() => after(r.message)),
+				() => $window?.one("hidden.bs.modal", () => frappe.hide_msgprint())
 			)
 		);
 		closed = new Promise((resolve) => uploader.dialog.$wrapper.one("hidden.bs.modal", resolve));
@@ -333,17 +339,6 @@ export function make_posting_reds(frm, reds, after) {
 export function close_and_reload(frm, dialog) {
 	dialog?.hide();
 	return reload_fresh(frm);
-}
-
-// A window drawn again shows where the old one was, at its scroll, with no close and open between
-export function show_in_place_of(dialog, old) {
-	if (!old?.display) return dialog.show();
-	const scroll = old.$wrapper.scrollTop();
-	dialog.animate = false;
-	old.$wrapper.removeClass("fade");
-	old.hide();
-	dialog.show();
-	dialog.$wrapper.scrollTop(scroll);
 }
 
 export function reload_fresh(frm) {

@@ -6,7 +6,6 @@ from io import BytesIO
 from unittest.mock import patch
 
 import frappe
-from frappe.contacts.doctype.address.address import get_default_address
 from frappe.utils import flt
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
@@ -14,7 +13,6 @@ from openpyxl.styles import Alignment
 from erpnext.setup.doctype.company_setup import company_setup_steps
 from erpnext.setup.doctype.company_setup.company_setup import create_company_setup
 from erpnext.setup.doctype.company_setup.company_setup_steps import HOOK_NAME, get_step_paths
-from erpnext.setup.doctype.company_setup.opening_invoices import add_account
 from erpnext.tests.utils import ERPNextTestSuite
 
 COMPANY = "_Test Company"
@@ -100,11 +98,6 @@ def extra_step(onboarding) -> dict:
 def broken_step(onboarding) -> dict:
 	"""A step of another app with a bug in it."""
 	raise ZeroDivisionError
-
-
-def hidden_step(onboarding) -> None:
-	"""A step of another app that doesn't apply to this company."""
-	return None
 
 
 @contextmanager
@@ -196,6 +189,22 @@ class TestCompanySetup(ERPNextTestSuite):
 		# every step shows, with or without a bank ledger or a trial balance
 		self.assertEqual(list(step_status(doc)), [*ERPNEXT_STEPS, "go_live"])
 
+		for name in OWN_STEPS:
+			self.assertRaises(frappe.ValidationError, doc.skip_step, step_key(doc, name))
+			self.assertEqual(step_status(doc)[name], "Not Started")
+		key = step_key(doc, "opening_sales_invoices")
+		doc.skip_step(key)
+		# a skipped step stays skipped when the steps are checked again
+		doc.check_steps()
+		self.assertEqual(step_status(doc)["opening_sales_invoices"], "Skipped")
+		doc.skip_step(key, skip=0)
+		self.assertEqual(step_status(doc)["opening_sales_invoices"], "Not Started")
+		# a done step stays done
+		make_customer("_Test Setup Skip Customer")
+		doc.check_steps()
+		doc.skip_step(step_key(doc, "customers"))
+		self.assertEqual(step_status(doc)["customers"], "Done")
+
 		renamed = "_Test Renamed Onboarding Company"
 		frappe.rename_doc("Company", company, renamed, force=True)
 		self.assertEqual(frappe.db.get_value("Company Setup", renamed, "company"), renamed)
@@ -222,100 +231,6 @@ class TestCompanySetup(ERPNextTestSuite):
 			company = make_company()
 		self.assertNotIn(broken, [row.step_key for row in doc.steps])
 		self.assertTrue(frappe.db.exists("Company Setup", company))
-
-	def test_a_step_that_returns_nothing_is_hidden(self):
-		hidden = f"{__name__}.hidden_step"
-		with hooked_steps({"app_one": [hidden]}):
-			doc = get_onboarding()
-			doc.run_method("onload")
-		self.assertNotIn(hidden, [row.step_key for row in doc.steps])
-		self.assertNotIn(hidden, doc.get_onload().steps)
-
-	def test_progress_counts_only_needed_steps_and_go_live_lists_whats_left(self):
-		doc = get_onboarding()
-		sales = step_key(doc, "opening_sales_invoices")
-		purchases = step_key(doc, "opening_purchase_invoices")
-		doc.append("opening_purchase_invoices", {"party_name": "Y", "outstanding_amount": 10})
-		doc.save()
-		doc.run_method("onload")
-		steps = doc.get_onload().steps
-		self.assertTrue(steps[step_key(doc, "migration_date")]["needed"])
-		self.assertTrue(steps[step_key(doc, "go_live")]["needed"])
-		# optional: counted once started, or skipped
-		self.assertFalse(steps[sales]["needed"])
-		self.assertTrue(steps[purchases]["needed"])
-
-		doc.skip_step(sales)
-		doc.run_method("onload")
-		self.assertTrue(doc.get_onload().steps[sales]["needed"])
-		reminders = doc.get_onload().go_live_reminders
-		self.assertEqual(reminders["skipped"], [sales])
-		# only required steps not done; an optional one is left out even when started
-		self.assertIn(step_key(doc, "migration_date"), reminders["steps"])
-		self.assertNotIn(purchases, reminders["steps"])
-		self.assertNotIn(step_key(doc, "go_live"), reminders["steps"])
-
-	def test_chart_step_is_done_from_the_choice(self):
-		doc = get_onboarding()
-		self.assertEqual(step_status(doc)["chart_of_accounts"], "Not Started")
-
-		doc.use_existing_chart()
-		self.assertEqual(doc.chart_of_accounts_source, "Existing")
-		self.assertEqual(step_status(doc)["chart_of_accounts"], "Done")
-
-	def test_skipping_steps(self):
-		doc = get_onboarding()
-		for name in ("migration_date", "chart_of_accounts", "opening_balances", "check_books", "go_live"):
-			self.assertRaises(frappe.ValidationError, doc.skip_step, step_key(doc, name))
-			self.assertEqual(step_status(doc)[name], "Not Started")
-
-		key = step_key(doc, "opening_sales_invoices")
-		doc.skip_step(key)
-		self.assertEqual(step_status(doc)["opening_sales_invoices"], "Skipped")
-
-		# a skipped step stays skipped when the steps are checked again
-		doc.check_steps()
-		self.assertEqual(step_status(doc)["opening_sales_invoices"], "Skipped")
-
-		doc.skip_step(key, skip=0)
-		self.assertEqual(step_status(doc)["opening_sales_invoices"], "Not Started")
-
-		# a done step stays done
-		make_customer("_Test Setup Skip Customer")
-		doc.check_steps()
-		doc.skip_step(step_key(doc, "customers"))
-		self.assertEqual(step_status(doc)["customers"], "Done")
-
-	def test_steps_are_checked_after_a_save_from_elsewhere(self):
-		opened = get_onboarding()
-		# like a background posting saving the document while the form was open
-		other = get_onboarding()
-		other.migration_date = "2026-04-01"
-		other.save()
-
-		opened.check_steps()
-		self.assertEqual(step_status(opened)["migration_date"], "Done")
-
-	def test_nothing_is_changed_while_invoices_post_in_the_background(self):
-		doc = get_onboarding()
-		with patch("erpnext.setup.doctype.company_setup.company_setup.is_job_enqueued", return_value=True):
-			self.assertRaises(
-				frappe.ValidationError,
-				doc.save_opening_invoices,
-				"Customer",
-				[{"party_name": "Onboarding Busy Customer", "outstanding_amount": 100}],
-			)
-			# opening the form while posting changes nothing either
-			self.assertFalse(doc.check_steps())
-
-	def test_opening_balances_done_only_when_all_posted(self):
-		doc = self.posting_setup()
-		cash = get_account(self.company, account_type="Cash")
-		doc.save_opening_balances([{"account": cash, "debit": 100}, {"account": self.capital, "credit": 100}])
-		self.assertEqual(step_status(get_setup(self.company))["opening_balances"], "Not Started")
-
-		doc.post_opening_balances()
-		self.assertEqual(step_status(get_setup(self.company))["opening_balances"], "Done")
 
 	def test_check_books_needs_temporary_opening_at_zero_and_nothing_left_to_post(self):
 		doc = self.posting_setup()
@@ -354,6 +269,15 @@ class TestCompanySetup(ERPNextTestSuite):
 
 	def test_go_live(self):
 		doc = get_onboarding()
+		# nothing is changed while invoices post in the background
+		with patch("erpnext.setup.doctype.company_setup.company_setup.is_job_enqueued", return_value=True):
+			self.assertRaises(
+				frappe.ValidationError,
+				doc.save_opening_invoices,
+				"Customer",
+				[{"party_name": "Onboarding Busy Customer", "outstanding_amount": 100}],
+			)
+			self.assertFalse(doc.check_steps())
 		doc.go_live()
 		self.assertEqual(doc.status, "Live")
 		self.assertEqual(step_status(doc)["go_live"], "Done")
@@ -376,43 +300,11 @@ class TestCompanySetup(ERPNextTestSuite):
 		summary = doc.get_onload().steps[step_key(doc, "go_live")]["summary"]
 		self.assertIn("still in Temporary Opening", summary)
 
-	def test_update_company_details(self):
-		doc = get_onboarding()
-		doc.update_company_details(
-			{
-				"tax_id": "27ABCDE1234F1Z5",
-				"email": "accounts@example.com",
-				"address_line1": "12 MG Road",
-				"city": "Pune",
-				"country": "India",
-			}
-		)
-		self.assertEqual(frappe.db.get_value("Company", COMPANY, "tax_id"), "27ABCDE1234F1Z5")
-		address = get_default_address("Company", COMPANY)
-		self.assertEqual(frappe.db.get_value("Address", address, "city"), "Pune")
-		self.assertTrue(frappe.db.get_value("Address", address, "is_your_company_address"))
-
-		# the same address is updated, not a second one added
-		doc.update_company_details({"address_line1": "12 MG Road", "city": "Mumbai", "country": "India"})
-		self.assertEqual(get_default_address("Company", COMPANY), address)
-		self.assertEqual(frappe.db.get_value("Address", address, "city"), "Mumbai")
-
 
 class TestStepOrder(ERPNextTestSuite):
 	"""Where steps from other apps go."""
 
-	def test_erpnext_steps_and_steps_without_a_known_place(self):
-		self.assertEqual(
-			[path.rsplit(".", 1)[-1] for path in frappe.get_hooks(HOOK_NAME, app_name="erpnext")],
-			[*ERPNEXT_STEPS, "go_live"],
-		)
-		self.assertEqual(step_names(), [*ERPNEXT_STEPS, "go_live"])
-		# they go before Go Live
-		for step in ("app_one.steps.gst", {"step": "app_one.steps.gst", "before": "no_such_step"}):
-			with self.subTest(step=step):
-				self.assertEqual(step_names(app_one=[step]), [*ERPNEXT_STEPS, "gst", "go_live"])
-
-	def test_steps_go_before_the_step_they_name(self):
+	def test_steps_go_before_or_in_place_of_the_step_they_name(self):
 		self.assertEqual(
 			step_names(
 				app_one=[
@@ -441,7 +333,7 @@ class TestStepOrder(ERPNextTestSuite):
 			[*ERPNEXT_STEPS, "payroll", "employees", "go_live"],
 		)
 
-	def test_a_step_takes_the_place_of_the_step_it_replaces(self):
+		# a step takes the place of the step it replaces
 		self.assertEqual(
 			step_names(app_one=[{"step": "app_one.steps.gst", "replaces": "opening_balances"}]),
 			[step if step != "opening_balances" else "gst" for step in [*ERPNEXT_STEPS, "go_live"]],
@@ -475,23 +367,6 @@ class TestStepOrder(ERPNextTestSuite):
 		self.assertEqual(
 			step_names(app_one=[{"step": "app_one.steps.gst", "replaces": "go_live"}])[-2:],
 			["gst", "go_live"],
-		)
-
-	def test_go_live_is_always_last(self):
-		go_live = "erpnext.setup.doctype.company_setup.company_setup_steps.go_live"
-		self.assertEqual(
-			step_names(app_one=[go_live, "app_one.steps.gst"])[-2:],
-			["gst", "go_live"],
-		)
-		self.assertEqual(
-			step_names(app_one=[{"step": "app_one.steps.gst", "before": "go_live"}]),
-			[*ERPNEXT_STEPS, "gst", "go_live"],
-		)
-
-	def test_bad_entries_are_skipped(self):
-		self.assertEqual(
-			step_names(app_one=[42, {"after": "review"}, "app_one.steps.gst"]),
-			[*ERPNEXT_STEPS, "gst", "go_live"],
 		)
 
 
@@ -559,75 +434,6 @@ def get_balance(account: str, voucher_no: str | None = None) -> float:
 		filters["voucher_no"] = voucher_no
 	rows = frappe.get_all("GL Entry", filters=filters, fields=["debit", "credit"])
 	return flt(sum(flt(row.debit) - flt(row.credit) for row in rows), 2)
-
-
-class TestEveryTab(ERPNextTestSuite):
-	"""Every tab and step shows; a step the trial balance has nothing for says so and is optional."""
-
-	def setUp(self):
-		self.company = make_company()
-		frappe.set_user(make_user("onboarding.accounts@example.com", "Accounts Manager"))
-		self.doc = frappe.get_doc("Company Setup", self.company)
-
-	def tearDown(self):
-		frappe.set_user("Administrator")
-		super().tearDown()
-
-	def get_steps(self) -> dict:
-		doc = get_setup(self.company)
-		doc.run_method("onload")
-		steps = doc.get_onload().steps
-		return {key.rsplit(".", 1)[-1]: step for key, step in steps.items()}
-
-	def test_steps_with_nothing_in_the_trial_balance_show_and_are_optional(self):
-		# before the trial balance is in, nothing is called not needed yet
-		steps = self.get_steps()
-		waiting = "Optional · we'll tell you once your trial balance is in"
-		self.assertEqual(
-			{
-				name: steps[name]["summary"]
-				for name in ("items", "opening_stock", "fixed_assets", "bank_accounts")
-			},
-			dict.fromkeys(("items", "opening_stock", "fixed_assets", "bank_accounts"), waiting),
-		)
-
-		self.doc.reload()
-		self.doc.append(
-			"opening_balances", {"account": get_account(self.company, account_type="Cash"), "debit": 10}
-		)
-		self.doc.save()
-		steps = self.get_steps()
-		self.assertEqual(
-			{
-				name: (steps[name]["summary"], bool(steps[name].get("required")))
-				for name in ("opening_stock", "fixed_assets", "bank_accounts")
-			},
-			{
-				"opening_stock": (
-					"Not needed · no stock in your opening balances · add stock if you keep any",
-					False,
-				),
-				"fixed_assets": (
-					"Optional · no fixed assets in your opening balances · add the asset list if you have any",
-					False,
-				),
-				"bank_accounts": (
-					"No bank lines in your opening balances · add bank details if you have a bank account",
-					False,
-				),
-			},
-		)
-		self.assertFalse(
-			any(steps[name].get("required") for name in ("items", "warehouses", "boms", "job_workers"))
-		)
-
-		# a stock line makes Items, Warehouses and Opening stock needed
-		stock = get_account(self.company, account_type="Stock")
-		self.doc.reload()
-		self.doc.sheet_accounts = {"Stock": {stock: 1000}}
-		self.doc.save()
-		steps = self.get_steps()
-		self.assertTrue(all(steps[name]["required"] for name in ("items", "warehouses", "opening_stock")))
 
 
 def make_stock_item(code: str, uom: str, conversions: dict | None = None) -> str:

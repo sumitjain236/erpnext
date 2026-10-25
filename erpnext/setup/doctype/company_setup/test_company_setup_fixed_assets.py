@@ -17,6 +17,8 @@ from erpnext.setup.doctype.company_setup.test_company_setup import (
 )
 from erpnext.tests.utils import ERPNextTestSuite
 
+USER = "onboarding.assets@example.com"
+
 
 class TestFixedAssets(ERPNextTestSuite):
 	"""Fixed assets on the Assets tab: the register behind the asset lines, checked as on today."""
@@ -37,7 +39,7 @@ class TestFixedAssets(ERPNextTestSuite):
 				"depreciation_expense_account": self.depreciation,
 			},
 		)
-		user = make_user("onboarding.assets@example.com", "Accounts Manager")
+		user = make_user(USER, "Accounts Manager")
 		for role in ("Item Manager", "Quality Manager", "Stock Manager"):
 			make_user(user, role)
 		frappe.set_user(user)
@@ -91,6 +93,17 @@ class TestFixedAssets(ERPNextTestSuite):
 			)
 		)
 		self.assertEqual(self.checks()["blocker"], "Mark the type of 1 account first.")
+		# posting makes Item records: without the role, it is named
+		frappe.set_user("Administrator")
+		frappe.get_doc("User", USER).remove_roles("Item Manager")
+		frappe.set_user(USER)
+		self.assertEqual(
+			self.checks()["blocker"],
+			"Posting makes Item records, which needs the Item Manager role. Ask an Administrator to add it in User.",
+		)
+		frappe.set_user("Administrator")
+		make_user(USER, "Item Manager")
+		frappe.set_user(USER)
 		self.assertEqual(self.doc.mark_asset_accounts(), [self.plant])
 		checks = self.checks()
 		self.assertIsNone(checks["blocker"])
@@ -216,7 +229,7 @@ class TestFixedAssets(ERPNextTestSuite):
 		# once ERPNext posts its depreciation, the asset can't be undone here
 		frappe.set_user("Administrator")
 		post_depreciation_entries(date="2026-03-31")
-		frappe.set_user("onboarding.assets@example.com")
+		frappe.set_user(USER)
 		self.doc.reload()
 		self.assertRaisesRegex(
 			frappe.ValidationError,

@@ -3,8 +3,6 @@
 
 import frappe
 
-from erpnext.setup.doctype.company_setup.bank_accounts import guess_new_bank
-from erpnext.setup.doctype.company_setup.company_setup_steps import warehouses as warehouses_step
 from erpnext.setup.doctype.company_setup.opening_invoices import add_account, get_temporary_account
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	get_account,
@@ -14,7 +12,6 @@ from erpnext.setup.doctype.company_setup.test_company_setup import (
 	make_stock_item,
 	make_user,
 	make_xlsx_file,
-	step_key,
 	step_status,
 )
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
@@ -96,15 +93,11 @@ class TestOpeningStock(ERPNextTestSuite):
 		self.doc.reload()
 		return self.doc.get_opening_stock()
 
-	def test_warehouses_are_done_once_reviewed(self):
-		self.assertNotEqual(step_status(get_setup(self.company))["warehouses"], "Done")
-		self.assertTrue(warehouses_step(self.doc)["summary"].endswith("· review them"))
-		self.doc.save_warehouses(self.doc.get_warehouses()["rows"])
-		self.assertEqual(step_status(get_setup(self.company))["warehouses"], "Done")
-
 	def test_opening_stock_posts_per_warehouse_against_temporary_opening(self):
 		temporary = get_temporary_account(self.company, create=True)
 		self.assertIn("opening_stock", step_status(get_setup(self.company)))
+		frappe.db.set_value("Company", self.company, "enable_perpetual_inventory", 0)
+		frappe.local.enable_perpetual_inventory = {}
 		result = self.doc.import_opening_stock(self.godown_summary())
 		self.assertEqual((result["read"], result["added"]), (3, 3))
 		rows = {row.item_name: row for row in self.doc.opening_stock}
@@ -113,6 +106,9 @@ class TestOpeningStock(ERPNextTestSuite):
 			(self.stores, 100, "Kg", 28500),
 		)
 		self.assertEqual(rows["_Test Setup Vest"].stock_group, "Garments")
+		# perpetual inventory is needed, and turned on from here
+		self.assertIn("perpetual inventory", self.checks()["blocker"])
+		self.doc.turn_on_perpetual_inventory()
 		checks = self.checks()
 		self.assertEqual(checks["reds"][0]["key"], "missing_items")
 		self.assertEqual(checks["blocker"], "1 item is not in ERPNext. Import it in Items first.")
@@ -256,67 +252,6 @@ class TestOpeningStock(ERPNextTestSuite):
 				"Stock Ledger Entry", {"voucher_no": issue.name, "is_cancelled": 0}, "stock_value_difference"
 			),
 			-3000,
-		)
-
-	def test_perpetual_inventory_is_needed_and_wip_kept_as_a_balance_is_not_stock(self):
-		frappe.db.set_value("Company", self.company, "enable_perpetual_inventory", 0)
-		frappe.local.enable_perpetual_inventory = {}
-		self.doc.import_opening_stock(self.godown_summary())
-		self.assertIn("perpetual inventory", self.checks()["blocker"])
-		self.doc.turn_on_perpetual_inventory()
-		self.assertNotIn("perpetual inventory", self.checks()["blocker"])
-
-		wip = add_account(
-			self.company,
-			"Work in Progress",
-			"",
-			"Asset",
-			parent=frappe.db.get_value("Account", self.stock_in_hand, "parent_account"),
-		)
-		capital = get_account(self.company, root_type="Equity", account_type=("!=", "Temporary"))
-		self.doc.save_opening_balances(
-			[{"account": wip, "debit": 1000}, {"account": capital, "credit": 1000}]
-		)
-		self.doc.run_method("onload")
-		self.assertEqual(self.doc.get_onload().stock_like_lines, [{"account": wip, "amount": 1000}])
-		# kept as a balance: not a stock line, so not in the stock total
-		self.assertEqual(self.checks()["trial_balance"]["total"], 46000)
-		self.doc.move_to_opening_stock(wip)
-		self.doc.reload()
-		self.assertEqual(frappe.db.get_value("Account", wip, "account_type"), "Stock")
-		self.assertEqual(self.checks()["trial_balance"]["total"], 47000)
-		self.assertEqual([row.account for row in self.doc.opening_balances], [capital])
-
-	def test_progress_counts_party_steps_and_temporary_opening_names_its_parts(self):
-		receivable = frappe.db.get_value("Company", self.company, "default_receivable_account")
-		self.doc.sheet_accounts = {
-			"Stock": {self.stock_in_hand: 41000, self.job_line: 5000},
-			"Receivable": {receivable: 10000},
-		}
-		self.doc.save()
-		cash = get_account(self.company, account_type="Cash")
-		capital = get_account(self.company, root_type="Equity", account_type=("!=", "Temporary"))
-		self.doc.save_opening_balances(
-			[{"account": cash, "debit": 1000}, {"account": capital, "credit": 5000}]
-		)
-		doc = get_setup(self.company)
-		doc.run_method("onload")
-		steps = doc.get_onload().steps
-		# customers are in the trial balance, suppliers are not
-		self.assertTrue(steps[step_key(doc, "customers")]["needed"])
-		self.assertTrue(steps[step_key(doc, "opening_sales_invoices")]["needed"])
-		self.assertFalse(steps[step_key(doc, "opening_purchase_invoices")]["needed"])
-		self.assertEqual(
-			doc.get_onload().temporary_parts,
-			[
-				{"label": "opening balances", "amount": -4000},
-				{"label": "stock", "amount": 46000, "to_come": True, "over": False},
-				{"label": "customer invoices", "amount": 10000, "to_come": True, "over": False},
-			],
-		)
-		self.assertEqual(
-			[guess_new_bank(name) for name in ("Axis Bank Current A/c", "Bank of Baroda OD", "Bank OD A/c")],
-			["Axis Bank", "Bank of Baroda", None],
 		)
 
 

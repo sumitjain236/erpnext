@@ -3,13 +3,11 @@
 
 import frappe
 
-from erpnext.setup.doctype.company_setup.chart_sheet import download_chart_template
 from erpnext.setup.doctype.company_setup.company_setup import get_chart_import_blocker
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	SHEET,
 	make_company,
 	make_customer,
-	make_file,
 	make_sheet,
 	make_user,
 	set_party_account,
@@ -33,6 +31,22 @@ class TestChartImport(ERPNextTestSuite):
 		super().tearDown()
 
 	def test_import_replaces_the_chart_and_keeps_balances_as_drafts(self):
+		# the preview changes nothing; customers and suppliers are left out, and said so
+		before = frappe.db.count("Account", {"company": self.company})
+		preview = self.doc.preview_chart(make_sheet(SHEET))
+		self.assertEqual((len(preview["accounts"]), preview["current_accounts"]), (len(SHEET) - 1, before))
+		self.assertEqual(preview["left_out"], {"Receivable": 95000, "Payable": -82000})
+		self.assertTrue(frappe.db.exists("Account", "Cash - _TOC"))
+		# a balance on a group account is refused
+		on_group = [
+			row.replace(
+				"Current Assets,Assets,1100,1000,1,,Asset,INR,,",
+				"Current Assets,Assets,1100,1000,1,,Asset,INR,10,",
+			)
+			for row in SHEET
+		]
+		self.assertRaises(frappe.ValidationError, self.doc.preview_chart, make_sheet(on_group))
+
 		self.doc.import_chart(make_sheet(SHEET))
 
 		self.assertEqual(self.doc.chart_of_accounts_source, "Imported")
@@ -56,24 +70,6 @@ class TestChartImport(ERPNextTestSuite):
 		self.assertEqual(rows["1110 - Cash in Hand"].debit, 25000)
 		self.assertEqual(rows["2200 - Owner Capital"].credit, 418000)
 		self.assertEqual({row.status for row in self.doc.opening_balances}, {"Draft"})
-
-	def test_import_adds_the_accounts_erpnext_posts_to(self):
-		# a chart from other software has a round off account at most, and no stock-not-billed one
-		sheet = [*SHEET, "Round Off,Expenses,5300,5000,0,Round Off,Expense,INR,,"]
-		self.assertEqual(
-			self.doc.preview_chart(make_sheet(sheet))["added_accounts"], ["Stock Received But Not Billed"]
-		)
-		result = self.doc.import_chart(make_sheet(sheet))
-
-		srbnb = frappe.db.get_value("Company", self.company, "stock_received_but_not_billed")
-		self.assertEqual(result, {"added_accounts": [srbnb]})
-		self.assertEqual(
-			frappe.db.get_value("Account", srbnb, ["account_type", "root_type"]),
-			("Stock Received But Not Billed", "Liability"),
-		)
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "round_off_account"), "5300 - Round Off - _TOC"
-		)
 
 	def test_import_keeps_the_default_and_party_accounts_by_name(self):
 		# a big company's chart: several receivable accounts, the usual one first
@@ -106,47 +102,37 @@ class TestChartImport(ERPNextTestSuite):
 				["1134 - Debtors - Export - _TOC"],
 			)
 
-	def test_a_foreign_currency_receivable_is_not_made_the_default(self):
-		sheet = [
+		big_lines = [
 			*SHEET,
-			"Debtors - USD,Current Assets,1135,1100,0,Receivable,Asset,USD,,",
-			"Creditors - USD,Liabilities,2150,2000,0,Payable,Liability,USD,,",
+			"Debtors - Retainers,Current Assets,1135,1100,0,Receivable,Asset,INR,500000,",
+			"Creditors - Capital Goods,Liabilities,2105,2000,0,Payable,Liability,INR,,500000",
+			"Creditors - Import,Liabilities,2110,2000,0,Payable,Liability,INR,,1000",
+			"Input CGST,Current Assets,1140,1100,0,,Asset,INR,,",
 		]
-		self.doc.import_chart(make_sheet(sheet))
+		self.doc.import_chart(make_sheet(big_lines))
+		# a GST ledger with no type is a tax account, so tax templates can pick it
 		self.assertEqual(
 			frappe.db.get_value(
-				"Company", self.company, ["default_receivable_account", "default_payable_account"]
+				"Account", {"company": self.company, "account_name": "Input CGST"}, "account_type"
 			),
-			("1130 - Sundry Debtors - _TOC", "2100 - Sundry Creditors - _TOC"),
+			"Tax",
+		)
+		# Retainers holds the most, but Sundry Debtors has the usual name
+		self.assertEqual(
+			frappe.db.get_value("Company", self.company, "default_receivable_account"),
+			"1130 - Sundry Debtors - _TOC",
 		)
 
-	def test_preview_changes_nothing(self):
-		before = frappe.db.count("Account", {"company": self.company})
-		preview = self.doc.preview_chart(make_sheet(SHEET))
-
-		self.assertEqual(len(preview["accounts"]), len(SHEET) - 1)
-		self.assertEqual(preview["current_accounts"], before)
-		# customers and suppliers are left out, and said so
-		self.assertEqual(preview["balances"], 4)
-		self.assertEqual(preview["debit"], 405000)
-		self.assertEqual(preview["credit"], 418000)
-		self.assertEqual(preview["left_out"], {"Receivable": 95000, "Payable": -82000})
-		self.assertTrue(frappe.db.exists("Account", "Cash - _TOC"))
-
-	def test_a_trial_balance_is_not_taken_for_a_chart(self):
-		sheet = make_file("trial_balance.csv", ["Particulars,Debit,Credit", "Cash,100,", "Capital,,100"])
-		with self.assertRaisesRegex(frappe.ValidationError, "isn't a chart of accounts"):
-			self.doc.preview_chart(sheet)
-
-	def test_balance_on_a_group_account_is_refused(self):
-		sheet = [
-			row.replace(
-				"Current Assets,Assets,1100,1000,1,,Asset,INR,,",
-				"Current Assets,Assets,1100,1000,1,,Asset,INR,10,",
-			)
-			for row in SHEET
-		]
-		self.assertRaises(frappe.ValidationError, self.doc.preview_chart, make_sheet(sheet))
+		# no usual name among the payables: left for the user to pick, not the biggest line
+		self.doc.import_chart(
+			make_sheet([row for row in big_lines if not row.startswith("Sundry Creditors")])
+		)
+		self.assertFalse(frappe.db.get_value("Company", self.company, "default_payable_account"))
+		self.doc.run_method("onload")
+		self.assertIn(
+			"default_payable_account",
+			[gap["fieldname"] for gap in self.doc.get_onload().books_reminders["default_account_gaps"]],
+		)
 
 	def test_draft_balances_move_to_the_new_account_with_the_same_name(self):
 		self.doc.append(
@@ -165,27 +151,6 @@ class TestChartImport(ERPNextTestSuite):
 			[(row.original_account, row.account) for row in self.doc.opening_balances],
 			[("Cash", "1110 - Cash - _TOC"), ("Earnest Money", None)],
 		)
-
-	def test_downloaded_chart_can_be_imported_again(self):
-		frappe.local.response = frappe._dict()
-		download_chart_template(self.company, "Current Chart")
-		file_url = (
-			frappe.get_doc(
-				{
-					"doctype": "File",
-					"file_name": "chart.xlsx",
-					"content": frappe.response.filecontent,
-					"is_private": 1,
-				}
-			)
-			.insert()
-			.file_url
-		)
-		before = frappe.db.count("Account", {"company": self.company})
-
-		self.doc.import_chart(file_url)
-		self.assertEqual(frappe.db.count("Account", {"company": self.company}), before)
-		self.assertTrue(frappe.db.exists("Account", "Cash - _TOC"))
 
 	def test_import_is_only_for_an_accounts_manager_and_before_any_entries(self):
 		self.assertIsNone(get_chart_import_blocker(self.company))

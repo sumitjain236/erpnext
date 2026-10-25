@@ -9,7 +9,6 @@ import {
 	make_sheet_head,
 	reload_fresh,
 	set_primary_disabled,
-	show_in_place_of,
 	upload_sheet,
 } from "./common";
 import { fill_where, where_to_find_fields } from "./where_to_find";
@@ -53,7 +52,7 @@ export function list_column(fieldname, fieldtype, label, columns, extra = {}) {
 }
 
 // Show the fields of one view of a window, as {view: [fieldnames]}, and hide the others
-export function show_view_fields(dialog, views, view) {
+function show_view_fields(dialog, views, view) {
 	for (const [name, fields] of Object.entries(views)) {
 		for (const field of fields) {
 			if (dialog.fields_dict[field]) dialog.set_df_property(field, "hidden", name === view ? 0 : 1);
@@ -62,7 +61,7 @@ export function show_view_fields(dialog, views, view) {
 }
 
 // A window's confirm in its "confirm" field: back says what going back does, then the body
-export function fill_confirm(dialog, { title, back, on_back, body, primary, on_primary, theme }) {
+function fill_confirm(dialog, { title, back, on_back, body, primary, on_primary, theme }) {
 	dialog.set_title(title);
 	dialog
 		.get_field("confirm")
@@ -77,26 +76,29 @@ export function fill_confirm(dialog, { title, back, on_back, body, primary, on_p
 
 // The sheet, its cards and messages, and the confirm that replaces it. Each step's window fills it.
 export class SheetWindow {
-	// row_form: each row opens a form with the fields not in the list. open: opens this window again.
-	// save_method and get_method keep the rows and read the checks, with args.
+	// row_form: each row opens a form with the fields not in the list. save_method and get_method
+	// keep the rows and read the checks, with args. Without fields or extra_fields, get_fields(checks)
+	// and get_extra_fields(checks) give them.
+	// table: more of the rows table, like its label. posted: no "Where do I find this?".
 	constructor(
 		frm,
 		{
 			title,
 			where,
 			fields,
-			extra_fields = [],
+			extra_fields,
 			has_data,
+			posted = false,
 			row_form = false,
-			open,
+			table = {},
+			primary_label = __("Post to books"),
 			save_method,
 			get_method,
 			args = {},
+			checks,
 		}
 	) {
-		const win = this;
 		this.frm = frm;
-		this.open = open;
 		this.save_method = save_method;
 		this.get_method = get_method;
 		this.args = args;
@@ -107,6 +109,8 @@ export class SheetWindow {
 		this.lines = [];
 		// the key of the alert whose rows alone show
 		this.only = null;
+		// get_layout, get_fields and get_extra_fields run before a subclass constructor: use only frm and args
+		this.layout = this.get_layout(checks);
 		this.dialog = new frappe.ui.Dialog({
 			title: title,
 			size: "extra-large",
@@ -119,28 +123,15 @@ export class SheetWindow {
 					fieldtype: "Table",
 					in_place_edit: row_form ? 0 : 1,
 					data: [],
-					fields: fields.map((df) =>
-						df.hidden
-							? df
-							: {
-									...df,
-									formatter: (value, column, options, doc) =>
-										win.format_cell(df, value, column, options, doc),
-									...(!df.read_only && {
-										onchange: function (e) {
-											df.onchange?.apply(this, [e]);
-											win.changed();
-										},
-									}),
-							  }
-					),
+					...table,
+					fields: this.wrap_fields(fields || this.get_fields(checks)),
 				},
 				{ fieldname: "notes", fieldtype: "HTML" },
-				...extra_fields,
+				...(extra_fields || this.get_extra_fields(checks)),
 				{ fieldname: "confirm", fieldtype: "HTML", hidden: 1 },
-				...(where ? where_to_find_fields(frm, where, { has_data: has_data, posted: false }) : []),
+				...(where ? where_to_find_fields(frm, where, { has_data: has_data, posted: posted }) : []),
 			],
-			primary_action_label: __("Post to books"),
+			primary_action_label: primary_label,
 			primary_action: () => this.post(),
 			secondary_action_label: __("Save draft"),
 			secondary_action: () => this.save_draft(),
@@ -150,14 +141,69 @@ export class SheetWindow {
 		setup_dialog_grid(this.grid, () => this.changed());
 		ask_before_closing(
 			this.dialog,
-			() => this.dirty,
-			() => this.save().then(() => (this.dirty = false))
+			() => this.is_dirty(),
+			() => this.save_before_close()
 		);
 		this.$back = $(`<div class="hide"></div>`).appendTo(this.dialog.custom_actions);
 		this.views = {
 			sheet: ["head", "stats", "alerts", "rows", "notes", "where_section"],
 			confirm: ["confirm"],
 		};
+	}
+
+	// each cell shows the alerts' badges, and an edit marks the window changed
+	wrap_fields(fields) {
+		const win = this;
+		return fields.map((df) =>
+			df.hidden
+				? df
+				: {
+						...df,
+						formatter: (value, column, options, doc) =>
+							win.format_cell(df, value, column, options, doc),
+						...(!df.read_only && {
+							onchange: function (e) {
+								df.onchange?.apply(this, [e]);
+								win.changed();
+							},
+						}),
+				  }
+		);
+	}
+
+	// what the columns depend on: when it changes on a refresh, the columns are made again
+	get_layout() {
+		return "";
+	}
+
+	get_fields() {
+		return [];
+	}
+
+	// the fields of the window's other views
+	get_extra_fields() {
+		return [];
+	}
+
+	set_fields(fields) {
+		this.grid.df.fields = this.wrap_fields(fields);
+		this.grid.reset_grid();
+	}
+
+	is_dirty() {
+		return this.dirty;
+	}
+
+	// Save draft in the unsaved-changes prompt; the window closes after it
+	save_before_close() {
+		return this.save().then(() => (this.dirty = false));
+	}
+
+	// a redraw that keeps the window where it was scrolled to
+	keep_scroll(draw) {
+		const scroll = this.dialog.$wrapper.scrollTop();
+		draw();
+		this.dialog.$wrapper.scrollTop(scroll);
 	}
 
 	render() {}
@@ -327,10 +373,10 @@ export class SheetWindow {
 		upload_sheet(this.frm, method, this.args, { replaces, after });
 	}
 
-	show(replacing) {
+	show() {
 		this.set_rows(this.drafts);
 		this.show_sheet();
-		show_in_place_of(this.dialog, replacing);
+		this.dialog.show();
 	}
 
 	save(rows = this.get_rows(), args = {}) {
@@ -347,20 +393,25 @@ export class SheetWindow {
 			.then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }));
 	}
 
-	// the saved rows and their checks, drawn again in this window; new columns need a new one
+	// the saved rows and their checks, drawn again in this window
 	refresh(result = null) {
-		const scroll = this.dialog.$wrapper.scrollTop();
 		return reload_fresh(this.frm)
-			.then(() => get_data(this.frm, this.get_method, this.args))
-			.then((r) => {
-				if (this.layout_changed(r.message)) return this.open(result, this.dialog);
-				this.load(r.message);
-				this.result = result;
-				this.dirty = false;
-				this.set_rows(this.drafts);
-				this.show_sheet();
-				this.dialog.$wrapper.scrollTop(scroll);
-			});
+			.then(() => this.get_method && get_data(this.frm, this.get_method, this.args))
+			.then((r) =>
+				this.keep_scroll(() => {
+					const checks = r?.message;
+					const layout = this.get_layout(checks);
+					if (layout !== this.layout) {
+						this.layout = layout;
+						this.set_fields(this.get_fields(checks));
+					}
+					this.result = result;
+					this.load(checks);
+					this.dirty = false;
+					this.set_rows(this.drafts);
+					this.show_sheet();
+				})
+			);
 	}
 
 	// the checks again, on the rows saved: a red shows on the sheet, else the confirm
@@ -387,9 +438,5 @@ export class SheetWindow {
 		this.set_view("sheet");
 		this.dialog.set_title(this.title);
 		this.render();
-	}
-
-	layout_changed() {
-		return false;
 	}
 }

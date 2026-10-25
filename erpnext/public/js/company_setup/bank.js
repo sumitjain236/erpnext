@@ -12,6 +12,7 @@ import {
 } from "./common";
 import { show_undo_result } from "./invoices_posted";
 import { BankAccountsWindow } from "./bank_window";
+import { get_bank_details } from "./bank_details";
 import { show_posted_window } from "./posted";
 
 export function bank_menu(frm) {
@@ -64,16 +65,9 @@ export function show_cheques_posted(frm) {
 }
 
 // Bank accounts: the bank details of each bank ledger, then the uncleared cheques and deposits
-export function show_bank_accounts(frm, replacing) {
-	Promise.all([
-		get_data(frm, "get_bank_accounts"),
-		frappe.db.get_list("Bank", { fields: ["name"], limit: 0 }),
-	]).then(([r, banks]) =>
-		new BankAccountsWindow(
-			frm,
-			r.message,
-			banks.map((bank) => bank.name)
-		).show(replacing)
+export function show_bank_accounts(frm) {
+	get_bank_details(frm).then(([details, bank_names]) =>
+		new BankAccountsWindow(frm, details, bank_names).show()
 	);
 }
 

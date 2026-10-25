@@ -43,10 +43,8 @@ const STOCK_FIELDS = [
 	"idx",
 ];
 
-export function show_opening_stock(frm, result, replacing) {
-	get_data(frm, "get_opening_stock").then((r) =>
-		new OpeningStockWindow(frm, r.message, result).show(replacing)
-	);
+export function show_opening_stock(frm, result) {
+	get_data(frm, "get_opening_stock").then((r) => new OpeningStockWindow(frm, r.message, result).show());
 }
 
 // The columns opening stock shows: the challan ones for job work, else the batch ones
@@ -61,64 +59,66 @@ function get_stock_layout(frm, checks) {
 
 class OpeningStockWindow extends SheetWindow {
 	constructor(frm, checks, result) {
-		const { drafts, job_work, batched } = get_stock_layout(frm, checks);
 		super(frm, {
 			title: __("Opening stock"),
-			open: (result, replacing) => show_opening_stock(frm, result, replacing),
 			save_method: "save_opening_stock",
 			get_method: "get_opening_stock",
 			where: "opening_stock",
-			has_data: drafts.length,
-			fields: [
-				list_column("item_name", "Data", __("Item"), job_work || batched ? 2 : 3),
-				list_column("warehouse_name", "Data", __("Warehouse"), job_work || batched ? 1 : 2),
-				list_column("qty", "Float", __("Qty"), 1, { onchange: keep_rate_on_qty }),
-				list_column("uom", "Data", __("Unit"), 1),
-				// the rate shows a typo in qty or value at a glance
-				list_column("rate", "Currency", __("Rate"), 1, { onchange: keep_rate_on_qty }),
-				list_column("amount", "Currency", __("Value"), job_work ? 1 : 2, {
-					onchange: set_rate_on_amount,
-				}),
-				job_work
-					? list_column("challan_no", "Data", __("Challan no"), 1)
-					: { fieldname: "challan_no", fieldtype: "Data", label: __("Challan no") },
-				job_work
-					? list_column("challan_date", "Date", __("Challan date"), 1)
-					: { fieldname: "challan_date", fieldtype: "Date", label: __("Challan date") },
-				job_work
-					? list_column("return_due", "Date", __("Return due"), 1)
-					: { fieldname: "return_due", fieldtype: "Date", label: __("Return due") },
-				batched
-					? list_column("batch_no", "Data", __("Batch"), 1)
-					: { fieldname: "batch_no", fieldtype: "Data", label: __("Batch") },
-				batched
-					? list_column("expiry_date", "Date", __("Expiry date"), 1)
-					: { fieldname: "expiry_date", fieldtype: "Date", label: __("Expiry date") },
-				{ fieldname: "serial_no", fieldtype: "Small Text", label: __("Serial No") },
-				{ fieldname: "stock_group", fieldtype: "Data", label: __("Stock group") },
-				{ fieldname: "source", fieldtype: "Data", hidden: 1 },
-				{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
-			],
+			has_data: get_stock_layout(frm, checks).drafts.length,
+			checks: checks,
 			extra_fields: [{ fieldname: "lines", fieldtype: "HTML" }],
 		});
 		this.views.sheet.push("lines");
 		this.result = result;
-		this.layout = [job_work, batched].join();
 		this.load(checks);
+	}
+
+	get_layout(checks) {
+		const { job_work, batched } = get_stock_layout(this.frm, checks);
+		return [job_work, batched].join();
+	}
+
+	get_fields(checks) {
+		const { job_work, batched } = get_stock_layout(this.frm, checks);
+		return [
+			list_column("item_name", "Data", __("Item"), job_work || batched ? 2 : 3),
+			list_column("warehouse_name", "Data", __("Warehouse"), job_work || batched ? 1 : 2),
+			list_column("qty", "Float", __("Qty"), 1, { onchange: keep_rate_on_qty }),
+			list_column("uom", "Data", __("Unit"), 1),
+			// the rate shows a typo in qty or value at a glance
+			list_column("rate", "Currency", __("Rate"), 1, { onchange: keep_rate_on_qty }),
+			list_column("amount", "Currency", __("Value"), job_work ? 1 : 2, {
+				onchange: set_rate_on_amount,
+			}),
+			job_work
+				? list_column("challan_no", "Data", __("Challan no"), 1)
+				: { fieldname: "challan_no", fieldtype: "Data", label: __("Challan no") },
+			job_work
+				? list_column("challan_date", "Date", __("Challan date"), 1)
+				: { fieldname: "challan_date", fieldtype: "Date", label: __("Challan date") },
+			job_work
+				? list_column("return_due", "Date", __("Return due"), 1)
+				: { fieldname: "return_due", fieldtype: "Date", label: __("Return due") },
+			batched
+				? list_column("batch_no", "Data", __("Batch"), 1)
+				: { fieldname: "batch_no", fieldtype: "Data", label: __("Batch") },
+			batched
+				? list_column("expiry_date", "Date", __("Expiry date"), 1)
+				: { fieldname: "expiry_date", fieldtype: "Date", label: __("Expiry date") },
+			{ fieldname: "serial_no", fieldtype: "Small Text", label: __("Serial No") },
+			{ fieldname: "stock_group", fieldtype: "Data", label: __("Stock group") },
+			{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+			{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
+		];
 	}
 
 	// back in front after warehouses were added in another browser tab: the checks again, unless
 	// rows are being edited
-	show(replacing) {
-		super.show(replacing);
+	show() {
+		super.show();
 		const refresh = () => this.dialog.display && !this.dirty && this.refresh();
 		$(window).on("focus", refresh);
 		this.dialog.onhide = () => $(window).off("focus", refresh);
-	}
-
-	layout_changed(checks) {
-		const { job_work, batched } = get_stock_layout(this.frm, checks);
-		return [job_work, batched].join() !== this.layout;
 	}
 
 	load(checks) {

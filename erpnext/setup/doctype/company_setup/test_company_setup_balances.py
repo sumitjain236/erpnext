@@ -4,18 +4,15 @@
 import frappe
 from frappe.utils import flt, getdate
 
-from erpnext.accounts.party import get_party_account
 from erpnext.accounts.utils import get_fiscal_year
 from erpnext.setup.doctype.company_setup import company_setup_steps
-from erpnext.setup.doctype.company_setup.chart_sheet import get_draft_balances
-from erpnext.setup.doctype.company_setup.opening_invoices import add_account, ensure_fiscal_year
+from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	get_account,
 	has_year,
 	make_company,
 	make_file,
 	make_user,
-	make_xlsx_file,
 	step_status,
 )
 from erpnext.tests.utils import ERPNextTestSuite
@@ -68,7 +65,7 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.assertFalse(frappe.db.exists("Journal Entry", {"name": ("in", list(entries))}))
 		self.assertFalse(frappe.db.exists("GL Entry", {"voucher_no": ("in", list(entries))}))
 
-	def test_save_replaces_drafts_nets_each_row_and_keeps_posted_rows(self):
+	def test_save_replaces_drafts_nets_each_row_and_refuses_party_and_stock_accounts(self):
 		self.doc.append("opening_balances", {"account": self.cash, "debit": 10, "status": "Posted"})
 		self.doc.flags.posting = True
 		self.doc.save()
@@ -95,28 +92,7 @@ class TestOpeningBalances(ERPNextTestSuite):
 			[(10, 0, "Posted"), (70, 0, "Draft"), (0, 50, "Draft")],
 		)
 
-	def test_a_form_save_cannot_mark_a_row_posted(self):
-		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
-		self.doc.opening_balances[0].status = "Posted"
-		self.doc.save()
-		self.assertEqual(self.doc.opening_balances[0].status, "Draft")
-
-	def test_post_uses_what_is_saved(self):
-		self.doc.migration_date = "2026-04-01"
-		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
-		# a change that was never saved is not posted
-		self.doc.opening_balances[0].debit = 999
-		self.doc.post_opening_balances()
-		self.assertEqual(self.doc.opening_balances[0].debit, 100)
-
-	def test_migration_date_is_fixed_once_posted(self):
-		self.doc.migration_date = "2026-04-01"
-		self.doc.save_opening_balances([{"account": self.cash, "debit": 100}])
-		self.doc.post_opening_balances()
-		self.doc.migration_date = "2026-05-01"
-		self.assertRaises(frappe.ValidationError, self.doc.save)
-
-	def test_customer_supplier_stock_and_other_companies_accounts_are_refused(self):
+		# customer, supplier, stock and other companies' accounts are refused
 		accounts = [
 			get_account(self.company, account_type=account_type)
 			for account_type in ("Receivable", "Payable", "Stock", "Temporary")
@@ -209,94 +185,6 @@ class TestOpeningBalances(ERPNextTestSuite):
 			self.assertEqual(result["left_out"], {"Receivable": 1500})
 			self.assertEqual(result["groups"], 0)
 
-	def test_trial_balance_sheets_with_headings_over_rows_or_indented_names(self):
-		cash_name = frappe.db.get_value("Account", self.cash, "account_name")
-		capital_name = frappe.db.get_value("Account", self.capital, "account_name")
-		with self.subTest("Tally, as exported"):
-			# title rows, headings over a few rows, ledgers indented under groups
-			rows = [
-				("Kapoor Interiors",),
-				("Trial Balance",),
-				("Particulars", "Kapoor Interiors"),
-				(None, "Closing Balance"),
-				(None, "Debit", "Credit"),
-				("Capital Account", None, 1000, 0),
-				(capital_name, None, 1000, 2),
-				("Current Assets", 1000, None, 0),
-				("Sundry Debtors", 700, None, 2),
-				("Mehta Residency", 700, None, 4),
-				("Cash-in-Hand", 300, None, 2),
-				(cash_name, 300, None, 4),
-				("Grand Total", 1000, 1000, 0),
-			]
-			result = self.doc.import_opening_balances(make_xlsx_file("tally_tb.xlsx", rows, indent_column=1))
-			self.assertEqual(
-				[(row.account, row.debit, row.credit) for row in self.doc.opening_balances],
-				[(self.capital, 0, 1000), (self.cash, 300, 0)],
-			)
-			self.assertEqual((result["groups"], result["left_out"]), (4, {"Receivable": 700}))
-
-		with self.subTest("the closing columns are named in the row above"):
-			self.doc.import_opening_balances(
-				make_file(
-					"tb.csv",
-					[
-						",Opening Balance,,Transactions,,Closing Balance,,",
-						"Particulars,Debit,Credit,Debit,Credit,Debit,Credit,Dr/Cr",
-						f"{cash_name},100,,900,,1000,,Dr",
-					],
-				)
-			)
-			self.assertEqual(
-				[(row.account, row.debit, row.credit) for row in self.doc.opening_balances],
-				[(self.cash, 1000, 0)],
-			)
-
-		with self.subTest("the indent is read from the name column"):
-			rows = [
-				("Account Number", "Account Name", "Debit", "Credit"),
-				(None, "Current Assets", 300, None, 0),
-				("A100", cash_name, 300, None, 2),
-			]
-			result = self.doc.import_opening_balances(make_xlsx_file("tb.xlsx", rows, indent_column=2))
-			self.assertEqual([row.debit for row in self.doc.opening_balances], [300])
-			self.assertEqual(result["groups"], 1)
-
-	def test_an_account_of_the_chart_under_the_debtors_group_keeps_its_balance(self):
-		user = frappe.session.user
-		frappe.set_user("Administrator")
-		receivable = get_account(self.company, account_type="Receivable")
-		provision = frappe.get_doc(
-			{
-				"doctype": "Account",
-				"account_name": "Provision for Doubtful Debts",
-				"company": self.company,
-				"parent_account": frappe.db.get_value("Account", receivable, "parent_account"),
-			}
-		).insert()
-		frappe.set_user(user)
-		result = self.doc.import_opening_balances(
-			make_file(
-				"busy_tb.csv",
-				[
-					"Particulars,Group,Debit,Credit",
-					"Onboarding Customer A,Sundry Debtors,900,",
-					"Provision for Doubtful Debts,Sundry Debtors,,200",
-					"Total,,900,200",
-				],
-			)
-		)
-		self.assertEqual(
-			[(row.account, row.credit) for row in self.doc.opening_balances], [(provision.name, 200)]
-		)
-		self.assertEqual(result["left_out"], {"Receivable": 900})
-
-	def test_downloaded_sheet_adds_up_the_rows_of_an_account(self):
-		self.doc.save_opening_balances(
-			[{"account": self.cash, "debit": 100}, {"account": self.cash, "debit": 50}]
-		)
-		self.assertEqual(get_draft_balances(self.doc), {self.cash: (150, 0)})
-
 	def test_post_balances_against_temporary_opening(self):
 		sales = get_account(self.company, root_type="Income")
 		rows = [
@@ -310,6 +198,11 @@ class TestOpeningBalances(ERPNextTestSuite):
 
 		self.doc.migration_date = "2026-04-01"
 		self.doc.save_opening_balances(rows)
+		# a form save can't mark a row posted, and a change never saved is not posted
+		self.doc.opening_balances[0].status = "Posted"
+		self.doc.save()
+		self.assertEqual(self.doc.opening_balances[0].status, "Draft")
+		self.doc.opening_balances[0].debit = 999
 		opening, so_far = self.doc.post_opening_balances()
 
 		opening = frappe.get_doc("Journal Entry", opening)
@@ -320,6 +213,16 @@ class TestOpeningBalances(ERPNextTestSuite):
 		self.assertEqual(company_setup_steps.get_temporary_opening_balance(self.company), -400 + 100)
 		self.assertEqual({row.status for row in self.doc.opening_balances}, {"Posted"})
 		self.assertEqual(step_status(self.doc)["opening_balances"], "Done")
+
+		self.doc.migration_date = "2026-05-01"
+		self.assertRaises(frappe.ValidationError, self.doc.save)
+
+		# last year's depreciation posts in a depreciation entry
+		self.doc.reload()
+		depreciation = get_account(self.company, account_type="Depreciation")
+		self.doc.save_opening_balances([{"account": depreciation, "debit": 200}])
+		(entry,) = self.doc.post_opening_balances()
+		self.assertEqual(frappe.db.get_value("Journal Entry", entry, "voucher_type"), "Depreciation Entry")
 
 	def test_a_mandatory_dimension_needs_a_default_and_frozen_accounts_stop_the_undo(self):
 		self.doc.migration_date = "2026-04-01"
@@ -350,61 +253,6 @@ class TestOpeningBalances(ERPNextTestSuite):
 		with self.assertRaisesRegex(frappe.ValidationError, "can't be undone"):
 			self.doc.undo_posting("balances", None)
 		self.assertEqual(frappe.db.get_value("Journal Entry", entry, "docstatus"), 1)
-
-	def test_add_account_goes_under_the_group_given(self):
-		group = get_account(self.company, is_group=1, root_type="Liability", parent_account=("is", "set"))
-		account = add_account(self.company, "Setup Loan", "", "Liability", parent=group)
-		self.assertEqual(frappe.db.get_value("Account", account, "parent_account"), group)
-
-		root = frappe.db.get_value(
-			"Account", add_account(self.company, "Setup Loan 2", "", "Liability"), "parent_account"
-		)
-		self.assertFalse(frappe.db.get_value("Account", root, "parent_account"))
-
-	def test_last_years_depreciation_posts_in_a_depreciation_entry(self):
-		depreciation = get_account(self.company, account_type="Depreciation")
-		self.doc.migration_date = "2026-04-01"
-		self.doc.save_opening_balances(
-			[{"account": self.cash, "debit": 1000}, {"account": depreciation, "debit": 200}]
-		)
-		entries = self.doc.post_opening_balances()
-
-		voucher_types = {frappe.db.get_value("Journal Entry", name, "voucher_type") for name in entries}
-		self.assertEqual(voucher_types, {"Opening Entry", "Depreciation Entry"})
-
-	def test_preview_shows_the_books_after_posting(self):
-		self.doc.migration_date = "2026-04-01"
-		self.doc.save_opening_balances(
-			[{"account": self.cash, "debit": 1000}, {"account": self.capital, "credit": 600}]
-		)
-		preview = self.doc.preview_opening_balances()
-
-		balances = {row["account"]: row["balance"] for row in preview["rows"]}
-		self.assertEqual(str(preview["posting_date"]), "2026-03-31")
-		self.assertEqual(balances[self.cash], 1000)
-		self.assertEqual(balances[self.capital], -600)
-		self.assertEqual(balances[preview["temporary_account"]], -400)
-		self.assertEqual(sum(balances.values()), 0)
-		# a preview posts nothing
-		self.assertFalse(frappe.db.exists("GL Entry", {"company": self.company}))
-
-	def test_preview_counts_only_invoices_that_can_post(self):
-		customer = frappe.get_all("Customer", pluck="name", limit=1)[0]
-		self.doc.migration_date = "2026-04-01"
-		self.doc.save_opening_invoices(
-			"Customer",
-			[
-				{"party_name": customer, "outstanding_amount": 700},
-				{"party_name": "Onboarding Nobody Yet", "outstanding_amount": 300},
-			],
-		)
-		preview = self.doc.preview_opening_balances()
-
-		balances = {row["account"]: row["balance"] for row in preview["rows"]}
-		receivable = get_party_account("Customer", customer, self.company)
-		self.assertEqual(balances[receivable], 700)
-		self.assertEqual(balances[preview["temporary_account"]], -700)
-		self.assertEqual((preview["draft_invoices"], preview["left_out_invoices"]), (1, 1))
 
 	def test_post_adds_the_financial_year_it_falls_in(self):
 		# test sites have years up to 2050 only

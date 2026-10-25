@@ -2,6 +2,7 @@
 # See license.txt
 
 import frappe
+from frappe.utils import getdate
 
 from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
@@ -88,6 +89,13 @@ class TestOpenOrders(ERPNextTestSuite):
 		)
 		# nothing posted to the books
 		self.assertFalse(frappe.db.exists("GL Entry", {"voucher_no": name}))
+		# made rows stay when a form save leaves them out
+		doc = frappe.get_doc("Company Setup", self.company)
+		doc.open_orders = []
+		doc.save()
+		doc.reload()
+		self.assertEqual({(row.status, row.document) for row in doc.open_orders}, {("Made", name)})
+		self.doc.reload()
 		self.doc.undo_open_orders("Sales Order", "open_sales_orders.csv")
 		self.assertFalse(frappe.db.exists("Sales Order", name))
 		self.doc.reload()
@@ -97,6 +105,10 @@ class TestOpenOrders(ERPNextTestSuite):
 		self.doc.save_open_orders(
 			"Work Order",
 			[{"item_name": self.fabric, "qty": 40, "wip_warehouse": self.wip}],
+		)
+		# the sheet gives no BOM: the row shows the item's default one
+		self.assertEqual(
+			[row.bom for row in self.doc.open_orders if row.order_type == "Work Order"], [self.bom]
 		)
 		[name] = self.doc.make_open_orders("Work Order")
 		order = frappe.get_doc("Work Order", name)
@@ -137,6 +149,8 @@ class TestOpenOrders(ERPNextTestSuite):
 					"party_name": "_Test Setup Velan",
 					"item_name": self.dyed,
 					"qty": 12,
+					"rate": 85,
+					"order_date": "2026-03-12",
 					"service_item": "_Test Setup Dyeing",
 				}
 			],
@@ -153,6 +167,14 @@ class TestOpenOrders(ERPNextTestSuite):
 				order.items[0].qty,
 			),
 			(1, "_Test Setup Velan", velan, self.dyed, 12),
+		)
+		# the order keeps its rate and date
+		self.assertEqual(
+			frappe.db.get_value("Purchase Order", order.purchase_order, "transaction_date"),
+			getdate("2026-03-12"),
+		)
+		self.assertEqual(
+			frappe.db.get_value("Purchase Order Item", {"parent": order.purchase_order}, "rate"), 85
 		)
 		self.doc.reload()
 		self.doc.undo_open_orders("Subcontracting Order", "open_subcontracting_orders.xlsx")

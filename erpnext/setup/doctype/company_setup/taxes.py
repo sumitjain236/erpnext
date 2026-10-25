@@ -81,7 +81,7 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 	own |= {(row.tax_type, row.template) for row in existing}
 	saved = get_templates(onboarding.tax_templates) | get_templates(existing)
 	templates = {}
-	for row in rows:
+	for number, row in enumerate(rows, 1):
 		row = frappe._dict(row)
 		title = " ".join(cstr(row.title).split())
 		has_rate = row.rate not in (None, "")
@@ -98,10 +98,15 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 				),
 				title=_("Name missing"),
 			)
+		if not row.account:
+			frappe.throw(
+				_("Pick a tax account for {0} (row {1}).").format(frappe.bold(title), number),
+				title=_("Tax account missing"),
+			)
 		if row.account not in accounts:
 			frappe.throw(
 				_("{0} is not a tax account of {1}. Pick an account of type Tax.").format(
-					frappe.bold(row.account or title), onboarding.company
+					frappe.bold(row.account), onboarding.company
 				),
 				title=_("Not a tax account"),
 			)

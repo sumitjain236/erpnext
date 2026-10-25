@@ -10,10 +10,8 @@ import {
 	plural,
 	short_account,
 	source_name,
-	upload_sheet,
 } from "./common";
 import { PARTY } from "./overview";
-import { show_opening_invoices } from "./invoices";
 
 export function make_opening_invoice_stats(frm, party_type, state, currency) {
 	const hand = state.names.filter((name) => name.kind === "hand_posted").length;
@@ -55,31 +53,6 @@ export function make_opening_invoice_stats(frm, party_type, state, currency) {
 				: __("All ready"),
 		}),
 	];
-}
-
-export function upload_opening_invoices(frm, party_type, dialog) {
-	const drafts = (dialog.fields_dict.invoices.df.data || []).filter(
-		(row) => row.party_name || flt(row.outstanding_amount)
-	).length;
-	upload_sheet(
-		frm,
-		"import_opening_invoices",
-		{ party_type: party_type },
-		{
-			replaces:
-				drafts &&
-				(party_type === "Customer"
-					? __(
-							"The sheet replaces the {0} in this table, unsaved changes included. Posted invoices stay as they are. Continue?",
-							[count_invoices(drafts, party_type)]
-					  )
-					: __(
-							"The sheet replaces the {0} in this table, unsaved changes included. Posted bills stay as they are. Continue?",
-							[count_invoices(drafts, party_type)]
-					  )),
-			after: (result) => show_opening_invoices(frm, party_type, result, dialog),
-		}
-	);
 }
 
 // Ask before posting, saying what is posted and what stays a draft, then post and say how it went

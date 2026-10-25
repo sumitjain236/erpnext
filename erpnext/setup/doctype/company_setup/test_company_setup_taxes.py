@@ -3,6 +3,7 @@
 
 import frappe
 
+from erpnext.controllers.accounts_controller import get_default_taxes_and_charges
 from erpnext.setup.doctype.company_setup.opening_invoices import add_account
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	ERPNEXT_STEPS,
@@ -33,7 +34,12 @@ class TestTaxes(ERPNextTestSuite):
 		frappe.set_user("Administrator")
 		super().tearDown()
 
-	def test_save_makes_the_tax_templates_and_no_rows_is_done_too(self):
+	def get_default(self) -> str | None:
+		return get_default_taxes_and_charges("Sales Taxes and Charges Template", company=self.company)[
+			"taxes_and_charges"
+		]
+
+	def test_save_makes_the_tax_templates_and_removed_rows_turn_theirs_off(self):
 		key = step_key(get_setup(self.company), "taxes")
 		self.assertEqual(step_status(get_setup(self.company))["taxes"], "Not Started")
 		cash = get_account(self.company, account_type="Cash")
@@ -43,6 +49,15 @@ class TestTaxes(ERPNextTestSuite):
 			self.doc.save_taxes,
 			[{"tax_type": "Sales", "title": "Wrong", "account": cash, "rate": 5}],
 		)
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			"Pick a tax account for <strong>IGST 18%</strong> \\(row 2\\)",
+			self.doc.save_taxes,
+			[
+				{"tax_type": "Sales", "title": "CA Sales Tax", "account": self.sales_tax, "rate": 7.25},
+				{"tax_type": "Sales", "title": "IGST 18%", "account": None, "rate": 18},
+			],
+		)
 		self.doc.save_taxes(
 			[
 				{"tax_type": "Sales", "title": "CA Sales Tax", "account": self.sales_tax, "rate": 7.25},
@@ -50,7 +65,9 @@ class TestTaxes(ERPNextTestSuite):
 			],
 			{"Sales": "CA Sales Tax"},
 		)
-		sales = frappe.get_doc("Sales Taxes and Charges Template", self.doc.tax_templates[0].template)
+		template = self.doc.tax_templates[0].template
+		self.assertEqual(self.get_default(), template)
+		sales = frappe.get_doc("Sales Taxes and Charges Template", template)
 		self.assertEqual(
 			(sales.company, sales.is_default, sales.taxes[0].account_head, sales.taxes[0].rate),
 			(self.company, 1, self.sales_tax, 7.25),
@@ -80,6 +97,33 @@ class TestTaxes(ERPNextTestSuite):
 		self.assertEqual(
 			(step_status(doc)["taxes"], doc.get_onload().steps[key]["summary"]), ("Done", "No taxes charged")
 		)
+		# so new invoices get no tax
+		self.assertIsNone(self.get_default())
+		self.assertEqual(frappe.db.get_value("Sales Taxes and Charges Template", template, "disabled"), 1)
+
+		# renamed: the new template is the default, the old one stays off
+		row = {"tax_type": "Sales", "title": "CA Sales Tax", "account": self.sales_tax, "rate": 7.25}
+		self.doc.save_taxes([row], {"Sales": "CA Sales Tax"})
+		self.doc.save_taxes([row | {"title": "California Tax"}], {"Sales": "California Tax"})
+		renamed = self.doc.tax_templates[0].template
+		self.assertEqual(self.get_default(), renamed)
+		self.assertEqual(
+			frappe.db.get_value("Sales Taxes and Charges Template", template, ["disabled", "is_default"]),
+			(1, 0),
+		)
+
+		# saved again unchanged: a line added in ERPNext stays
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc("Sales Taxes and Charges Template", renamed)
+		doc.append(
+			"taxes",
+			{"charge_type": "On Net Total", "account_head": self.input_tax, "rate": 1, "description": "Levy"},
+		)
+		doc.save()
+		frappe.set_user("onboarding.accounts@example.com")
+		self.doc.save_taxes([row | {"title": "California Tax"}])
+		self.assertEqual(len(frappe.get_doc("Sales Taxes and Charges Template", renamed).taxes), 2)
+
 		# a compliance app takes its place
 		self.assertEqual(
 			step_names(app_one=[{"step": "app_one.steps.gst", "replaces": "taxes"}]),

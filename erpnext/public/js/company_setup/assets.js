@@ -39,10 +39,8 @@ const ASSET_FIELDS = [
 ];
 
 // result: what an upload just did, said at the top of the window
-export function show_fixed_assets(frm, result, replacing) {
-	get_data(frm, "get_fixed_assets").then((r) =>
-		new FixedAssetsWindow(frm, r.message, result).show(replacing)
-	);
+export function show_fixed_assets(frm, result) {
+	get_data(frm, "get_fixed_assets").then((r) => new FixedAssetsWindow(frm, r.message, result).show());
 }
 
 class FixedAssetsWindow extends SheetWindow {
@@ -50,7 +48,6 @@ class FixedAssetsWindow extends SheetWindow {
 		const drafts = (frm.doc.fixed_assets || []).filter((row) => row.status !== "Posted");
 		super(frm, {
 			title: __("Fixed assets"),
-			open: (result, replacing) => show_fixed_assets(frm, result, replacing),
 			save_method: "save_fixed_assets",
 			get_method: "get_fixed_assets",
 			where: "fixed_assets",

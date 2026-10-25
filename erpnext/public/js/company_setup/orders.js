@@ -170,9 +170,9 @@ export function count_orders(order_type, count) {
 		: plural(count, __("1 order"), __("{0} orders", [count]));
 }
 
-export function show_open_orders(frm, order_type, result, replacing) {
+export function show_open_orders(frm, order_type, result) {
 	get_data(frm, "get_open_orders", { order_type: order_type }).then((r) =>
-		new OpenOrdersWindow(frm, order_type, r.message, result).show(replacing)
+		new OpenOrdersWindow(frm, order_type, r.message, result).show()
 	);
 }
 
@@ -372,7 +372,6 @@ class OpenOrdersWindow extends SheetWindow {
 			title: text.title,
 			where: where,
 			has_data: order_rows(frm, order_type, false).length,
-			open: (result, replacing) => show_open_orders(frm, order_type, result, replacing),
 			save_method: "save_open_orders",
 			get_method: "get_open_orders",
 			args: { order_type: order_type },

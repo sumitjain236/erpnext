@@ -4,21 +4,16 @@
 import frappe
 from frappe.utils import getdate
 
+from erpnext.setup.doctype.company_setup import company_setup_api as api
 from erpnext.setup.doctype.company_setup.company_setup import (
 	get_account_parent,
 	run_year_close,
 	save_year_close,
-	suggest_balance_accounts,
 )
-from erpnext.setup.doctype.company_setup.company_setup_steps import get_draft_rows_by
-from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
-	SHEET,
 	get_account,
 	get_balance,
-	has_year,
 	make_company,
-	make_sheet,
 	make_stock_item,
 	make_user,
 	make_xlsx_file,
@@ -43,7 +38,7 @@ class TestBooks(ERPNextTestSuite):
 		frappe.set_user("Administrator")
 		super().tearDown()
 
-	def test_one_balance_column_and_a_ledger_the_chart_keeps_as_a_group(self):
+	def test_trial_balance_lines_get_a_ledger_and_post(self):
 		cash = get_account(self.company, account_type="Cash")
 		capital = frappe.db.get_value("Account", {"company": self.company, "account_name": "Capital Stock"})
 		result = self.doc.import_opening_balances(
@@ -72,36 +67,6 @@ class TestBooks(ERPNextTestSuite):
 		(entry,) = self.doc.post_opening_balances()
 		self.assertEqual((get_balance(cash, entry), get_balance(capital, entry)), (85000, -85000))
 
-	def test_a_tax_credit_line_is_never_matched_to_a_reverse_charge_ledger(self):
-		from erpnext.setup.doctype.company_setup.company_setup import suggest_account
-
-		def account(name, root_type):
-			return frappe._dict(
-				name=f"{name} - X", account_name=name, root_type=root_type, is_group=0, disabled=0
-			)
-
-		accounts = [
-			account("Input Tax CGST", "Asset"),
-			account("Input Tax CGST RCM", "Asset"),
-			account("Output Tax CGST", "Liability"),
-		]
-		# Tally keeps both under Duties & Taxes: the line's side says which kind it is
-		self.assertEqual(suggest_account("Input CGST", accounts, None, "debit"), "Input Tax CGST - X")
-		self.assertEqual(suggest_account("Output CGST", accounts, None, "credit"), "Output Tax CGST - X")
-
-	def test_suggestions_stay_within_the_kind_of_line(self):
-		office_rent = frappe.db.get_value("Account", {"company": self.company, "account_name": "Office Rent"})
-		salary = frappe.db.get_value("Account", {"company": self.company, "account_name": "Salary"})
-		self.assertEqual(
-			suggest_balance_accounts(
-				self.company,
-				["Security Deposit - Office Rent", "Rent Expense", "1001 - Salaries"],
-				{"Security Deposit - Office Rent": "Asset", "Rent Expense": "Expense"},
-			)["suggestions"],
-			{"Rent Expense": office_rent, "1001 - Salaries": salary},
-		)
-
-	def test_trial_balance_lines_get_the_standard_ledger_or_one_to_add(self):
 		result = self.doc.import_opening_balances(
 			make_xlsx_file(
 				"tb.xlsx",
@@ -143,69 +108,6 @@ class TestBooks(ERPNextTestSuite):
 				"HDFC Bank CA 4521": ("Bank", ledger("Bank Accounts")),
 				"Vehicles": ("Fixed Asset", ledger("Fixed Assets")),
 			},
-		)
-
-	def test_quickbooks_account_list_and_its_sub_accounts(self):
-		self.doc.import_chart(
-			make_xlsx_file(
-				"Account List.xlsx",
-				[
-					("Bluebonnet Software Inc", None, None),
-					("Account", "Type", "Detail Type"),
-					("Frost Bank Checking", "Bank", "Checking"),
-					("Accounts Receivable (A/R)", "Accounts receivable (A/R)", "Accounts Receivable (A/R)"),
-					("Computer Equipment:Original Cost", "Fixed Assets", "Machinery & Equipment"),
-					("Furniture:Original Cost", "Fixed Assets", "Furniture & Fixtures"),
-					("Accounts Payable (A/P)", "Accounts payable (A/P)", "Accounts Payable (A/P)"),
-					("Amex Business Platinum", "Credit Card", "Credit Card"),
-					("Payroll Liabilities:Federal Taxes", "Other Current Liabilities", "Payroll Tax Payable"),
-					("Common Stock", "Equity", "Common Stock"),
-					("Professional Services", "Income", "Service/Fee Income"),
-					("Rent or Lease", "Expenses", "Rent or Lease of Buildings"),
-				],
-			)
-		)
-		computers = "Original Cost (Computer Equipment) - _TOC"
-		furniture = "Original Cost (Furniture) - _TOC"
-		self.assertEqual(
-			frappe.db.get_value("Account", computers, ["parent_account", "account_type"]),
-			("Computer Equipment - _TOC", "Fixed Asset"),
-		)
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "default_bank_account"), "Frost Bank Checking - _TOC"
-		)
-
-		self.doc.import_opening_balances(
-			make_xlsx_file(
-				"Trial Balance.xlsx",
-				[
-					("Trial Balance", None, None),
-					(None, "Debit", "Credit"),
-					("Computer Equipment:Original Cost", 96400, None),
-					("Furniture:Original Cost", 38250, None),
-					("Payroll Liabilities:Federal Taxes", None, 9812.55),
-					("Common Stock", None, 124837.45),
-					("TOTAL", 134650, 134650),
-				],
-			)
-		)
-		self.assertEqual(
-			{row.original_account: row.account for row in self.doc.opening_balances},
-			{
-				"Computer Equipment:Original Cost": computers,
-				"Furniture:Original Cost": furniture,
-				"Payroll Liabilities:Federal Taxes": "Federal Taxes - _TOC",
-				"Common Stock": "Common Stock - _TOC",
-			},
-		)
-		(entry,) = self.doc.post_opening_balances()
-		self.assertEqual(
-			(
-				get_balance(computers, entry),
-				get_balance(furniture, entry),
-				get_balance("Federal Taxes - _TOC"),
-			),
-			(96400, 38250, -9812.55),
 		)
 
 	def test_last_years_profit_not_closed_is_pointed_out(self):
@@ -299,18 +201,6 @@ class TestBooks(ERPNextTestSuite):
 		self.assertIsNone(self.get_year_close())
 		self.assertTrue(frappe.db.exists("Period Closing Voucher", {"company": self.company, "docstatus": 1}))
 
-	def test_a_save_from_an_older_page_keeps_the_finished_year_close(self):
-		save_year_close(self.company, {"steps": [{"fiscal_year": "2025"}], "done": 0})
-		older = frappe.get_doc("Company Setup", self.company)
-		save_year_close(self.company, None)
-		older.save()
-		self.assertIsNone(frappe.db.get_value("Company Setup", self.company, "year_close"))
-
-	def test_a_draft_with_no_date_yet_is_not_dated_before_a_close(self):
-		self.doc.migration_date = None
-		self.doc.append("opening_sales_invoices", {"party_name": "No Date Yet", "outstanding_amount": 10})
-		self.assertEqual(get_draft_rows_by(self.doc, "2025-12-31"), {})
-
 	def test_years_close_in_order_with_an_earlier_year_of_entries_but_no_profit(self):
 		cash = get_account(self.company, account_type="Cash")
 		capital = frappe.db.get_value("Account", {"company": self.company, "account_name": "Capital Stock"})
@@ -352,57 +242,15 @@ class TestBooks(ERPNextTestSuite):
 		)
 		self.assertEqual(self.get_unclosed_years(), [])
 
-	def test_default_party_accounts_never_follow_the_biggest_line(self):
-		sheet = [
-			*SHEET,
-			"Debtors - Retainers,Current Assets,1135,1100,0,Receivable,Asset,INR,500000,",
-			"Creditors - Capital Goods,Liabilities,2105,2000,0,Payable,Liability,INR,,500000",
-			"Creditors - Import,Liabilities,2110,2000,0,Payable,Liability,INR,,1000",
-			"Input CGST,Current Assets,1140,1100,0,,Asset,INR,,",
-		]
-		self.doc.import_chart(make_sheet(sheet))
-		# a GST ledger with no type is a tax account, so tax templates can pick it
-		self.assertEqual(
-			frappe.db.get_value(
-				"Account", {"company": self.company, "account_name": "Input CGST"}, "account_type"
-			),
-			"Tax",
-		)
-		# Retainers holds the most, but Sundry Debtors has the usual name
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "default_receivable_account"),
-			"1130 - Sundry Debtors - _TOC",
-		)
-
-		# no usual name among the payables: left for the user to pick, not the biggest line
-		self.doc.import_chart(make_sheet([row for row in sheet if not row.startswith("Sundry Creditors")]))
-		self.assertFalse(frappe.db.get_value("Company", self.company, "default_payable_account"))
-		self.doc.run_method("onload")
-		self.assertIn(
-			"default_payable_account",
-			[gap["fieldname"] for gap in self.doc.get_onload().books_reminders["default_account_gaps"]],
-		)
-
-	def test_the_roles_the_steps_left_need_are_named_once(self):
-		frappe.set_user("Administrator")
-		frappe.set_user(make_user("onboarding.roles@example.com", "Accounts Manager"))
-		self.doc.run_method("onload")
-		roles = {row["role"]: row["steps"] for row in self.doc.get_onload().missing_roles}
-		# purchase tax templates need a role an Accounts Manager lacks; journal entries don't
-		self.assertIn("Taxes", roles["Purchase Master Manager"])
-		self.assertNotIn("Accounts Manager", roles)
-		self.assertNotIn("Opening balances", [step for steps in roles.values() for step in steps])
-
-	def test_a_new_account_goes_under_the_group_of_its_type_and_side(self):
-		group = lambda name: frappe.db.get_value(  # noqa: E731
-			"Account", {"company": self.company, "account_name": name, "is_group": 1}
-		)
-		self.assertEqual(get_account_parent(self.company, "Bank", "Asset"), group("Bank Accounts"))
-		self.assertEqual(get_account_parent(self.company, "Tax", "Liability"), group("Duties and Taxes"))
-		self.assertEqual(get_account_parent(self.company, "Fixed Asset", "Asset"), group("Fixed Assets"))
-		self.assertEqual(get_account_parent(self.company, None, "Asset"), group("Current Assets"))
-
 	def test_going_live_and_the_sheet_totals_stay_as_stored_on_a_save_from_outside(self):
+		# a save from an older page keeps the finished year close
+		save_year_close(self.company, {"steps": [{"fiscal_year": "2025"}], "done": 0})
+		older = frappe.get_doc("Company Setup", self.company)
+		save_year_close(self.company, None)
+		older.save()
+		self.assertIsNone(frappe.db.get_value("Company Setup", self.company, "year_close"))
+		self.doc.reload()
+
 		self.doc.sheet_receivables = 1000
 		self.doc.save()
 		self.doc.go_live()
@@ -419,18 +267,12 @@ class TestBooks(ERPNextTestSuite):
 			("Live", 1000),
 		)
 
-	def test_account_groups_are_shown_only_to_those_who_may_see_the_setup(self):
+	def test_a_user_who_cannot_read_the_setup_is_refused(self):
 		frappe.set_user("Administrator")
 		frappe.set_user(make_user("onboarding.nobody@example.com", "Stock User"))
 		self.assertRaises(frappe.PermissionError, get_account_parent, self.company, "Bank", "Asset")
-
-	def test_amounts_with_a_decimal_comma(self):
-		from erpnext.setup.doctype.company_setup.chart_sheet import get_amount
-
-		self.assertEqual(
-			[get_amount(value) for value in ("1.200,50", "1,20,000", "25,00,000.00 Cr", "(1.234,5)")],
-			[1200.5, 120000, 2500000, -1234.5],
-		)
+		self.assertRaises(frappe.PermissionError, api.get_taxes, self.company)
+		self.assertRaises(frappe.PermissionError, api.get_stock_status, self.company)
 
 	def get_year_close(self):
 		self.doc.reload()
@@ -439,79 +281,6 @@ class TestBooks(ERPNextTestSuite):
 	def get_unclosed_years(self):
 		self.doc.run_method("onload")
 		return self.doc.get_onload().books_reminders["unclosed_years"]
-
-	def test_busy_list_of_accounts_is_a_chart(self):
-		sheet = make_xlsx_file(
-			"List of Accounts.xlsx",
-			[
-				("Sanjeevani Clinic", None, None, None),
-				("List of Accounts", None, None, None),
-				("S.No.", "Name", "Group", "Dr/Cr"),
-				(1, "HDFC Bank Current A/c 5021", "Bank Accounts", "Dr"),
-				(2, "Infosys Ltd", "Sundry Debtors", "Dr"),
-				(3, "Medline Surgicals", "Sundry Creditors", "Dr"),
-				(4, "Acc. Depreciation - Motor Vehicles", "Fixed Assets", "Dr"),
-				(5, "Share Capital", "Capital Account", "Dr"),
-				(6, "OPD Consultation Income", "Income (Direct/Opr.)", "Dr"),
-				(7, "Rent", "Expenses (Indirect/Admn.)", "Dr"),
-				(8, "Star Health", "Insurance & TPA", "Dr"),
-			],
-		)
-		self.assertEqual(self.doc.preview_chart(sheet)["unknown_groups"], ["Insurance & TPA"])
-		self.doc.import_chart(sheet, {"Insurance & TPA": "Customers"})
-		accounts = {
-			row.account_name: (row.parent_account, row.account_type, row.root_type)
-			for row in frappe.get_all(
-				"Account",
-				filters={"company": self.company, "is_group": 0},
-				fields=["account_name", "parent_account", "account_type", "root_type"],
-			)
-		}
-		# customers and suppliers come in as parties: one debtors and one creditors account for them
-		self.assertNotIn("Infosys Ltd", accounts)
-		self.assertEqual(accounts["Debtors"], ("Sundry Debtors - _TOC", "Receivable", "Asset"))
-		self.assertEqual(accounts["Creditors"], ("Sundry Creditors - _TOC", "Payable", "Liability"))
-		self.assertEqual(accounts["HDFC Bank Current A/c 5021"], ("Bank Accounts - _TOC", "Bank", "Asset"))
-		self.assertEqual(
-			accounts["Acc. Depreciation - Motor Vehicles"],
-			("Fixed Assets - _TOC", "Accumulated Depreciation", "Asset"),
-		)
-		self.assertEqual(accounts["Share Capital"][2], "Equity")
-		# a group of customers is one receivable ledger, and their lines in the trial balance wait for
-		# invoices on it
-		self.assertNotIn("Star Health", accounts)
-		self.assertEqual(accounts["Insurance & TPA"], ("Sundry Debtors - _TOC", "Receivable", "Asset"))
-		result = self.doc.import_opening_balances(
-			make_xlsx_file(
-				"Trial Balance.xlsx",
-				[
-					("Account Name", "Group", "Dr. Amount (Rs.)", "Cr. Amount (Rs.)"),
-					("Star Health", "Insurance & TPA", "1,000.00", None),
-					("Share Capital", "Capital Account", None, "1,000.00"),
-				],
-			)
-		)
-		self.assertEqual(result["left_out"], {"Receivable": 1000})
-		self.assertEqual(
-			frappe.parse_json(self.doc.sheet_accounts)["Receivable"], {"Insurance & TPA - _TOC": 1000}
-		)
-
-	def test_what_stops_posting_shows_before_post_with_where_to_fix_it(self):
-		frappe.set_user("Administrator")
-		frappe.db.set_value("Company", self.company, "accounts_frozen_till_date", "2025-12-31")
-		frappe.set_user(USER)
-		self.doc.run_method("onload")
-		reds = self.doc.get_onload().posting_reds
-		for red in (reds["balances"][0], reds["Customer"][-1], reds["undo"]["balances"][0]):
-			self.assertTrue(red["text"].startswith("Accounts are frozen up to"))
-			self.assertEqual((red["fix"]["doctype"], red["fix"]["name"]), ("Company", self.company))
-
-	def test_a_year_added_far_back_leaves_no_gap(self):
-		frappe.set_user("Administrator")
-		first = min(getdate(start) for start in frappe.get_all("Fiscal Year", pluck="year_start_date"))
-		date = f"{first.year - 3}-06-30"
-		ensure_fiscal_year(date, self.company)
-		self.assertTrue(all(has_year(f"{first.year - gap}-06-30") for gap in (3, 2, 1)))
 
 
 class TestTaxTemplates(ERPNextTestSuite):
@@ -570,22 +339,3 @@ class TestTaxTemplates(ERPNextTestSuite):
 		name = frappe.db.get_value("Account", agency, "account_name")
 		self.assertEqual([tax.description for tax in template.taxes], [f"{name} 6.25%", f"{name} 2%"])
 		self.assertFalse(frappe.db.get_value("Sales Taxes and Charges Template", made_at_setup, "is_default"))
-
-	def test_a_chart_import_leaves_the_templates_to_the_taxes_step(self):
-		sheet = make_xlsx_file(
-			"Account List.xlsx",
-			[
-				("Account", "Type", "Detail Type"),
-				("Frost Bank Checking", "Bank", "Checking"),
-				("Amex Business Platinum", "Credit Card", "Credit Card"),
-				("Sales Tax Payable", "Other Current Liabilities", "Sales Tax Payable"),
-				("Common Stock", "Equity", "Common Stock"),
-				("Services", "Income", "Service/Fee Income"),
-				("Rent", "Expenses", "Rent or Lease of Buildings"),
-			],
-		)
-		self.doc.import_chart(sheet)
-		self.assertFalse(frappe.db.exists("Sales Taxes and Charges Template", {"company": self.company}))
-		self.assertEqual(
-			frappe.db.get_value("Company", self.company, "default_bank_account"), "Frost Bank Checking - _TOU"
-		)

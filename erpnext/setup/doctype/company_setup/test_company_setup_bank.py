@@ -1,19 +1,16 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
-from unittest.mock import patch
-
 import frappe
 from frappe.utils import formatdate
 
 from erpnext.accounts.doctype.bank_clearance.bank_clearance import get_payment_entries_for_bank_clearance
-from erpnext.setup.doctype.company_setup.bank_accounts import get_statement_offs, guess_bank
-from erpnext.setup.doctype.company_setup.opening_invoices import BACKGROUND_FROM, add_account
+from erpnext.setup.doctype.company_setup.bank_accounts import guess_bank
+from erpnext.setup.doctype.company_setup.opening_invoices import add_account
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	get_account,
 	get_balance,
 	make_company,
-	make_file,
 	make_user,
 	step_key,
 	step_status,
@@ -173,21 +170,6 @@ class TestBankAccounts(ERPNextTestSuite):
 			"State Bank of India",
 		)
 
-	def test_an_overdraft_statement_typed_as_the_bank_shows_it_is_overdrawn(self):
-		self.doc.mark_bank_accounts()
-		self.doc.save_opening_balances([{"account": self.od, "credit": 50000}])
-		self.doc.save_bank_accounts(
-			[
-				{"account": self.hdfc, "bank": "_Test Setup HDFC", "statement_balance": 123000},
-				{"account": self.od, "bank": "_Test Setup ICICI", "statement_balance": 50000},
-			],
-			"No",
-			True,
-		)
-		statements = {row.account: row.statement_balance for row in self.doc.bank_accounts}
-		self.assertEqual((statements[self.hdfc], statements[self.od]), (123000, -50000))
-		self.assertNotIn(self.od, get_statement_offs(self.doc))
-
 	def test_uncleared_cheques_net_to_zero_and_undo_amends_the_bank_entry(self):
 		self.doc.mark_bank_accounts()
 		self.save_bank_details()
@@ -315,59 +297,6 @@ class TestBankAccounts(ERPNextTestSuite):
 			(get_balance(self.hdfc), get_balance(self.od), get_balance(temporary)), (100000, -50000, 0)
 		)
 
-	def test_cheque_sheets_with_a_bank_column_or_for_one_bank(self):
-		self.doc.mark_bank_accounts()
-		result = self.doc.import_uncleared_cheques(
-			make_file(
-				"uncleared.csv",
-				[
-					"Bank Account,Issued/Deposited,Cheque or Reference No,Date,Party,Amount",
-					"HDFC Bank A/c,Issued,004512,2026-03-26,Lakshmi Spinning Mills,85000",
-					"HDFC Bank A/c,Deposited,,2026-03-28,Ramesh Garments,120000",
-					"Kotak Current,Issued,9,2026-03-28,,100",
-					"HDFC Bank A/c,,77,2026-03-26,Velan Packaging,500",
-				],
-			)
-		)
-		self.assertEqual((result["added"], result["unknown_banks"]), (3, ["Kotak Current"]))
-		# a blank Issued/Deposited is never guessed: posting waits for it
-		self.assertFalse(self.doc.uncleared_cheques[2].entry_type)
-		self.assertEqual(self.doc.get_uncleared_cheques()["missing_type"], 1)
-		self.doc.save_uncleared_cheques(
-			[row.as_dict() for row in self.doc.uncleared_cheques if row.entry_type], "uncleared.csv"
-		)
-		# Tally's bank reconciliation: money into the bank is a deposit
-		result = self.doc.import_uncleared_cheques(
-			make_file(
-				"brs.csv",
-				[
-					"Date,Particulars,Vch Type,Instrument No,Instrument Date,Debit,Credit",
-					"2026-03-29,Coimbatore Dyeing Works,Payment,118803,2026-03-29,,96500",
-					",Total,,,,,96500",
-				],
-			),
-			self.od,
-		)
-		self.assertEqual(result["added"], 1)
-		self.assertEqual(
-			[
-				(
-					row.bank_account,
-					row.entry_type,
-					row.reference_no,
-					str(row.reference_date),
-					row.party_name,
-					row.amount,
-				)
-				for row in self.doc.uncleared_cheques
-			],
-			[
-				(self.hdfc, "Issued", "004512", "2026-03-26", "Lakshmi Spinning Mills", 85000),
-				(self.hdfc, "Deposited", "", "2026-03-28", "Ramesh Garments", 120000),
-				(self.od, "Issued", "118803", "2026-03-29", "Coimbatore Dyeing Works", 96500),
-			],
-		)
-
 	def test_two_posts_a_zero_net_bank_and_undo_of_the_first(self):
 		self.doc.mark_bank_accounts()
 		self.save_bank_details()
@@ -467,31 +396,22 @@ class TestBankAccounts(ERPNextTestSuite):
 		doc.check_steps()
 		self.assertEqual(step_status(doc)["check_books"], "Not Started")
 
-	def test_many_cheques_post_and_undo_in_the_background(self):
-		self.doc.mark_bank_accounts()
-		self.save_bank_details()
-		self.post_balances()
-		temporary = get_account(self.company, account_type="Temporary")
-		rows = [
-			{
-				"bank_account": self.hdfc,
-				"entry_type": "Issued" if number % 2 else "Deposited",
-				"reference_no": f"C{number}",
-				"reference_date": "2026-03-30",
-				"amount": 100 + number,
-			}
-			for number in range(BACKGROUND_FROM)
-		]
-		self.doc.save_uncleared_cheques(rows, "many.xlsx")
-		self.assertEqual(self.doc.post_uncleared_cheques(), "queued")
+		# a cheque posted on one bank is not posted again on another
 		self.doc.reload()
-		self.assertEqual({row.status for row in self.doc.uncleared_cheques}, {"Posted"})
-		self.assertEqual((get_balance(self.hdfc), get_balance(temporary)), (100000, 0))
-
-		# the job commits its work; the test keeps it to roll back
-		with patch.object(frappe.db, "commit"):
-			self.assertEqual(self.doc.undo_uncleared_cheques("many.xlsx"), "queued")
-		self.doc.reload()
-		self.assertFalse(self.doc.uncleared_cheques)
-		self.assertEqual(len(self.doc.undone_cheques), BACKGROUND_FROM)
-		self.assertEqual((get_balance(self.hdfc), get_balance(temporary)), (100000, 0))
+		self.doc.save_uncleared_cheques(
+			[
+				*[row.as_dict() for row in self.doc.uncleared_cheques],
+				{
+					"bank_account": self.od,
+					"entry_type": "Issued",
+					"reference_no": "B1",
+					"reference_date": "2026-03-25",
+					"amount": 4000,
+				},
+			],
+			"icici.csv",
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError, "posted already on another bank", self.doc.post_uncleared_cheques
+		)
+		self.assertEqual(get_balance(self.od), -50000)

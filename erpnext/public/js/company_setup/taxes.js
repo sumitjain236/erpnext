@@ -96,8 +96,6 @@ export function show_taxes(frm) {
 								? __("New invoices start with it. Leave empty for none.")
 								: __("New bills start with it. Leave empty for none."),
 						default: taxes.defaults?.[tax_type] || "",
-						// a section built with only hidden fields stays hidden
-						hidden: taxes.rows.some((row) => row.tax_type === tax_type) ? 0 : 1,
 					},
 				]),
 			],
@@ -145,6 +143,7 @@ export function show_taxes(frm) {
 				dialog.set_df_property(fieldname, "hidden", titles.length ? 0 : 1);
 				dialog.set_value(fieldname, titles.includes(value) ? value : "");
 			}
+			dialog.refresh_sections();
 			defaults_shown = true;
 		};
 		let defaults_shown = false;
