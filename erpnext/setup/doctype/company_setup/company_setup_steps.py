@@ -35,23 +35,33 @@ from erpnext.setup.doctype.company_setup.bank_accounts import (
 	cheque_words,
 	get_bank_match,
 	get_bank_status,
+	get_cheque_blocker,
+	get_cheque_checks,
 )
-from erpnext.setup.doctype.company_setup.fixed_assets import get_assets_status
-from erpnext.setup.doctype.company_setup.open_orders import get_boms_status, get_orders_status
+from erpnext.setup.doctype.company_setup.fixed_assets import get_asset_checks, get_assets_status
+from erpnext.setup.doctype.company_setup.open_orders import (
+	get_boms_status,
+	get_order_checks,
+	get_orders_status,
+)
 from erpnext.setup.doctype.company_setup.opening_invoices import (
 	TABLES,
 	count_text,
 	get_cached,
 	get_day_before,
 	get_hand_posted,
+	get_missing_default_account,
 	get_missing_fiscal_year,
+	get_posting_reds,
 	get_sheet_match,
 	normalize_account_name,
 	number,
 )
 from erpnext.setup.doctype.company_setup.opening_stock import (
 	get_items_status,
+	get_stock_checks,
 	get_stock_match,
+	get_stock_reds,
 	get_stock_status,
 	get_warehouses_status,
 )
@@ -299,6 +309,10 @@ def bank_accounts(onboarding) -> dict:
 		"done": done,
 		"started": bool(onboarding.bank_accounts or onboarding.uncleared_cheques) and not done,
 		"warnings": status.statement_off if onboarding.status != "Live" else [],
+		"blocker": status.drafts
+		and not status.posting
+		and onboarding.migration_date
+		and get_blocker_line([get_cheque_blocker(onboarding, get_cheque_checks(onboarding))]),
 		"has_lines": bool(status.accounts),
 		"tab": "accounts_tab",
 	}
@@ -463,9 +477,19 @@ def opening_invoices(onboarding, doctype: str, title: str, description: str, tab
 		"summary": text,
 		"done": done,
 		"started": bool(drafts or hand or totals.count) and not done,
+		"blocker": bool(drafts) and onboarding.migration_date and get_invoice_blocker(onboarding, doctype),
 		"tab": tab,
 		"required": has_party_lines(onboarding, "Customer" if doctype == "Sales Invoice" else "Supplier"),
 	}
+
+
+def get_invoice_blocker(onboarding, doctype: str) -> str | None:
+	party_type = "Customer" if doctype == "Sales Invoice" else "Supplier"
+	reds = get_posting_reds(
+		onboarding.company, get_day_before(onboarding), voucher_types=(doctype, "Journal Entry")
+	)
+	missing = get_missing_default_account(onboarding, party_type)
+	return get_blocker_line([missing, *(red["text"] for red in reds)])
 
 
 def has_party_lines(onboarding, party_type: str) -> bool:
@@ -592,9 +616,45 @@ def opening_stock(onboarding) -> dict:
 		"summary": summary,
 		"done": done,
 		"started": bool(status.drafts or status.posted) and not done,
+		"blocker": status.drafts
+		and not status.posting
+		and onboarding.migration_date
+		and get_stock_blocker_line(onboarding),
 		"tab": "stock_tab",
 		"required": needs_stock(onboarding),
 	}
+
+
+def get_stock_blocker_line(onboarding) -> str | None:
+	checks = get_cached(onboarding, "stock_checks", get_stock_checks)
+	missing = checks["reds"]
+	both = missing.missing_warehouses and missing.missing_items
+	texts = []
+	for red in get_stock_reds(checks):
+		if red["key"] == "no_drafts" or (both and red["key"] == "missing_items"):
+			continue
+		if both and red["key"] == "missing_warehouses":
+			texts.append(
+				_("{0} and {1} are not in ERPNext.").format(
+					count_text(len(missing.missing_warehouses), _("1 warehouse"), _("{0} warehouses")),
+					count_text(len(missing.missing_items), _("1 item"), _("{0} items")),
+				)
+			)
+		else:
+			texts.append(red["text"])
+	return get_blocker_line(texts)
+
+
+def get_blocker_line(texts: list) -> str | None:
+	"""The card's red line: the first reason the drafts can't be posted, its first sentence only
+	(the window says how to fix it), and how many reasons more."""
+	texts = [text for text in texts if text]
+	if not texts:
+		return None
+	line = _("Can't post yet: {0}").format(texts[0].split(". ")[0].rstrip("."))
+	if len(texts) > 1:
+		line += " · " + _("{0} more").format(len(texts) - 1)
+	return line
 
 
 def get_posted_cover(onboarding) -> float:
@@ -708,6 +768,12 @@ def fixed_assets(onboarding) -> dict:
 		"summary": summary,
 		"done": done,
 		"started": bool(status.drafts or status.posted) and not done,
+		"blocker": status.drafts
+		and not status.posting
+		and onboarding.migration_date
+		and get_blocker_line(
+			[red["text"] for red in get_asset_checks(onboarding)["reds"] if red["key"] != "empty"]
+		),
 		"tab": "assets_tab",
 		# money in the trial balance waits for this step: Go live points it out even when skipped
 		"has_lines": bool(status.line_total),
@@ -781,6 +847,9 @@ def open_orders(
 		"summary": summary,
 		"done": bool(status.orders) and not status.drafts,
 		"started": bool(status.drafts),
+		"blocker": status.drafts
+		and onboarding.migration_date
+		and get_blocker_line([red["text"] for red in get_order_checks(onboarding, order_type)["reds"]]),
 		"tab": tab,
 	}
 

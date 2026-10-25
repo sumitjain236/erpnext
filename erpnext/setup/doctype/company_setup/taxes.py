@@ -28,12 +28,19 @@ def get_taxes(onboarding) -> dict:
 	"""What the Taxes window shows: the saved rows, and the accounts it can pick."""
 	from erpnext.setup.doctype.company_setup.company_setup import get_account_parent
 
-	own = {row.template for row in onboarding.tax_templates if row.template}
+	# before the first save, the templates already in ERPNext, as rows to review
+	rows = (
+		onboarding.tax_templates
+		if onboarding.taxes_saved or onboarding.tax_templates
+		else get_existing_rows(onboarding.company)
+	)
+	own = {row.template for row in rows if row.template}
 	return {
 		"rows": [
 			{field: row.get(field) for field in ("tax_type", "title", "account", "rate", "template")}
-			for row in onboarding.tax_templates
+			for row in rows
 		],
+		"from_existing": bool(rows) and not onboarding.tax_templates,
 		"accounts": get_tax_accounts(onboarding.company),
 		"saved": onboarding.taxes_saved,
 		# the title of this step's default template of each type
@@ -66,7 +73,11 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 	and the step is done too. defaults: the title to make the default, by Sales or Purchase."""
 	accounts = set(get_tax_accounts(onboarding.company))
 	own = {(row.tax_type, row.template) for row in onboarding.tax_templates if row.template}
-	saved = get_templates(onboarding.tax_templates)
+	# templates already in ERPNext that the window showed: kept as they are unless their lines change
+	shown = [frappe._dict(row).template for row in rows if frappe._dict(row).get("template")]
+	existing = get_existing_rows(onboarding.company, shown) if shown else []
+	own |= {(row.tax_type, row.template) for row in existing}
+	saved = get_templates(onboarding.tax_templates) | get_templates(existing)
 	templates = {}
 	for row in rows:
 		row = frappe._dict(row)
@@ -127,6 +138,36 @@ def save_taxes(onboarding, rows: list[dict], defaults: dict | None = None):
 	for tax_type in TEMPLATE_DOCTYPES:
 		set_default_template(onboarding, tax_type, (defaults or {}).get(tax_type))
 	onboarding.taxes_saved = 1
+
+
+def get_existing_rows(company: str, names: list[str] | None = None) -> list[frappe._dict]:
+	"""The tax lines of the company's enabled templates, as rows of this step."""
+	rows = []
+	for tax_type, doctype in TEMPLATE_DOCTYPES.items():
+		filters = {"company": company, "disabled": 0}
+		if names is not None:
+			filters["name"] = ("in", names or [""])
+		templates = frappe.get_all(doctype, filters=filters, fields=["name", "title"], order_by="title")
+		lines = frappe.get_all(
+			"Sales Taxes and Charges" if tax_type == "Sales" else "Purchase Taxes and Charges",
+			filters={"parenttype": doctype, "parent": ("in", [t.name for t in templates] or [""])},
+			fields=["parent", "account_head", "rate"]
+			+ (["add_deduct_tax"] if tax_type == "Purchase" else []),
+			order_by="idx",
+		)
+		for template in templates:
+			rows.extend(
+				frappe._dict(
+					tax_type=tax_type,
+					title=template.title,
+					account=line.account_head,
+					rate=-line.rate if line.get("add_deduct_tax") == "Deduct" else line.rate,
+					template=template.name,
+				)
+				for line in lines
+				if line.parent == template.name
+			)
+	return rows
 
 
 def get_templates(rows: list) -> dict[tuple, str]:

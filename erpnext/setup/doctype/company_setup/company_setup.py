@@ -194,18 +194,33 @@ class CompanySetup(Document):
 			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
 		]
 		asset_categories: DF.Table[CompanySetupAssetCategory]
+		assets_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		bank_accounts: DF.Table[CompanySetupBankAccount]
+		boms_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		chart_of_accounts_source: DF.Literal["", "Existing", "Imported"]
+		cheques_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		company: DF.Link
 		depreciation_booked: DF.Literal["", "Every month", "Only at year end"]
 		fixed_assets: DF.Table[CompanySetupFixedAsset]
 		has_uncleared_cheques: DF.Literal["", "No", "Yes"]
+		job_work_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		migration_date: DF.Date | None
 		open_orders: DF.Table[CompanySetupOpenOrder]
 		opening_balances: DF.Table[CompanySetupOpeningBalance]
 		opening_purchase_invoices: DF.Table[CompanySetupOpeningInvoice]
 		opening_sales_invoices: DF.Table[CompanySetupOpeningInvoice]
 		opening_stock: DF.Table[CompanySetupOpeningStock]
+		orders_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		payables_source: DF.Literal[
 			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
 		]
@@ -221,6 +236,9 @@ class CompanySetup(Document):
 		stock_difference: DF.JSON | None
 		stock_difference_entry: DF.Link | None
 		stock_like_kept: DF.JSON | None
+		stock_source: DF.Literal[
+			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
+		]
 		tax_templates: DF.Table[CompanySetupTaxTemplate]
 		taxes_saved: DF.Check
 		uncleared_cheques: DF.Table[CompanySetupUnclearedCheque]
@@ -248,6 +266,7 @@ class CompanySetup(Document):
 					"description": step["description"],
 					"summary": step.get("summary"),
 					"warnings": step.get("warnings"),
+					"blocker": step.get("blocker"),
 					"started": step.get("started"),
 					"tab": step.get("tab"),
 					"required": step.get("required"),
@@ -831,10 +850,24 @@ class CompanySetup(Document):
 		accounts = frappe.get_all(
 			"Account",
 			filters={"company": self.company},
-			fields=["name", "account_name", "account_number", "parent_account", "root_type", "is_group"],
+			fields=[
+				"name",
+				"account_name",
+				"account_number",
+				"parent_account",
+				"root_type",
+				"is_group",
+				"account_type",
+			],
 			order_by="lft",
 		)
 		names = {account.name: account.account_name for account in accounts}
+		in_books = {}
+		for account in accounts:
+			if account.account_type in ("Receivable", "Payable", "Stock"):
+				in_books[account.account_type] = flt(in_books.get(account.account_type)) + flt(
+					balances.get(account.name)
+				)
 		rows = [
 			{
 				"account": account.name,
@@ -867,6 +900,12 @@ class CompanySetup(Document):
 			"draft_invoices": draft_invoices,
 			"left_out_invoices": left_out["count"],
 			"left_out": left_out,
+			# what customers, suppliers and stock still to come leave on Temporary Opening, by the sheet
+			"waiting": {
+				"Receivable": flt(self.sheet_receivables) - flt(in_books.get("Receivable")),
+				"Payable": flt(self.sheet_payables) + flt(in_books.get("Payable")),
+				"Stock": flt(self.sheet_stock) - flt(in_books.get("Stock")),
+			},
 		}
 
 	@frappe.whitelist()
@@ -1923,19 +1962,15 @@ class CompanySetup(Document):
 		self.check_permission("write")
 		return orders.mark_items_subcontracted(self)
 
-	def get_job_work_bom(self, item_code: str) -> dict:
+	def get_job_work_setups(self, items: list | str) -> list[dict]:
 		self.check_permission("read")
-		return orders.get_job_work_bom(self, item_code)
+		return orders.get_job_work_setups(self, frappe.parse_json(items))
 
 	@frappe.whitelist()
-	def set_job_work_bom(
-		self, item_code: str, materials: list | str, service_item: str, finished_good_qty: float = 1
-	) -> dict:
-		"""Give the item a job-work BOM with only these materials: see open_orders.set_job_work_bom."""
+	def set_job_work_setups(self, setups: list | str) -> list[str]:
+		"""Give each item a job-work BOM and service item: see open_orders.set_job_work_bom."""
 		self.check_permission("write")
-		return orders.set_job_work_bom(
-			self, item_code, frappe.parse_json(materials), service_item, finished_good_qty
-		)
+		return orders.set_job_work_setups(self, frappe.parse_json(setups))
 
 	def get_made_orders(self, order_type: str) -> dict:
 		self.check_permission("read")

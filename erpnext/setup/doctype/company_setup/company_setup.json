@@ -18,6 +18,12 @@
   "receivables_source",
   "onboarding_html",
   "payables_source",
+  "cheques_source",
+  "stock_source",
+  "assets_source",
+  "orders_source",
+  "boms_source",
+  "job_work_source",
   "steps",
   "accounts_tab",
   "accounts_section",
@@ -251,6 +257,54 @@
    "fieldtype": "Select",
    "hidden": 1,
    "label": "Payables From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the uncleared cheques come from.",
+   "fieldname": "cheques_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Cheques From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the stock summary comes from.",
+   "fieldname": "stock_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Stock From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the fixed asset register comes from.",
+   "fieldname": "assets_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Assets From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the open orders come from.",
+   "fieldname": "orders_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Orders From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the BOMs come from.",
+   "fieldname": "boms_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "BOMs From",
+   "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
+  },
+  {
+   "description": "The software the job work orders come from.",
+   "fieldname": "job_work_source",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Job Work From",
    "options": "\nTally\nBusy\nZoho Books\nQuickBooks\nXero\nMarg\nExcel / other"
   },
   {
@@ -539,7 +593,7 @@
  "grid_page_length": 50,
  "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-22 22:06:35.613557",
+ "modified": "2026-10-24 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",

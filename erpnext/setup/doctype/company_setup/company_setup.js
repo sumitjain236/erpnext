@@ -83,6 +83,7 @@ function get_steps(frm) {
 		description: details[row.step_key]?.description,
 		summary: details[row.step_key]?.summary,
 		warnings: details[row.step_key]?.warnings || [],
+		blocker: details[row.step_key]?.blocker,
 		tab: details[row.step_key]?.tab,
 		is_started: details[row.step_key]?.started,
 		is_required: details[row.step_key]?.required,
@@ -198,26 +199,29 @@ const PARTY = {
 
 // Every task with its status, in any order. Each row opens its task; rows are grouped by tab.
 function make_checklist(frm, steps) {
-	// the required steps count; Go live is what they lead to
-	const required = steps.filter((step) => step.is_required && step.name !== "go_live");
-	const done = required.filter((step) => step.is_complete).length;
-	const optional_left = steps.filter(
-		(step) => !step.is_required && !step.is_complete && !step.is_skipped
-	).length;
+	// Go live is what the steps lead to, so it is not counted
+	const counted = steps.filter((step) => step.name !== "go_live");
+	const finished = (step) => step.is_complete || step.is_skipped;
+	const done = counted.filter(finished).length;
+	const required = counted.filter((step) => step.is_required);
+	const required_done = required.filter(finished).length;
 	const $card = $(`<div class="contact-box flex flex-col gap-1 mb-0"></div>`);
 	$card.append(
 		frappe.ui.progress({
 			label: __("Set up {0}", [frm.doc.company]),
 			hint: () =>
-				done < required.length
-					? __("{0} of {1} required steps done", [done, required.length])
-					: optional_left
-					? __("All required steps done · {0} optional left", [optional_left])
-					: __("All required steps done"),
+				required_done < required.length
+					? __("{0} of {1} steps done · {2} of {3} required", [
+							done,
+							counted.length,
+							required_done,
+							required.length,
+					  ])
+					: __("{0} of {1} steps done", [done, counted.length]),
 			intervals: true,
-			interval_count: required.length,
+			interval_count: counted.length,
 			size: "md",
-			value: required.length ? (done / required.length) * 100 : 0,
+			value: counted.length ? (done / counted.length) * 100 : 0,
 		})
 	);
 	const first_tab = steps.findIndex((step) => step.tab);
@@ -710,13 +714,36 @@ const SOURCES = {
 	opening_balances: ["accounts_source", __("Your trial balance comes from")],
 	opening_sales_invoices: ["receivables_source", __("Your unpaid invoices come from")],
 	opening_purchase_invoices: ["payables_source", __("Your unpaid bills come from")],
-	uncleared_cheques: ["accounts_source", __("Your bank book comes from")],
-	opening_stock: ["accounts_source", __("Your stock summary comes from")],
-	fixed_assets: ["accounts_source", __("Your asset register comes from")],
-	open_orders: ["accounts_source", __("Your open orders come from")],
-	boms: ["accounts_source", __("Your BOMs come from")],
-	job_work_orders: ["accounts_source", __("Your job work orders come from")],
+	uncleared_cheques: ["cheques_source", __("Your bank book comes from")],
+	opening_stock: ["stock_source", __("Your stock summary comes from")],
+	fixed_assets: ["assets_source", __("Your asset register comes from")],
+	open_orders: ["orders_source", __("Your open orders come from")],
+	boms: ["boms_source", __("Your BOMs come from")],
+	job_work_orders: ["job_work_source", __("Your job work orders come from")],
 };
+// reports that come from the trial balance's software until picked on their own
+const FOLLOWS_TRIAL_BALANCE = [
+	"uncleared_cheques",
+	"opening_stock",
+	"fixed_assets",
+	"open_orders",
+	"boms",
+	"job_work_orders",
+];
+
+// the trial balance's software, or an Excel sheet when that software has no such report
+function follow_trial_balance(task_name, accounts_source) {
+	return !accounts_source || WHERE_TO_FIND[task_name].some(([software]) => software === accounts_source)
+		? accounts_source || ""
+		: "Excel / other";
+}
+
+function get_source(frm, task_name) {
+	const value = frm.doc[SOURCES[task_name][0]];
+	return value || !FOLLOWS_TRIAL_BALANCE.includes(task_name)
+		? value || ""
+		: follow_trial_balance(task_name, frm.doc.accounts_source);
+}
 
 // a software without its own steps for this report gets the sheet's columns
 function get_places(task_name, source) {
@@ -768,7 +795,7 @@ function fill_where(frm, dialog, task_name) {
 	const field = dialog.fields_dict.where_to_find;
 	if (!field) return;
 	const [source_field, says] = SOURCES[task_name];
-	const source = frm.doc[source_field];
+	const source = get_source(frm, task_name);
 	const [$select] = make_source_select(source, (value) => {
 		if (!value || value === source) return;
 		frm.set_value(source_field, value)
@@ -842,6 +869,12 @@ function make_task(frm, step, buttons) {
 	for (const warning of step.warnings || []) {
 		$(`<div class="text-p-sm text-ink-amber-8"></div>`).text(warning).appendTo($text);
 	}
+	if (step.blocker && !step.is_skipped) {
+		$(`<div class="flex items-center gap-1 text-p-sm text-ink-red-7"></div>`)
+			.append($(`<span class="shrink-0"></span>`).html(frappe.utils.icon("circle-x", "sm")))
+			.append($("<span></span>").text(step.blocker))
+			.appendTo($text);
+	}
 
 	if (buttons.length) {
 		const $actions = $(`<div class="flex flex-wrap items-center justify-end gap-2 ms-auto"></div>`);
@@ -891,35 +924,21 @@ function show_migration_date(frm) {
 		[__("Trial balance"), __("Every account with its balance"), "opening_balances"],
 		[__("Unpaid customer invoices"), __("Who owes you, invoice by invoice"), "opening_sales_invoices"],
 		[__("Unpaid supplier bills"), __("Whom you owe, bill by bill"), "opening_purchase_invoices"],
-		// from where the trial balance comes: no picker of their own
-		[
-			__("Stock summary"),
-			__("If you keep stock: item by item, in each warehouse"),
-			"opening_stock",
-			true,
-		],
-		[__("Fixed asset register"), __("If you have fixed assets: asset by asset"), "fixed_assets", true],
-		[__("Bank reconciliation"), __("Cheques the bank had not cleared"), "uncleared_cheques", true],
-		[
-			__("Open orders"),
-			__("Sales and purchase orders not yet delivered or received"),
-			"open_orders",
-			true,
-		],
-		[__("BOMs"), __("If you make goods: the materials of each item you make"), "boms", true],
+		[__("Stock summary"), __("If you keep stock: item by item, in each warehouse"), "opening_stock"],
+		[__("Fixed asset register"), __("If you have fixed assets: asset by asset"), "fixed_assets"],
+		[__("Bank reconciliation"), __("Cheques the bank had not cleared"), "uncleared_cheques"],
+		[__("Open orders"), __("Sales and purchase orders not yet delivered or received"), "open_orders"],
+		[__("BOMs"), __("If you make goods: the materials of each item you make"), "boms"],
 		[
 			__("Job work orders"),
 			__("If you send work out: orders with goods still at job workers"),
 			"job_work_orders",
-			true,
 		],
 	];
 	const sources = Object.fromEntries(
-		reports.map(([, , task_name]) => [SOURCES[task_name][0], frm.doc[SOURCES[task_name][0]] || ""])
+		reports.map(([, , task_name]) => [SOURCES[task_name][0], get_source(frm, task_name)])
 	);
 	const $where = $(`<div class="flex flex-col gap-3"></div>`);
-	// a report that follows the trial balance comes from an Excel sheet when that software has none
-	const follow_labels = [];
 	const show_where = () => {
 		$where
 			.empty()
@@ -928,25 +947,26 @@ function show_migration_date(frm) {
 					make_where_box(get_places(task_name, sources[SOURCES[task_name][0]]), title)
 				)
 			);
-		for (const [$label, task_name] of follow_labels) {
-			const source = sources[SOURCES[task_name][0]];
-			$label.text(
-				!source || WHERE_TO_FIND[task_name].some(([software]) => software === source)
-					? __("Same software as trial balance")
-					: __("Excel sheet")
-			);
-		}
 	};
 
 	const $reports = $(`<div class="flex flex-col gap-2 pt-2"></div>`);
-	const values = Object.values(sources);
-	let controls = [];
-	// "Mostly from" fills every report; one report can then be changed on its own
+	const values = ["accounts_source", "receivables_source", "payables_source"].map(
+		(field) => sources[field]
+	);
+	const controls = {};
+	// "Mostly from" fills the reports with a software of their own; the others follow the trial
+	// balance. Any report can then be changed on its own.
 	const [$mostly] = make_source_select(
 		values.every((value) => value === values[0]) ? values[0] : "",
 		(value) => {
 			if (!value) return;
-			for (const control of controls) control?.set_value(value);
+			for (const task_name of [
+				"opening_balances",
+				"opening_sales_invoices",
+				"opening_purchase_invoices",
+			]) {
+				controls[task_name].set_value(value);
+			}
 		}
 	);
 	$(`<div class="flex items-center justify-between gap-3"></div>`)
@@ -961,15 +981,23 @@ function show_migration_date(frm) {
 		)
 		.appendTo($reports);
 	const $list = $(`<div class="flex flex-col border rounded-lg"></div>`).appendTo($reports);
-	controls = reports.map(([title, note, task_name, follows], index) => {
+	reports.forEach(([title, note, task_name], index) => {
 		const source_field = SOURCES[task_name][0];
-		if (follows) follow_labels.push([grey_line("").addClass("shrink-0"), task_name]);
-		const [$select, control] = follows
-			? [follow_labels.at(-1)[0]]
-			: make_source_select(sources[source_field], (value) => {
-					sources[source_field] = value || "";
-					show_where();
-			  });
+		const [$select, control] = make_source_select(sources[source_field], (value) => {
+			const before = sources[source_field];
+			sources[source_field] = value || "";
+			if (task_name === "opening_balances") {
+				for (const follower of FOLLOWS_TRIAL_BALANCE) {
+					const field = SOURCES[follower][0];
+					// one picked on its own stays
+					if (sources[field] === follow_trial_balance(follower, before)) {
+						controls[follower].set_value(follow_trial_balance(follower, value));
+					}
+				}
+			}
+			show_where();
+		});
+		controls[task_name] = control;
 		$(`<div class="flex items-center gap-3 px-3 py-2.5 ${index ? "border-t" : ""}"></div>`)
 			.append(
 				$(`<span class="flex shrink-0 text-ink-gray-5"></span>`).html(
@@ -982,7 +1010,6 @@ function show_migration_date(frm) {
 				$select
 			)
 			.appendTo($list);
-		return control;
 	});
 	grey_line(
 		__("Customer and supplier lists help too. Without them, you confirm each new name before posting.")
@@ -1153,7 +1180,7 @@ function get_books_reminders(frm) {
 			],
 		});
 	}
-	for (const line of frm.doc.__onload?.bank?.statement_off || []) {
+	for (const line of frm.doc.__onload?.bank?.statement_off_short || []) {
 		alerts.push({ theme: "yellow", title: line });
 	}
 	return alerts;
@@ -1731,7 +1758,7 @@ function name_with_badge(name_html, badge_html) {
 }
 
 function new_badge() {
-	return frappe.ui.badge.html({ label: __("New"), theme: "gray" });
+	return frappe.ui.badge.html({ label: __("New"), theme: "blue" });
 }
 
 // where rows came from: the sheet's name, or typed in
@@ -1799,16 +1826,9 @@ function make_alerts(alerts) {
 	return $alerts.toggleClass("hide", !alerts.length);
 }
 
-// Why a window's primary button can't be used yet: grey, beside it, and the button disabled
-function set_footer_reason(dialog, reason) {
-	let $reason = dialog.standard_actions.find(".company-setup-reason");
-	if (!$reason.length) {
-		$reason = $(`<span class="company-setup-reason text-p-sm text-ink-gray-5 me-2"></span>`).insertBefore(
-			dialog.get_primary_btn()
-		);
-	}
-	$reason.text(reason || "").toggleClass("hide", !reason);
-	reason ? dialog.disable_primary_action() : dialog.enable_primary_action();
+// A window's primary button, disabled while it can't be used yet: what stops it shows above
+function set_primary_disabled(dialog, disabled) {
+	disabled ? dialog.disable_primary_action() : dialog.enable_primary_action();
 }
 
 // Label and value lines, as in a confirm
@@ -1926,12 +1946,13 @@ function party_list_item(doctype) {
 	};
 }
 
-function show_opening_balances(frm, result) {
+function show_opening_balances(frm, result, replacing) {
 	const company = frm.doc.company;
 	const abbr = frm.doc.__onload?.company_details?.abbr;
 	const short_name = (account) => (abbr ? account.replace(new RegExp(` - ${abbr}$`), "") : account);
 	const posted = (frm.doc.opening_balances || []).filter((row) => row.status === "Posted");
-	const drafts = (frm.doc.opening_balances || []).filter((row) => row.status !== "Posted");
+	const get_drafts = () => (frm.doc.opening_balances || []).filter((row) => row.status !== "Posted");
+	const drafts = get_drafts();
 	// a zero is left blank, so the side with the amount stands out
 	const amount = (value, df, options, doc) =>
 		flt(value) ? frappe.form.formatters.Currency(value, df, options, doc) : "";
@@ -2036,13 +2057,22 @@ function show_opening_balances(frm, result) {
 		primary_action_label: __("Preview and post"),
 		primary_action: () => save().then(() => show_posting_preview(frm)),
 		secondary_action_label: __("Save draft"),
-		secondary_action: () => save(),
+		secondary_action: () => save_draft(),
 	});
 	fill_where(frm, dialog, "opening_balances");
-	const save = () =>
-		call_method(frm, "save_opening_balances", { rows: dialog.get_values().balances || [] }).then(() => {
-			return close_and_reload(frm, dialog);
-		});
+	const save_rows = () =>
+		call_method(frm, "save_opening_balances", { rows: dialog.get_values().balances || [] });
+	const save = () => save_rows().then(() => close_and_reload(frm, dialog));
+	const save_draft = () =>
+		save_rows()
+			.then(() => reload_fresh(frm))
+			.then(() => {
+				const grid = dialog.fields_dict.balances.grid;
+				grid.df.data = get_drafts().map((row) => ({ ...row, name: undefined }));
+				grid.refresh();
+				update_totals();
+				frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
+			});
 
 	const $intro = dialog.get_field("intro").$wrapper;
 	$(`<div class="flex flex-wrap items-center justify-between gap-2 mb-3"></div>`)
@@ -2071,7 +2101,11 @@ function show_opening_balances(frm, result) {
 			)
 		)
 		.appendTo($intro);
-	$intro.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances));
+	$intro.append(
+		make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances, () =>
+			show_opening_balances(frm, null, dialog)
+		)
+	);
 	const $cards = $(`<div class="es-stat-card-grid company-setup-stats mb-3"></div>`).appendTo($intro);
 	// nothing entered yet: the table's place says how to start, and the cards wait for rows
 	let typing = false;
@@ -2268,18 +2302,7 @@ function show_opening_balances(frm, result) {
 				],
 				get_profit_caption(frm)
 			),
-			make_lines_card(
-				__("For other steps"),
-				[
-					[__("Receivables"), money(frm, frm.doc.sheet_receivables, 0)],
-					[__("Payables"), money(frm, frm.doc.sheet_payables, 0)],
-					[__("Stock"), money(frm, frm.doc.sheet_stock, 0)],
-				],
-				__("From your trial balance. Not posted with these balances."),
-				__(
-					"What customers owe, what you owe suppliers and the stock value, as your trial balance has them. They aren't posted with the balances here: customer invoices on the Selling tab and supplier bills on the Buying tab bring them in, invoice by invoice, so each one can be paid off later."
-				)
-			)
+			get_left_out_card(frm)
 		);
 	};
 	const use_suggestions = (suggestions) =>
@@ -2334,11 +2357,11 @@ function show_opening_balances(frm, result) {
 	dialog.restore_actions = () => {
 		dialog.set_primary_action(__("Preview and post"), () => save().then(() => show_posting_preview(frm)));
 		dialog.set_secondary_action_label(__("Save draft"));
-		dialog.set_secondary_action(() => save());
+		dialog.set_secondary_action(() => save_draft());
 	};
 	dialog.update_totals = update_totals;
 	setup_dialog_grid(dialog.fields_dict.balances.grid, update_totals);
-	dialog.show();
+	show_in_place_of(dialog, replacing);
 	update_totals();
 	// an account's type or category may have changed in the chart since the rows were saved
 	const picked = (dialog.fields_dict.balances.df.data || []).filter((row) => row.account);
@@ -2647,13 +2670,12 @@ function upload_opening_balances(frm, dialog) {
 					"The sheet replaces the {0} balances in this table, unsaved changes included. Posted balances stay as they are. Continue?",
 					[drafts]
 				),
-			dialog: dialog,
-			after: (result) => show_opening_balances(frm, result),
+			after: (result) => show_opening_balances(frm, result, dialog),
 		}
 	);
 }
 
-// Pick a sheet and read it with method, then open the window again on what it read. replaces: the
+// Pick a sheet and read it with method, then draw the window again on what it read. replaces: the
 // confirm to ask first, as the sheet replaces drafts.
 // The uploader for a sheet: a .xlsx or .csv from this device only
 function pick_sheet(on_success) {
@@ -2667,13 +2689,17 @@ function pick_sheet(on_success) {
 	});
 }
 
-function upload_sheet(frm, method, args, { replaces, dialog, after }) {
-	const choose = () =>
-		pick_sheet((file) =>
-			call_method(frm, method, { ...args, file_url: file.file_url }).then((r) => {
-				close_and_reload(frm, dialog).then(() => after(r.message));
-			})
+function upload_sheet(frm, method, args, { replaces, after }) {
+	const choose = () => {
+		// the window is drawn again once the upload's own dialog is gone, so it ends on top
+		let closed;
+		const uploader = pick_sheet((file) =>
+			call_method(frm, method, { ...args, file_url: file.file_url }).then((r) =>
+				Promise.all([reload_fresh(frm), closed]).then(() => after(r.message))
+			)
 		);
+		closed = new Promise((resolve) => uploader.dialog.$wrapper.one("hidden.bs.modal", resolve));
+	};
 	if (!replaces) return choose();
 	frappe.confirm(replaces, choose);
 }
@@ -2704,15 +2730,22 @@ function make_upload_result(frm, result) {
 		);
 	}
 
-	// customers and suppliers are told by the Difference card; only stock needs a line of its own
-	const left_out = left_out_text(frm, { Stock: result.left_out?.Stock });
-	if (left_out) grey_line(left_out).appendTo($result);
-	if (result.groups) {
-		grey_line(
-			__("{0} group lines were skipped: they only add up their sub-accounts.", [result.groups])
-		).appendTo($result);
-	}
 	return $result;
+}
+
+// What the trial balance holds that comes in on other tabs, each with how far it is
+function get_left_out_card(frm) {
+	const lines = [
+		[__("Customers"), frm.doc.sheet_receivables, __("Selling")],
+		[__("Suppliers"), frm.doc.sheet_payables, __("Buying")],
+		[__("Stock"), frm.doc.sheet_stock, __("Stock")],
+	].filter(([, amount]) => flt(amount, 2));
+	if (!lines.length) return [];
+	return make_lines_card(
+		__("Left out of these balances"),
+		lines.map(([label, amount]) => [label, money(frm, amount, 0)]),
+		__("They come in on the {0} tabs.", [frappe.utils.comma_and(lines.map(([, , tab]) => tab))])
+	);
 }
 
 // What the balances' difference waits for: the customer invoices and supplier bills posted so far
@@ -2773,22 +2806,19 @@ function left_out_text(frm, left_out = {}) {
 }
 
 // Opening entries are dated the day before the migration date, in a year a new site may not have
-function make_fiscal_year_note(frm) {
+function fiscal_year_text(frm) {
 	const missing = frm.doc.__onload?.missing_fiscal_year;
 	// without the right to add it, the posting reds ask for it instead
-	if (!missing || !frappe.model.can_create("Fiscal Year")) return null;
-	return frappe.ui.alert({
-		theme: "blue",
-		title: __("The financial year {0} is added when you post", [missing.year]),
-		description: __(
-			"Opening entries are dated {0}, the day before you start, and ERPNext doesn't have that year yet.",
-			[frappe.datetime.str_to_user(missing.date)]
-		),
-	});
+	if (!missing || !frappe.model.can_create("Fiscal Year")) return "";
+	return __("They're dated {0}; the financial year {1} is added when you post.", [
+		frappe.datetime.str_to_user(missing.date),
+		missing.year,
+	]);
 }
 
-// A button that opens where a red is fixed: a closing entry, the company, a dimension
-function fix_button(fix, frm) {
+// A button that opens where a red is fixed: a closing entry, the company, a dimension. after:
+// draws the window again once a dimension's default is set; without it the window closes.
+function fix_button(fix, frm, after) {
 	if (fix.doctype === "Accounting Dimension" && fix.document_type) {
 		return {
 			label: fix.label,
@@ -2807,9 +2837,9 @@ function fix_button(fix, frm) {
 						call_method(frm, "set_dimension_default", {
 							dimension: fix.name,
 							value: values.value,
-						}).then(() => {
-							close_and_reload(frm, window.cur_dialog);
-						}),
+						}).then(() =>
+							after ? reload_fresh(frm).then(after) : close_and_reload(frm, window.cur_dialog)
+						),
 					fix.label,
 					__("Set")
 				),
@@ -2826,14 +2856,14 @@ function fix_button(fix, frm) {
 }
 
 // What stops posting or undoing, as the server's get_posting_reds gives it, shown as a window opens
-function make_posting_reds(frm, reds) {
+function make_posting_reds(frm, reds, after) {
 	if (!reds?.length) return [];
 	return $(`<div class="mb-3"></div>`).append(
 		make_alerts(
 			reds.map((red) => ({
 				theme: "red",
 				title: red.text,
-				buttons: red.fix ? [fix_button(red.fix, frm)] : [],
+				buttons: red.fix ? [fix_button(red.fix, frm, after)] : [],
 			}))
 		)
 	);
@@ -2844,6 +2874,17 @@ function make_posting_reds(frm, reds) {
 function close_and_reload(frm, dialog) {
 	dialog?.hide();
 	return reload_fresh(frm);
+}
+
+// A window drawn again shows where the old one was, at its scroll, with no close and open between
+function show_in_place_of(dialog, old) {
+	if (!old?.display) return dialog.show();
+	const scroll = old.$wrapper.scrollTop();
+	dialog.animate = false;
+	old.$wrapper.removeClass("fade");
+	old.hide();
+	dialog.show();
+	dialog.$wrapper.scrollTop(scroll);
 }
 
 function reload_fresh(frm) {
@@ -2943,9 +2984,6 @@ function show_posting_preview(frm, can_post = true, on_close = null) {
 				.get_field("preview")
 				.$wrapper.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.balances));
 		}
-		const year_note = can_post && make_fiscal_year_note(frm);
-		if (year_note)
-			dialog.get_field("preview").$wrapper.append($(`<div class="mb-3"></div>`).append(year_note));
 		if (!can_post) dialog.get_field("preview").$wrapper.append(make_books_checks(frm, dialog));
 		if (on_close) dialog.onhide = () => !dialog.opened_other && on_close();
 		dialog
@@ -2953,6 +2991,60 @@ function show_posting_preview(frm, can_post = true, on_close = null) {
 			.$wrapper.append(make_posting_preview(preview, currency, frm, can_post ? null : dialog));
 		dialog.show();
 	});
+}
+
+// What waits on Temporary Opening: customers, suppliers and stock still to come explain it, or a
+// balance may be missing from the sheet
+function make_temporary_sum(preview, temporary, money) {
+	const waiting = preview.waiting || {};
+	const expected = flt(waiting.Receivable) - flt(waiting.Payable) + flt(waiting.Stock);
+	const unexplained = flt(temporary.balance - expected, 2);
+	if (Math.abs(unexplained) >= 1) {
+		return frappe.ui.alert({
+			theme: "yellow",
+			title:
+				unexplained > 0
+					? __("{0} more than customers, suppliers and stock explain", [money(unexplained)])
+					: __("{0} less than customers, suppliers and stock explain", [money(-unexplained)]),
+			description: __(
+				"A balance may be missing from your sheet. Check the trial balance, or post anyway: it waits in Temporary Opening."
+			),
+		});
+	}
+	const lines = [
+		[__("Customers owe you"), waiting.Receivable, 1],
+		[__("You owe suppliers"), waiting.Payable, -1],
+		[__("Stock"), waiting.Stock, 1],
+	].filter(([, amount]) => flt(amount, 2));
+	const $table = $(`<div class="flex flex-col border rounded-lg"></div>`).append(
+		lines.map(([label, amount, sign], index) =>
+			$(
+				`<div class="flex justify-between gap-3 px-3 py-2 text-base ${
+					index ? "border-t" : ""
+				}"></div>`
+			).append(
+				$(`<span class="text-ink-gray-6"></span>`).text(label),
+				$(`<span class="text-ink-gray-8"></span>`).text(
+					sign < 0 ? `− ${money(amount)}` : money(amount)
+				)
+			)
+		),
+		$(
+			`<div class="flex justify-between gap-3 px-3 py-2 text-base-medium text-ink-gray-8 border-t"></div>`
+		).append(
+			$(`<span></span>`).text(__("Waits in Temporary Opening")),
+			$(`<span class="flex items-center gap-1"></span>`).append(
+				$(`<span></span>`).text(money(temporary.balance)),
+				$(`<span class="flex text-ink-green-7"></span>`)
+					.attr("title", __("As expected"))
+					.html(frappe.utils.icon("check", "sm"))
+			)
+		)
+	);
+	return $(`<div class="flex flex-col gap-2"></div>`).append(
+		$table,
+		grey_line(__("It goes to zero once the opening invoices, bills and stock are posted."))
+	);
 }
 
 // With the Check your books dialog, Temporary Opening is the Overview card's figure
@@ -2997,6 +3089,7 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 				  )
 				: __("Your books as they are, with everything posted so far.")
 		)
+		.append(books_dialog ? "" : ` ${fiscal_year_text(frm)}`)
 		.appendTo($body);
 	const left_out = preview.left_out?.count && get_left_out_text(preview.left_out, money);
 	const party_type = preview.left_out?.party_types?.[0];
@@ -3030,17 +3123,7 @@ function make_posting_preview(preview, currency, frm, books_dialog) {
 			make_alerts([{ theme: "yellow", title: left_out, buttons: books_dialog ? [open_invoices] : [] }])
 		);
 	}
-	if (temporary && !books_dialog) {
-		$body.append(
-			frappe.ui.alert({
-				theme: "yellow",
-				title: __("{0} doesn't balance yet", [money(Math.abs(temporary.balance))]),
-				description: __(
-					"It waits in Temporary Opening until your customer invoices, supplier bills and opening stock, or a balance missing from your sheet, are in. Then it goes to zero. Nothing stops you meanwhile."
-				),
-			})
-		);
-	}
+	if (temporary && !books_dialog) $body.append(make_temporary_sum(preview, temporary, money));
 
 	const tabs = [
 		{
@@ -3932,9 +4015,9 @@ function show_undo_result(frm, kind, result, source) {
 	}
 }
 
-function show_opening_invoices(frm, party_type, result) {
+function show_opening_invoices(frm, party_type, result, replacing) {
 	get_data(frm, "get_invoice_names", { party_type: party_type }).then((r) =>
-		make_opening_invoices_dialog(frm, party_type, r.message, result)
+		make_opening_invoices_dialog(frm, party_type, r.message, result, replacing)
 	);
 }
 
@@ -4009,7 +4092,7 @@ function get_name_state(rows, kind_of) {
 	};
 }
 
-function make_opening_invoices_dialog(frm, party_type, names, result) {
+function make_opening_invoices_dialog(frm, party_type, names, result, replacing) {
 	const party = PARTY[party_type];
 	const is_customer = party_type === "Customer";
 	const rows = frm.doc[party.table] || [];
@@ -4026,11 +4109,30 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	const party_accounts = { ...names.party_accounts };
 	// a ledger saved on the customer or supplier, or on its group, wins over the sheet's "Post to"
 	const own_accounts = names.own_accounts || {};
+	// dates the sheet had that could not be read: what it said, by row and field, until typed in
+	const unread = {};
+	for (const bad of result?.bad_dates || []) {
+		unread[[bad.party_name, bad.invoice_number || ""]] = {
+			...unread[[bad.party_name, bad.invoice_number || ""]],
+			[bad.field]: bad.text,
+		};
+	}
 	const data = get_draft_rows(frm, party_type, names).map((row) => ({
 		...row,
 		name: undefined,
 		account: accounts.length ? row.account || party_accounts[row.party] : undefined,
+		unread_dates: unread[[row.party_name, row.invoice_number || ""]],
 	}));
+	const has_unread_date = (row) => Object.keys(row.unread_dates || {}).some((field) => !row[field]);
+	const date_formatter = (value, df, options, row) =>
+		!value && row?.unread_dates?.[df.fieldname]
+			? `<span title="${frappe.utils.escape_html(
+					__("On the sheet: {0}", [row.unread_dates[df.fieldname]])
+			  )}">${frappe.ui.badge.html({ label: __("Check date"), theme: "orange" })}</span>`
+			: value
+			? frappe.datetime.str_to_user(value)
+			: "";
+	let only_unread = false;
 	// names confirmed in this window, shown as Confirmed in the names list
 	const confirmed = new Set();
 	const day_before = day_before_text(frm);
@@ -4126,6 +4228,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 						label: is_customer ? __("Invoice Date") : __("Bill Date"),
 						in_list_view: 1,
 						columns: 1,
+						formatter: date_formatter,
+						onchange: () => refresh_state(),
 					},
 					{
 						fieldname: "due_date",
@@ -4133,6 +4237,8 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 						label: __("Due Date"),
 						in_list_view: 1,
 						columns: 1,
+						formatter: date_formatter,
+						onchange: () => refresh_state(),
 					},
 					{
 						fieldname: "outstanding_amount",
@@ -4166,7 +4272,11 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 
 	// one line and the sheet's buttons; the cards under them
 	const $intro = dialog.get_field("intro").$wrapper;
-	$intro.append(make_posting_reds(frm, frm.doc.__onload?.posting_reds?.[party_type]));
+	$intro.append(
+		make_posting_reds(frm, frm.doc.__onload?.posting_reds?.[party_type], () =>
+			show_opening_invoices(frm, party_type, null, dialog)
+		)
+	);
 	// each sheet's draft rows can go at once; saving keeps the change, closing without it undoes it
 	const draft_sources = {};
 	for (const row of frm.doc[PARTY[party_type].table] || []) {
@@ -4324,14 +4434,6 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 				  ])
 		);
 	}
-	if (result?.bad_dates?.length) {
-		grey(
-			__("Dates we could not read, left empty: {0}. Type them in, or those rows are dated {1}.", [
-				result.bad_dates.join(", "),
-				day_before,
-			])
-		);
-	}
 	if (result?.unknown_ledgers?.length) {
 		grey(
 			is_customer
@@ -4396,7 +4498,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	let typing = data.length > 0;
 	const $review = dialog.get_field("review").$wrapper;
 	const show_empty = () => {
-		const source = frm.doc[SOURCES[party.table][0]];
+		const source = get_source(frm, party.table);
 		$review.append(
 			$(`<div class="border rounded-lg py-10"></div>`).append(
 				frappe.ui.empty_state({
@@ -4611,7 +4713,57 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 			);
 		}
 		$review.append(make_waiting_alerts(all));
+		$review.append(make_unread_dates_alert(all));
 		if (state.review.length) make_review_box(state);
+	};
+	// rows whose sheet dates could not be read: one box for all of them, and a way to see just those
+	const make_unread_dates_alert = (all) => {
+		const rows = all.filter(has_unread_date);
+		if (!rows.length) only_unread = false;
+		show_only_unread();
+		if (!rows.length) return [];
+		const kind = is_customer
+			? plural(rows.length, __("1 invoice"), __("{0} invoices", [rows.length]))
+			: plural(rows.length, __("1 bill"), __("{0} bills", [rows.length]));
+		return frappe.ui
+			.alert({
+				theme: "yellow",
+				title: __("{0} with dates we couldn't read", [kind]),
+				description: !only_unread
+					? __("They're left empty. Type them in, or they're dated {0}.", [day_before])
+					: rows.length === 1
+					? __("Showing only this one of {0}. Type its dates in, or it's dated {1}.", [
+							all.length,
+							day_before,
+					  ])
+					: __("Showing only these {0} of {1}. Type the dates in, or they're dated {2}.", [
+							rows.length,
+							all.length,
+							day_before,
+					  ]),
+				footer: () =>
+					frappe.ui.button({
+						label: only_unread ? __("Show all") : __("Show rows"),
+						onclick: () => {
+							only_unread = !only_unread;
+							if (only_unread) {
+								// first, so they are on the table's first page
+								dialog.fields_dict.invoices.df.data = [
+									...rows,
+									...all.filter((row) => !rows.includes(row)),
+								];
+								grid.refresh();
+							}
+							refresh_state();
+						},
+					}),
+			})
+			.addClass("mb-3");
+	};
+	const show_only_unread = () => {
+		for (const grid_row of grid.grid_rows || []) {
+			grid_row.wrapper.toggle(!only_unread || has_unread_date(grid_row.doc));
+		}
 	};
 	// rows that stay drafts whatever the names say: a disabled customer's, or in another currency
 	const make_waiting_alerts = (all) => {
@@ -4667,10 +4819,7 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 											})
 										)
 										.then(() => reload_fresh(frm))
-										.then(() => {
-											dialog.hide();
-											show_opening_invoices(frm, party_type);
-										})
+										.then(() => show_opening_invoices(frm, party_type, null, dialog))
 							),
 					},
 				],
@@ -5070,14 +5219,17 @@ function make_opening_invoices_dialog(frm, party_type, names, result) {
 	};
 	const save_draft = () => {
 		if (!dialog.get_values()) return;
-		save().then(() => dialog.hide());
+		save().then(() => {
+			if (dialog.get_field("names_view").df.hidden) refresh_state();
+			frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
+		});
 	};
 
 	if (posting) {
 		frm.posting_dialog = Object.assign(dialog, { party_type: party_type });
 		dialog.set_df_property("invoices", "read_only", 1);
 	}
-	dialog.show();
+	show_in_place_of(dialog, replacing);
 	refresh_state();
 	grid.refresh();
 }
@@ -5144,8 +5296,7 @@ function upload_opening_invoices(frm, party_type, dialog) {
 							"The sheet replaces the {0} in this table, unsaved changes included. Posted bills stay as they are. Continue?",
 							[count_invoices(drafts, party_type)]
 					  )),
-			dialog: dialog,
-			after: (result) => show_opening_invoices(frm, party_type, result),
+			after: (result) => show_opening_invoices(frm, party_type, result, dialog),
 		}
 	);
 }
@@ -5939,20 +6090,19 @@ function ask_serial_and_batch(frm) {
 				.then(() => reload_fresh(frm))
 				.then(resolve);
 		};
-		dialog
-			.get_field("body")
-			.$wrapper.append(
-				$(`<div class="flex flex-col gap-3"></div>`).append(
-					$(`<div class="text-p-base text-ink-gray-8"></div>`).text(
-						__("Do any of your items use batch or serial numbers?")
-					),
-					grey_line(__("Pick No if you don't track batches. You can turn it on per item later.")),
-					$(`<div class="flex justify-end gap-2"></div>`).append(
-						frappe.ui.button({ label: __("No"), onclick: () => answer(false) }),
-						frappe.ui.button({ label: __("Yes"), onclick: () => answer(true) })
-					)
+		dialog.get_field("body").$wrapper.append(
+			$(`<div class="flex flex-col gap-3"></div>`).append(
+				$(`<div class="text-p-base text-ink-gray-8"></div>`).text(
+					__("Do any of your items use batch or serial numbers?")
+				),
+				grey_line(__("Pick No if you don't track batches. You can turn it on per item later.")),
+				$(`<div class="flex justify-end gap-2"></div>`).append(
+					// most companies don't track batches
+					frappe.ui.button({ label: __("Yes"), onclick: () => answer(true) }),
+					frappe.ui.button({ label: __("No"), variant: "solid", onclick: () => answer(false) })
 				)
-			);
+			)
+		);
 		dialog.show();
 	});
 }
@@ -6886,7 +7036,7 @@ function make_books_checks(frm, dialog) {
 }
 
 // Bank accounts: the bank details of each bank ledger, then the uncleared cheques and deposits
-function show_bank_accounts(frm) {
+function show_bank_accounts(frm, replacing) {
 	Promise.all([
 		get_data(frm, "get_bank_accounts"),
 		frappe.db.get_list("Bank", { fields: ["name"], limit: 0 }),
@@ -6895,7 +7045,7 @@ function show_bank_accounts(frm) {
 			frm,
 			r.message,
 			banks.map((bank) => bank.name)
-		).show()
+		).show(replacing)
 	);
 }
 
@@ -6931,7 +7081,7 @@ class BankAccountsWindow {
 		return Boolean(bank) && !this.known_banks.has(bank.trim().toLowerCase());
 	}
 
-	show() {
+	show(replacing) {
 		const status = this.frm.doc.__onload?.bank || {};
 		// bank details saved and cheques waiting: straight to them
 		const to_cheques =
@@ -6939,7 +7089,7 @@ class BankAccountsWindow {
 			status.accounts &&
 			status.added === status.accounts &&
 			status.drafts;
-		this.dialog.show();
+		show_in_place_of(this.dialog, replacing);
 		to_cheques ? this.show_cheques() : this.show_accounts();
 	}
 
@@ -6958,6 +7108,9 @@ class BankAccountsWindow {
 				{
 					fieldname: "accounts",
 					fieldtype: "Table",
+					description: __(
+						"Statement: type it as the bank shows it. For an overdrawn account, what you owe the bank."
+					),
 					cannot_add_rows: 1,
 					cannot_delete_rows: 1,
 					in_place_edit: 1,
@@ -7023,6 +7176,17 @@ class BankAccountsWindow {
 							in_list_view: 1,
 							columns: 1,
 							onchange: refresh,
+							formatter: (value, df, options, row) =>
+								[null, undefined, ""].includes(value)
+									? ""
+									: `<span class="flex items-center justify-end gap-2">${
+											is_overdrawn(row)
+												? frappe.ui.badge.html({
+														label: __("Overdrawn"),
+														theme: "gray",
+												  })
+												: ""
+									  }${format_currency(Math.abs(flt(value)), row.account_currency)}</span>`,
 						},
 						{
 							fieldname: "is_default",
@@ -7063,6 +7227,7 @@ class BankAccountsWindow {
 						{ value: "Yes", label: __("Yes") },
 					],
 					default: this.details.has_uncleared_cheques || "",
+					reqd: 1,
 					change: refresh,
 				},
 				{ fieldname: "cheques_head", fieldtype: "HTML", hidden: 1 },
@@ -7141,6 +7306,11 @@ class BankAccountsWindow {
 			secondary_action: () => this.save_accounts(true),
 		});
 		fill_where(this.frm, this.dialog, "uncleared_cheques");
+		// a No or Yes needs no full-width box
+		this.dialog
+			.get_field("has_uncleared_cheques")
+			.$wrapper.find(".control-input-wrapper")
+			.addClass("max-w-xs");
 		this.accounts_grid = this.dialog.fields_dict.accounts.grid;
 		setup_dialog_grid(this.accounts_grid);
 		this.cheques_grid = this.dialog.fields_dict.cheques.grid;
@@ -7265,8 +7435,9 @@ class BankAccountsWindow {
 		const off_banks = rows
 			.map((row) => {
 				const books = flt(row.book) || (row.line ?? null);
-				if ([null, undefined, ""].includes(row.statement_balance) || books === null) return null;
-				const off = flt(row.statement_balance) - flt(books) - (uncleared[row.account] || 0);
+				const statement = get_statement(row);
+				if (statement === null || books === null) return null;
+				const off = statement - flt(books) - (uncleared[row.account] || 0);
 				return Math.abs(off) < 1 ? null : { name: short_account(this.frm, row.account), off: off };
 			})
 			.filter(Boolean);
@@ -7349,29 +7520,8 @@ class BankAccountsWindow {
 			});
 		}
 		$head.append(make_alerts(alerts).addClass("mb-3"));
-		if (new_banks.length && this.details.can_create_bank) {
-			$head.append(
-				grey_line(
-					new_banks.length === 1
-						? __("1 bank is new: {0}. It is made when you save.", [new_banks[0]])
-						: __("{0} banks are new: {1}. They are made when you save.", [
-								new_banks.length,
-								new_banks.join(", "),
-						  ])
-				).addClass("mb-3")
-			);
-		}
 		this.dialog.set_df_property("accounts", "hidden", rows.length ? 0 : 1);
-		set_footer_reason(
-			this.dialog,
-			!rows.length
-				? __("Mark the bank accounts to add their details.")
-				: alerts.some((alert) => alert.theme === "red")
-				? __("Fix the red items above to save.")
-				: !this.dialog.get_value("has_uncleared_cheques")
-				? __("Answer the question to save.")
-				: null
-		);
+		set_primary_disabled(this.dialog, !rows.length || alerts.some((alert) => alert.theme === "red"));
 	}
 
 	get_account_rows() {
@@ -7380,9 +7530,7 @@ class BankAccountsWindow {
 			bank: row.bank,
 			bank_account_no: row.bank_account_no,
 			branch_code: row.branch_code,
-			statement_balance: [null, undefined, ""].includes(row.statement_balance)
-				? null
-				: row.statement_balance,
+			statement_balance: get_statement(row),
 			is_default: row.is_default ? 1 : 0,
 			is_credit_card: row.is_credit_card ? 1 : 0,
 		}));
@@ -7390,6 +7538,8 @@ class BankAccountsWindow {
 
 	save_accounts(draft = false) {
 		const answer = this.dialog.get_value("has_uncleared_cheques");
+		// get_values names the unanswered question
+		if (!draft && !answer) return this.dialog.get_values();
 		return call_method(
 			this.frm,
 			"save_bank_accounts",
@@ -7398,6 +7548,7 @@ class BankAccountsWindow {
 		).then(() =>
 			reload_fresh(this.frm).then(() => {
 				if (draft) {
+					this.refresh_accounts();
 					frappe.ui.toast({ type: "success", message: __("Saved as a draft.") });
 				} else if (answer === "Yes") {
 					this.show_cheques();
@@ -7427,7 +7578,7 @@ class BankAccountsWindow {
 		})
 			.then(() => call_method(this.frm, "mark_bank_accounts"))
 			.then(() => {
-				close_and_reload(this.frm, this.dialog).then(() => show_bank_accounts(this.frm));
+				reload_fresh(this.frm).then(() => show_bank_accounts(this.frm, this.dialog));
 				frappe.ui.toast({
 					type: "success",
 					message: plural(
@@ -7459,6 +7610,7 @@ class BankAccountsWindow {
 			this.dialog.set_secondary_action(() =>
 				this.save_cheques()
 					.then(() => reload_fresh(this.frm))
+					.then(() => this.show_cheques(this.picked))
 					.then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }))
 			);
 			this.make_cheques_head();
@@ -7645,7 +7797,11 @@ class BankAccountsWindow {
 			frappe.ui.stat_card({
 				label: on(__("Book balance")),
 				value: money(this.frm, picked ? picked.book : sum("book"), 0),
-				caption: this.day ? __("On {0}", [this.day]) : null,
+				caption: shown.some((bank) => bank.book_from_sheet)
+					? __("From your trial balance, not posted yet")
+					: this.day
+					? __("On {0}", [this.day])
+					: null,
 			}),
 			make_lines_card(on(__("Uncleared")), [
 				[
@@ -7709,7 +7865,9 @@ class BankAccountsWindow {
 		if (this.checks.posting_blocker) {
 			reds.push({
 				...red(this.checks.posting_blocker),
-				buttons: this.checks.posting_fix ? [fix_button(this.checks.posting_fix, this.frm)] : [],
+				buttons: this.checks.posting_fix
+					? [fix_button(this.checks.posting_fix, this.frm, () => this.show_cheques(this.picked))]
+					: [],
 			});
 		}
 		if (count(state.no_bank)) {
@@ -7815,14 +7973,7 @@ class BankAccountsWindow {
 					empty ? reds.slice(0, this.checks.balances_posted ? 0 : 1) : [...reds, ...yellows]
 				)
 			);
-		set_footer_reason(
-			this.dialog,
-			!rows.length
-				? __("Upload a sheet or add rows to post.")
-				: reds.length
-				? __("Fix the red items above to post.")
-				: null
-		);
+		set_primary_disabled(this.dialog, !rows.length || reds.length > 0);
 	}
 
 	save_cheques() {
@@ -8420,15 +8571,25 @@ function show_taxes(frm) {
 				{ fieldname: "notes", fieldtype: "HTML" },
 				// the template new invoices and bills start with, only when the user picks one: a company
 				// may sell exempt services too
-				...["Sales", "Purchase"].map((tax_type) => ({
-					fieldname: `default_${tax_type.toLowerCase()}`,
-					fieldtype: "Select",
-					label:
-						tax_type === "Sales" ? __("Default sales template") : __("Default purchase template"),
-					description: __("New invoices start with it. Leave empty for none."),
-					default: taxes.defaults?.[tax_type] || "",
-					hidden: 1,
-				})),
+				{ fieldtype: "Section Break" },
+				...["Sales", "Purchase"].flatMap((tax_type) => [
+					...(tax_type === "Purchase" ? [{ fieldtype: "Column Break" }] : []),
+					{
+						fieldname: `default_${tax_type.toLowerCase()}`,
+						fieldtype: "Select",
+						label:
+							tax_type === "Sales"
+								? __("Default sales template")
+								: __("Default purchase template"),
+						description:
+							tax_type === "Sales"
+								? __("New invoices start with it. Leave empty for none.")
+								: __("New bills start with it. Leave empty for none."),
+						default: taxes.defaults?.[tax_type] || "",
+						// a section built with only hidden fields stays hidden
+						hidden: taxes.rows.some((row) => row.tax_type === tax_type) ? 0 : 1,
+					},
+				]),
 			],
 			primary_action_label: __("Save taxes"),
 			primary_action: () =>
@@ -8533,6 +8694,17 @@ function show_taxes(frm) {
 				),
 				frappe.ui.button({ label: __("Add tax account"), icon: "plus", onclick: add_tax_account })
 			),
+			taxes.from_existing
+				? $(`<div></div>`).append(
+						frappe.ui.alert({
+							theme: "blue",
+							title: __("These templates are already in ERPNext"),
+							description: __(
+								"Check them, change or add what is missing, then save. Nothing is done until you save."
+							),
+						})
+				  )
+				: [],
 			taxes.other_templates?.length
 				? $(`<div class="mb-3"></div>`).append(
 						frappe.ui.alert({
@@ -8784,7 +8956,7 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 						? plural(added, __("Add 1 warehouse"), __("Add {0} warehouses", [added]))
 						: __("Save warehouses")
 				);
-			set_footer_reason(dialog, alerts.length ? __("Fix the red items above to save.") : null);
+			set_primary_disabled(dialog, alerts.length > 0);
 		};
 		dialog.show();
 		refresh_state();
@@ -8796,6 +8968,19 @@ function show_warehouses(frm, { job_workers = false } = {}) {
 // A grid in a dialog. Frappe's Delete all rows clears this.frm.doc, which it has not, so it clears its
 // own rows. Frappe tells nothing of deleted rows outside a form, so a refresh with fewer rows than the
 // last one runs on_delete.
+// An overdraft or cash credit: what the bank is owed, or an account its books show overdrawn
+function is_overdrawn(row) {
+	return row.root_type === "Liability" || (flt(row.book) || flt(row.line)) < 0;
+}
+
+// The statement balance as the books count it: the bank shows what an overdrawn account owes as a
+// plain number, so it is taken as overdrawn either way it is typed
+function get_statement(row) {
+	if ([null, undefined, ""].includes(row.statement_balance)) return null;
+	const amount = flt(row.statement_balance);
+	return is_overdrawn(row) ? -Math.abs(amount) : amount;
+}
+
 function setup_dialog_grid(grid, on_delete) {
 	grid.delete_all_rows = () =>
 		frappe.confirm(__("Are you sure you want to delete all {0} rows?", [grid.data.length]), () => {
@@ -8850,7 +9035,7 @@ function fill_confirm(dialog, { title, back, on_back, body, primary, on_primary,
 		.get_field("confirm")
 		.$wrapper.empty()
 		.append($(`<div class="flex flex-col gap-3"></div>`).append(make_back_line(back, on_back), body));
-	set_footer_reason(dialog, null);
+	set_primary_disabled(dialog, false);
 	dialog.set_primary_action(primary, on_primary);
 	if (theme) dialog.get_primary_btn().attr("data-theme", theme);
 	dialog.set_secondary_action_label(__("Back"));
@@ -8885,6 +9070,10 @@ class SheetWindow {
 		this.day = day_before_text(frm);
 		this.title = title;
 		this.dirty = false;
+		this.alerts = [];
+		this.lines = [];
+		// the key of the alert whose rows alone show
+		this.only = null;
 		this.dialog = new frappe.ui.Dialog({
 			title: title,
 			size: "extra-large",
@@ -8898,14 +9087,18 @@ class SheetWindow {
 					in_place_edit: row_form ? 0 : 1,
 					data: [],
 					fields: fields.map((df) =>
-						df.read_only || df.hidden
+						df.hidden
 							? df
 							: {
 									...df,
-									onchange: function (e) {
-										df.onchange?.apply(this, [e]);
-										win.changed();
-									},
+									formatter: (value, column, options, doc) =>
+										win.format_cell(df, value, column, options, doc),
+									...(!df.read_only && {
+										onchange: function (e) {
+											df.onchange?.apply(this, [e]);
+											win.changed();
+										},
+									}),
 							  }
 					),
 				},
@@ -8956,14 +9149,53 @@ class SheetWindow {
 		return this.grid.df.data || [];
 	}
 
-	// a row the checks name goes first, so it is in view
-	show_rows(test) {
+	// only the rows an alert is about, first so they are on the table's first page; or all again
+	show_rows(alert) {
+		this.only = this.only === alert.key ? null : alert.key;
+		if (this.only) this.move_first(alert);
+		this.draw_alerts();
+	}
+
+	move_first(alert) {
+		const open = new Set(this.open_rows(alert));
 		const rows = this.get_rows();
-		this.set_rows([...rows.filter(test), ...rows.filter((row) => !test(row))]);
+		this.set_rows([...rows.filter((row) => open.has(row)), ...rows.filter((row) => !open.has(row))]);
+	}
+
+	// a cell an alert marked, not changed since
+	is_open(alert, row, field) {
+		const seen = alert.seen.get(row);
+		return Boolean(seen) && field in seen && cstr(row[field]) === cstr(seen[field]);
+	}
+
+	// an alert's rows still in the table; with marked cells, those with one left
+	open_rows(alert) {
+		return this.get_rows().filter((row) => {
+			const seen = alert.seen.get(row);
+			if (!seen) return false;
+			const fields = Object.keys(seen);
+			return !fields.length || fields.some((field) => this.is_open(alert, row, field));
+		});
+	}
+
+	format_cell(df, value, column, options, doc) {
+		const formatted = (df.formatter || frappe.form.get_formatter(df.fieldtype))(
+			value,
+			column,
+			options,
+			doc
+		);
+		const alert =
+			doc && this.alerts.find((alert) => alert.seen && this.is_open(alert, doc, df.fieldname));
+		if (!alert) return formatted;
+		if (!value) return frappe.ui.badge.html({ label: __("Needed"), theme: "red" });
+		const badge = frappe.ui.badge.html({ label: alert.badge || __("Check"), theme: "red" });
+		return `<div class="flex items-center gap-1"><div class="truncate min-w-0">${formatted}</div><div class="shrink-0">${badge}</div></div>`;
 	}
 
 	changed() {
 		this.dirty = true;
+		this.draw_alerts();
 		this.refresh_footer();
 	}
 
@@ -8982,24 +9214,83 @@ class SheetWindow {
 			);
 	}
 
+	// rows (doc_idx or a test): the rows an alert is about, for Show rows. fields: the cells in them
+	// that show a badge until changed, the empty ones, else all
 	set_alerts(alerts, lines = []) {
+		const rows = this.get_rows();
+		this.alerts = alerts.map((alert) => {
+			if (!alert.rows) return alert;
+			const idxs = new Set(typeof alert.rows === "function" ? [] : alert.rows);
+			const test = typeof alert.rows === "function" ? alert.rows : (row) => idxs.has(row.doc_idx);
+			const fields = alert.fields || [];
+			const seen = rows.filter(test).map((row) => {
+				const empty = fields.filter((field) => !row[field]);
+				return [row, Object.fromEntries((empty.length ? empty : fields).map((f) => [f, row[f]]))];
+			});
+			return seen.length ? { ...alert, key: alert.key || alert.title, seen: new Map(seen) } : alert;
+		});
+		this.lines = lines;
+		const only = this.alerts.find((alert) => alert.seen && alert.key === this.only);
+		if (only) this.move_first(only);
+		this.draw_alerts();
+	}
+
+	draw_alerts() {
+		const all = this.get_rows().length;
+		const alerts = this.alerts.filter((alert) => !alert.seen || this.open_rows(alert).length);
+		const only = alerts.find((alert) => alert.seen && alert.key === this.only);
+		if (!only) this.only = null;
+		const showing = (count) =>
+			count === 1
+				? __("Showing only this one of {0}.", [all])
+				: __("Showing only these {0} of {1}.", [count, all]);
 		this.dialog
 			.get_field("alerts")
 			.$wrapper.empty()
 			.append(
-				make_alerts(alerts).addClass("mb-3"),
-				lines.filter(Boolean).map((line) => (line.jquery ? line : grey_line(line)).addClass("mb-3"))
+				make_alerts(
+					alerts.map((alert) =>
+						alert.seen
+							? {
+									...alert,
+									description:
+										alert === only
+											? [showing(this.open_rows(alert).length), alert.description]
+													.filter(Boolean)
+													.join(" ")
+											: alert.description,
+									buttons: [
+										...(alert.buttons || []),
+										{
+											label: alert === only ? __("Show all") : __("Show rows"),
+											onclick: () => this.show_rows(alert),
+										},
+									],
+							  }
+							: alert
+					)
+				).addClass("mb-3"),
+				this.lines
+					.filter(Boolean)
+					.map((line) => (line.jquery ? line : grey_line(line)).addClass("mb-3"))
 			);
+		const open = only && new Set(this.open_rows(only));
+		// a grid refreshes a changed cell only in its first row, so the badges are drawn here
+		const fields = new Set(this.alerts.flatMap((alert) => alert.fields || []));
+		for (const grid_row of this.grid.grid_rows || []) {
+			grid_row.wrapper.toggle(!open || open.has(grid_row.doc));
+			for (const field of fields) grid_row.refresh_field(field);
+		}
 	}
 
-	upload(method, replaces, after = (result) => this.open(result)) {
-		upload_sheet(this.frm, method, this.args, { replaces, dialog: this.dialog, after });
+	upload(method, replaces, after = (result) => this.refresh(result)) {
+		upload_sheet(this.frm, method, this.args, { replaces, after });
 	}
 
-	show() {
+	show(replacing) {
 		this.set_rows(this.drafts);
 		this.show_sheet();
-		this.dialog.show();
+		show_in_place_of(this.dialog, replacing);
 	}
 
 	save(rows = this.get_rows(), args = {}) {
@@ -9011,9 +9302,25 @@ class SheetWindow {
 	}
 
 	save_draft() {
-		return this.save().then(() =>
-			this.reopen().then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }))
-		);
+		return this.save()
+			.then(() => this.refresh())
+			.then(() => frappe.ui.toast({ type: "success", message: __("Saved as a draft.") }));
+	}
+
+	// the saved rows and their checks, drawn again in this window; new columns need a new one
+	refresh(result = null) {
+		const scroll = this.dialog.$wrapper.scrollTop();
+		return reload_fresh(this.frm)
+			.then(() => get_data(this.frm, this.get_method, this.args))
+			.then((r) => {
+				if (this.layout_changed(r.message)) return this.open(result, this.dialog);
+				this.load(r.message);
+				this.result = result;
+				this.dirty = false;
+				this.set_rows(this.drafts);
+				this.show_sheet();
+				this.dialog.$wrapper.scrollTop(scroll);
+			});
 	}
 
 	// the checks again, on the rows saved: a red shows on the sheet, else the confirm
@@ -9042,8 +9349,8 @@ class SheetWindow {
 		this.render();
 	}
 
-	reopen() {
-		return close_and_reload(this.frm, this.dialog).then(() => this.open());
+	layout_changed() {
+		return false;
 	}
 }
 
@@ -9067,20 +9374,28 @@ const STOCK_FIELDS = [
 	"idx",
 ];
 
-function show_opening_stock(frm, result) {
-	get_data(frm, "get_opening_stock").then((r) => new OpeningStockWindow(frm, r.message, result).show());
+function show_opening_stock(frm, result, replacing) {
+	get_data(frm, "get_opening_stock").then((r) =>
+		new OpeningStockWindow(frm, r.message, result).show(replacing)
+	);
+}
+
+// The columns opening stock shows: the challan ones for job work, else the batch ones
+function get_stock_layout(frm, checks) {
+	const drafts = (frm.doc.opening_stock || []).filter((row) => row.status !== "Posted");
+	const job_work =
+		checks.reds.some((red) => red.key === "challan") ||
+		drafts.some((row) => row.challan_no || row.challan_date);
+	const batched = !job_work && drafts.some((row) => row.batch_no || row.expiry_date);
+	return { drafts, job_work, batched };
 }
 
 class OpeningStockWindow extends SheetWindow {
 	constructor(frm, checks, result) {
-		const drafts = (frm.doc.opening_stock || []).filter((row) => row.status !== "Posted");
-		const job_work =
-			checks.reds.some((red) => red.key === "challan") ||
-			drafts.some((row) => row.challan_no || row.challan_date);
-		const batched = !job_work && drafts.some((row) => row.batch_no || row.expiry_date);
+		const { drafts, job_work, batched } = get_stock_layout(frm, checks);
 		super(frm, {
 			title: __("Opening stock"),
-			open: (result) => show_opening_stock(frm, result),
+			open: (result, replacing) => show_opening_stock(frm, result, replacing),
 			save_method: "save_opening_stock",
 			get_method: "get_opening_stock",
 			where: "opening_stock",
@@ -9118,14 +9433,26 @@ class OpeningStockWindow extends SheetWindow {
 			extra_fields: [{ fieldname: "lines", fieldtype: "HTML" }],
 		});
 		this.views.sheet.push("lines");
-		this.checks = checks;
 		this.result = result;
-		this.drafts = drafts.map((row) => ({
-			...Object.fromEntries(STOCK_FIELDS.map((field) => [field, row[field]])),
-			old_qty: row.qty,
-			old_amount: row.amount,
-			doc_idx: row.idx,
-		}));
+		this.layout = [job_work, batched].join();
+		this.load(checks);
+	}
+
+	layout_changed(checks) {
+		const { job_work, batched } = get_stock_layout(this.frm, checks);
+		return [job_work, batched].join() !== this.layout;
+	}
+
+	load(checks) {
+		this.checks = checks;
+		this.drafts = (this.frm.doc.opening_stock || [])
+			.filter((row) => row.status !== "Posted")
+			.map((row) => ({
+				...Object.fromEntries(STOCK_FIELDS.map((field) => [field, row[field]])),
+				old_qty: row.qty,
+				old_amount: row.amount,
+				doc_idx: row.idx,
+			}));
 	}
 
 	render() {
@@ -9168,7 +9495,7 @@ class OpeningStockWindow extends SheetWindow {
 							icon: "undo-2",
 							onclick: () =>
 								call_method(frm, "restore_undone_stock", { source }).then(() =>
-									this.reopen()
+									this.refresh()
 								),
 						})
 					),
@@ -9183,7 +9510,7 @@ class OpeningStockWindow extends SheetWindow {
 								),
 								() =>
 									call_method(frm, "move_to_opening_balances", { account }).then(() =>
-										this.reopen()
+										this.refresh()
 									)
 							),
 					})),
@@ -9274,10 +9601,6 @@ class OpeningStockWindow extends SheetWindow {
 
 	get_alerts() {
 		const { checks, frm } = this;
-		const rows = (idxs) => {
-			const set = new Set(idxs);
-			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
-		};
 		const go = (label, open) => ({
 			label: label,
 			onclick: () => {
@@ -9285,14 +9608,15 @@ class OpeningStockWindow extends SheetWindow {
 				open();
 			},
 		});
-		const red = (title, buttons = [], description) => ({ theme: "red", title, description, buttons });
 		// the server's reds, in order; a few get a button to the step that fixes them
 		const actions = {
-			posting_blocker: checks.posting_fix ? [fix_button(checks.posting_fix, frm)] : [],
+			posting_blocker: checks.posting_fix
+				? [fix_button(checks.posting_fix, frm, () => this.refresh())]
+				: [],
 			perpetual_inventory: [
 				{
 					label: __("Turn it on"),
-					onclick: () => call_method(frm, "turn_on_perpetual_inventory").then(() => this.reopen()),
+					onclick: () => call_method(frm, "turn_on_perpetual_inventory").then(() => this.refresh()),
 				},
 			],
 			missing_warehouses: [go(__("Go to Warehouses"), () => show_warehouses(frm))],
@@ -9303,7 +9627,7 @@ class OpeningStockWindow extends SheetWindow {
 					onclick: () =>
 						(this.dirty ? this.save() : Promise.resolve())
 							.then(() => call_method(frm, "make_serial_numbers"))
-							.then(() => this.reopen()),
+							.then(() => this.refresh()),
 				},
 			],
 			untracked: frm.doc.__onload?.serial_batch_off
@@ -9311,7 +9635,7 @@ class OpeningStockWindow extends SheetWindow {
 						{
 							label: __("Turn on batch and serial numbers"),
 							onclick: () =>
-								call_method(frm, "turn_on_serial_and_batch").then(() => this.reopen()),
+								call_method(frm, "turn_on_serial_and_batch").then(() => this.refresh()),
 						},
 				  ]
 				: [],
@@ -9324,7 +9648,7 @@ class OpeningStockWindow extends SheetWindow {
 							onclick: () =>
 								call_method(frm, "move_to_opening_stock", {
 									account: checks.reds.find((red) => red.key === "kept").account,
-								}).then(() => this.reopen()),
+								}).then(() => this.refresh()),
 						},
 				  ]
 				: [],
@@ -9340,15 +9664,29 @@ class OpeningStockWindow extends SheetWindow {
 			];
 			return names.slice(0, 5).join(", ") + (names.length > 5 ? ", …" : "");
 		};
+		// the cells a red is about, marked in its rows
+		const fields = {
+			missing_warehouses: ["warehouse_name"],
+			missing_items: ["item_name"],
+			negative: ["qty"],
+			no_qty: ["qty"],
+			unknown_units: ["uom"],
+			part_qty: ["qty"],
+			challan: ["challan_no", "challan_date", "return_due"],
+			no_batch: ["batch_no"],
+		};
 		const alerts = (checks.reds || [])
 			.filter((item) => item.key !== "no_drafts")
-			.map((item) =>
-				red(
-					item.text,
-					[...(actions[item.key] || []), ...(item.rows.length ? [rows(item.rows)] : [])],
-					item.key === "missing_items" ? names_of(item.rows) : undefined
-				)
-			);
+			.map((item) => ({
+				theme: "red",
+				key: item.key,
+				title: item.text,
+				description: item.key === "missing_items" ? names_of(item.rows) : undefined,
+				buttons: actions[item.key] || [],
+				rows: item.rows,
+				fields: fields[item.key],
+				badge: item.key.startsWith("missing_") ? __("Not in ERPNext") : undefined,
+			}));
 		let red_count = alerts.length;
 		const close = Object.entries(checks.close_items || {});
 		if (close.length) {
@@ -9362,17 +9700,9 @@ class OpeningStockWindow extends SheetWindow {
 					__("{0} items have close matches.", [close.length])
 				),
 				description: __("Check them before you use them."),
-				buttons: [
-					{ label: __("Use them"), onclick: () => this.use_close_items(close) },
-					{
-						label: __("Show rows"),
-						variant: "outline",
-						onclick: () => {
-							const names = new Set(close.map(([sheet]) => sheet));
-							this.show_rows((row) => names.has(row.item_name));
-						},
-					},
-				],
+				buttons: [{ label: __("Use them"), onclick: () => this.use_close_items(close) }],
+				rows: (row) => close.some(([sheet]) => sheet === row.item_name),
+				fields: ["item_name"],
 			});
 		}
 		if (checks.expired?.length) {
@@ -9384,7 +9714,7 @@ class OpeningStockWindow extends SheetWindow {
 					__("{0} batches expired by {1}.", [checks.expired.length, this.day])
 				),
 				description: __("They post as stock. Leave them out if you will write them off."),
-				buttons: [rows(checks.expired)],
+				rows: checks.expired,
 			});
 		}
 		if (this.result?.differ) {
@@ -9496,10 +9826,11 @@ class OpeningStockWindow extends SheetWindow {
 		);
 	}
 
-	// the checks were for the saved rows: say so rather than show them stale
+	// the checks were for the saved rows: keep only the alerts about rows, which follow the edits
 	changed() {
 		if (!this.dirty) {
-			this.set_alerts([], [__("Rows changed. Save draft to check them again.")]);
+			this.alerts = this.alerts.filter((alert) => alert.seen);
+			this.lines = [__("Rows changed. Save draft to check them again.")];
 			this.dialog.get_field("lines").$wrapper.empty();
 		}
 		super.changed();
@@ -9515,15 +9846,9 @@ class OpeningStockWindow extends SheetWindow {
 			has_drafts || this.dirty ? this.save_draft() : this.dialog.hide()
 		);
 		const blocker = this.checks.blocker;
-		set_footer_reason(
+		set_primary_disabled(
 			this.dialog,
-			this.dirty || !has_drafts
-				? null
-				: !this.checks.perpetual_inventory
-				? __("Turn on perpetual inventory to post.")
-				: blocker && blocker !== __("Upload a sheet or add rows to post.")
-				? __("Fix the red items above to post.")
-				: blocker
+			!this.dirty && has_drafts > 0 && (!this.checks.perpetual_inventory || Boolean(blocker))
 		);
 	}
 
@@ -9532,7 +9857,7 @@ class OpeningStockWindow extends SheetWindow {
 		const rows = this.get_rows().map((row) =>
 			map[row.item_name] ? { ...row, item_name: map[row.item_name] } : row
 		);
-		this.save(rows).then(() => this.reopen());
+		this.save(rows).then(() => this.refresh());
 	}
 
 	confirm_post() {
@@ -9854,20 +10179,18 @@ function show_posted_window(frm, opts) {
 		const refresh = () => {
 			const selected = grid.get_selected_children();
 			const blocked = (selected.length ? selected : grid.df.data).filter(opts.blocked);
-			const reason = blocked.length && __("Fix the red items above to undo.");
 			const alert = blocked.length && can_undo && opts.blocked_alert(blocked, group, dialog);
 			$head.empty().append(
 				make_back_header(source_name(group.source), line_of(group), () => show_list(), [
 					...(opts.group_actions?.(group, dialog) || []),
 					...(can_undo
 						? [
-								reason ? grey_line(reason) : [],
 								frappe.ui.button({
 									label: opts.undo_label(selected, group),
 									icon: "undo-2",
 									theme: "red",
 									variant: selected.length ? "subtle" : "outline",
-									disabled: Boolean(reason),
+									disabled: Boolean(blocked.length),
 									onclick: () => show_confirm(group, selected.length ? selected : null),
 								}),
 						  ]
@@ -10200,17 +10523,10 @@ function show_correct_rows(frm, group, posted_dialog) {
 		win.dialog.set_secondary_action_label(__("Close"));
 		win.dialog.set_secondary_action(() => win.dialog.hide());
 		win.dialog.set_primary_action(
-			plural(count, __("Correct 1 row"), __("Correct {0} rows", [count])),
+			count ? plural(count, __("Correct 1 row"), __("Correct {0} rows", [count])) : __("Correct rows"),
 			() => check()
 		);
-		set_footer_reason(
-			win.dialog,
-			!count
-				? __("Change a row's qty or value to correct it.")
-				: win.refused
-				? __("Fix the red items above to correct rows.")
-				: null
-		);
+		set_primary_disabled(win.dialog, !count || Boolean(win.refused));
 	};
 	win.changed = () => {
 		win.refused = null;
@@ -10237,9 +10553,7 @@ function show_correct_rows(frm, group, posted_dialog) {
 					description: (result.below_zero || []).length
 						? __("Put their quantities back, or ask your CA.")
 						: undefined,
-					buttons: below.size
-						? [{ label: __("Show rows"), onclick: () => win.show_rows(is_below) }]
-						: [],
+					rows: is_below,
 				},
 			]);
 			win.refresh_footer();
@@ -10476,121 +10790,148 @@ function count_orders(order_type, count) {
 		: plural(count, __("1 order"), __("{0} orders", [count]));
 }
 
-function show_open_orders(frm, order_type, result) {
+function show_open_orders(frm, order_type, result, replacing) {
 	get_data(frm, "get_open_orders", { order_type: order_type }).then((r) =>
-		new OpenOrdersWindow(frm, order_type, r.message, result).show()
+		new OpenOrdersWindow(frm, order_type, r.message, result).show(replacing)
 	);
 }
 
-// A copy of the item's BOM that leaves out what is added in-house, for its Subcontracting BOM
-function show_job_work_bom(frm, item_code, after) {
-	get_data(frm, "get_job_work_bom", { item_code: item_code }, { freeze: true }).then((r) => {
-		const data = r.message;
-		if (!data.bom) {
-			frappe.msgprint({
-				title: __("No BOM"),
-				message: __("{0} has no default BOM. Add its BOM first.", [
-					frappe.utils.escape_html(item_code),
-				]),
-				indicator: "red",
-			});
-			return;
-		}
+// Per item: its service item, and a copy of its BOM that leaves out what is added in-house
+function show_job_work_setup(frm, items, after) {
+	get_data(frm, "get_job_work_setups", { items: items }, { freeze: true }).then((r) => {
+		const setups = r.message;
+		const ready = setups.filter((setup) => setup.bom);
+		const fields = setups.flatMap((setup, i) => [
+			{
+				fieldtype: "Section Break",
+				label: frappe.utils.escape_html(
+					[
+						setup.item_name && setup.item_name !== setup.item_code
+							? `${setup.item_code}: ${setup.item_name}`
+							: setup.item_code,
+						...setup.job_workers,
+					].join(" · ")
+				),
+			},
+			...(setup.bom ? job_work_fields(setup, i) : [{ fieldname: `no_bom_${i}`, fieldtype: "HTML" }]),
+		]);
 		const dialog = new frappe.ui.Dialog({
-			title: __("Job-work BOM for {0}", [frappe.utils.escape_html(item_code)]),
+			title: __("Set up job work"),
 			size: "large",
-			fields: [
-				{
-					fieldname: "materials",
-					fieldtype: "Table",
-					label: __("Materials"),
-					description: __("Ticked materials go to the job worker. Untick what you add in-house."),
-					cannot_add_rows: 1,
-					cannot_delete_rows: 1,
-					data: data.materials.map((row) => ({
-						...row,
-						__checked: row.held ? 1 : 0,
-						material:
-							row.item_name && row.item_name !== row.item_code
-								? `${row.item_code}: ${row.item_name}`
-								: row.item_code,
-						note: row.held ? "" : __("added by you"),
-					})),
-					fields: [
-						{
-							fieldname: "material",
-							fieldtype: "Data",
-							label: __("Material"),
-							in_list_view: 1,
-							read_only: 1,
-							columns: 5,
-						},
-						{
-							fieldname: "qty",
-							fieldtype: "Float",
-							label: __("Qty"),
-							in_list_view: 1,
-							read_only: 1,
-							columns: 2,
-						},
-						{
-							fieldname: "uom",
-							fieldtype: "Data",
-							label: __("Unit"),
-							in_list_view: 1,
-							read_only: 1,
-							columns: 1,
-						},
-						{
-							fieldname: "note",
-							fieldtype: "Data",
-							label: __("Note"),
-							in_list_view: 1,
-							read_only: 1,
-							columns: 2,
-						},
-						{ fieldname: "item_code", fieldtype: "Data", hidden: 1 },
-					],
-				},
-				{
-					fieldname: "service_item",
-					fieldtype: "Link",
-					options: "Item",
-					label: __("Service item"),
-					reqd: 1,
-					default: data.service_item,
-					get_query: () => ({ filters: { is_stock_item: 0, disabled: 0 } }),
-				},
-				{
-					fieldname: "finished_good_qty",
-					fieldtype: "Float",
-					label: __("Finished goods per service unit"),
-					reqd: 1,
-					non_negative: 1,
-					default: data.finished_good_qty,
-				},
-			],
-			primary_action_label: __("Save job-work BOM"),
+			fields: fields,
+			primary_action_label: plural(
+				ready.length,
+				__("Save 1 job-work setup"),
+				__("Save {0} job-work setups", [ready.length])
+			),
 			primary_action: (values) =>
 				call_method(
 					frm,
-					"set_job_work_bom",
+					"set_job_work_setups",
 					{
-						item_code: item_code,
-						materials: dialog.fields_dict.materials.grid
-							.get_selected_children()
-							.map((row) => row.item_code),
-						service_item: values.service_item,
-						finished_good_qty: values.finished_good_qty,
+						setups: setups
+							.map((setup, i) => ({ setup, i }))
+							.filter(({ setup }) => setup.bom)
+							.map(({ setup, i }) => ({
+								item_code: setup.item_code,
+								materials: dialog.fields_dict[`materials_${i}`].grid
+									.get_selected_children()
+									.map((row) => row.item_code),
+								service_item: values[`service_item_${i}`],
+								finished_good_qty: values[`finished_good_qty_${i}`],
+							})),
 					},
 					{ freeze: true }
-				).then((r) => {
+				).then(() => {
 					dialog.hide();
-					after(r.message);
+					after();
 				}),
 		});
+		setups.forEach((setup, i) => {
+			if (!setup.bom) {
+				dialog
+					.get_field(`no_bom_${i}`)
+					.$wrapper.append(grey_line(__("This item has no default BOM. Add its BOM first.")));
+			}
+		});
+		set_primary_disabled(dialog, !ready.length);
 		dialog.show();
 	});
+}
+
+function job_work_fields(setup, i) {
+	return [
+		{
+			fieldname: `service_item_${i}`,
+			fieldtype: "Link",
+			options: "Item",
+			label: __("Service item"),
+			reqd: 1,
+			default: setup.service_item,
+			get_query: () => ({ filters: { is_stock_item: 0, disabled: 0 } }),
+		},
+		{ fieldtype: "Column Break" },
+		{
+			fieldname: `finished_good_qty_${i}`,
+			fieldtype: "Float",
+			label: __("Finished goods per service unit"),
+			reqd: 1,
+			non_negative: 1,
+			default: setup.finished_good_qty,
+		},
+		{ fieldtype: "Section Break" },
+		{
+			fieldname: `materials_${i}`,
+			fieldtype: "Table",
+			label: __("Materials sent to the job worker"),
+			cannot_add_rows: 1,
+			cannot_delete_rows: 1,
+			data: setup.materials.map((row) => ({
+				...row,
+				__checked: row.held ? 1 : 0,
+				material:
+					row.item_name && row.item_name !== row.item_code
+						? `${row.item_code}: ${row.item_name}`
+						: row.item_code,
+				note: row.held ? "" : __("added by you"),
+			})),
+			fields: [
+				{
+					fieldname: "material",
+					fieldtype: "Data",
+					label: __("Material"),
+					in_list_view: 1,
+					read_only: 1,
+					columns: 5,
+				},
+				{
+					fieldname: "qty",
+					fieldtype: "Float",
+					label: __("Qty"),
+					in_list_view: 1,
+					read_only: 1,
+					columns: 2,
+				},
+				{
+					fieldname: "uom",
+					fieldtype: "Data",
+					label: __("Unit"),
+					in_list_view: 1,
+					read_only: 1,
+					columns: 1,
+				},
+				{
+					fieldname: "note",
+					fieldtype: "Data",
+					label: __("Note"),
+					in_list_view: 1,
+					read_only: 1,
+					columns: 2,
+				},
+				{ fieldname: "item_code", fieldtype: "Data", hidden: 1 },
+			],
+		},
+	];
 }
 
 class OpenOrdersWindow extends SheetWindow {
@@ -10650,7 +10991,7 @@ class OpenOrdersWindow extends SheetWindow {
 			title: text.title,
 			where: where,
 			has_data: order_rows(frm, order_type, false).length,
-			open: (result) => show_open_orders(frm, order_type, result),
+			open: (result, replacing) => show_open_orders(frm, order_type, result, replacing),
 			save_method: "save_open_orders",
 			get_method: "get_open_orders",
 			args: { order_type: order_type },
@@ -10662,11 +11003,15 @@ class OpenOrdersWindow extends SheetWindow {
 		});
 		this.order_type = order_type;
 		this.text = text;
-		this.checks = checks;
 		this.result = result;
-		const fieldnames = [...fields.map((df) => df.fieldname), "source"];
-		this.drafts = order_rows(frm, order_type, false).map((row) => ({
-			...Object.fromEntries(fieldnames.map((field) => [field, row[field]])),
+		this.fieldnames = [...fields.map((df) => df.fieldname), "source"];
+		this.load(checks);
+	}
+
+	load(checks) {
+		this.checks = checks;
+		this.drafts = order_rows(this.frm, this.order_type, false).map((row) => ({
+			...Object.fromEntries(this.fieldnames.map((field) => [field, row[field]])),
 			doc_idx: row.idx,
 		}));
 	}
@@ -10709,10 +11054,6 @@ class OpenOrdersWindow extends SheetWindow {
 				  ]
 				: []
 		);
-		const rows = (idxs) => {
-			const set = new Set(idxs);
-			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
-		};
 		const go = (label, open) => ({
 			label,
 			onclick: () => {
@@ -10730,13 +11071,19 @@ class OpenOrdersWindow extends SheetWindow {
 			missing_items: [go(__("Go to Items"), () => open_party_import(frm, "Item"))],
 			no_bom: [go(__("Import BOMs"), () => open_party_import(frm, "BOM"))],
 			no_job_worker: [go(__("Go to Warehouses"), () => show_warehouses(frm, { job_workers: true }))],
+			material_not_posted: [
+				go(__("Go to Opening stock"), () => {
+					show_tab(frm, "stock_tab");
+					show_opening_stock(frm);
+				}),
+			],
 			not_subcontracted: [
 				{
 					label: __("Mark them subcontracted"),
 					onclick: () =>
 						(this.dirty ? this.save() : Promise.resolve())
 							.then(() => call_method(frm, "mark_items_subcontracted", {}, { freeze: true }))
-							.then(() => this.reopen()),
+							.then(() => this.refresh()),
 				},
 			],
 		};
@@ -10755,51 +11102,39 @@ class OpenOrdersWindow extends SheetWindow {
 			];
 			return names.slice(0, 5).join(", ") + (names.length > 5 ? ", …" : "");
 		};
+		// the cells a red is about, marked in its rows
+		const fields = {
+			no_party_name: ["party_name"],
+			missing_parties: ["party_name"],
+			missing_items: ["item_name"],
+			no_qty: ["qty"],
+			unknown_units: ["uom"],
+			no_bom: ["bom"],
+			no_wip: ["wip_warehouse"],
+			no_warehouse: ["warehouse"],
+		};
 		const alerts = (checks.reds || []).map((item) => ({
 			theme: "red",
+			key: item.key,
 			title: item.text,
 			description: names_of(item.key, item.rows),
+			rows: item.rows,
+			fields: fields[item.key],
+			badge: ["missing_parties", "missing_items"].includes(item.key) ? __("Not in ERPNext") : undefined,
 			buttons: [
 				...(actions[item.key] || []),
-				...(item.fix ? [fix_button(item.fix, frm)] : []),
-				...(item.key === "no_service_item"
+				...(item.fix ? [fix_button(item.fix, frm, () => this.refresh())] : []),
+				...(["job_work_setup", "material_not_at_job_worker"].includes(item.key)
 					? [
-							go(__("Add Subcontracting BOM"), () =>
-								frappe.new_doc("Subcontracting BOM", { finished_good: item.items[0] })
-							),
+							{
+								label: __("Set up job work"),
+								onclick: () =>
+									(this.dirty ? this.save() : Promise.resolve()).then(() =>
+										show_job_work_setup(frm, item.items, () => this.refresh())
+									),
+							},
 					  ]
 					: []),
-				...(item.key === "material_not_at_job_worker"
-					? item.items.map((code) => ({
-							label:
-								item.items.length > 1
-									? __("Set job-work BOM for {0}", [code])
-									: __("Set job-work BOM"),
-							onclick: () =>
-								(this.dirty ? this.save() : Promise.resolve()).then(() =>
-									show_job_work_bom(frm, code, (saved) =>
-										this.reopen().then(() =>
-											frappe.ui.toast(
-												saved.short
-													? {
-															type: "info",
-															message: __(
-																"Job-work BOM saved. The job worker still does not hold all the material."
-															),
-													  }
-													: {
-															type: "success",
-															message: __(
-																"Job-work BOM saved. The job worker now holds all the material."
-															),
-													  }
-											)
-										)
-									)
-								),
-					  }))
-					: []),
-				...(item.rows.length ? [rows(item.rows)] : []),
 			],
 		}));
 		this.set_alerts(alerts, [
@@ -10835,16 +11170,7 @@ class OpenOrdersWindow extends SheetWindow {
 		this.dialog.set_secondary_action_label(__("Save draft"));
 		this.dialog.set_secondary_action(() => this.save_draft());
 		const empty = !this.get_rows().length;
-		set_footer_reason(
-			this.dialog,
-			empty
-				? __("Upload a sheet or add rows to make orders.")
-				: this.dirty
-				? null
-				: checks.blocker
-				? __("Fix the red items above to make orders.")
-				: null
-		);
+		set_primary_disabled(this.dialog, empty || (!this.dirty && Boolean(checks.blocker)));
 	}
 
 	confirm_post() {
@@ -10907,6 +11233,13 @@ class OpenOrdersWindow extends SheetWindow {
 }
 
 function order_type_make_label(order_type, count) {
+	if (!count) {
+		return order_type === "Work Order"
+			? __("Make work orders")
+			: order_type === "Subcontracting Order"
+			? __("Make subcontracting orders")
+			: __("Make orders");
+	}
 	return order_type === "Work Order"
 		? plural(count, __("Make 1 work order"), __("Make {0} work orders", [count]))
 		: order_type === "Subcontracting Order"
@@ -11032,8 +11365,10 @@ const ASSET_FIELDS = [
 ];
 
 // result: what an upload just did, said at the top of the window
-function show_fixed_assets(frm, result) {
-	get_data(frm, "get_fixed_assets").then((r) => new FixedAssetsWindow(frm, r.message, result).show());
+function show_fixed_assets(frm, result, replacing) {
+	get_data(frm, "get_fixed_assets").then((r) =>
+		new FixedAssetsWindow(frm, r.message, result).show(replacing)
+	);
 }
 
 class FixedAssetsWindow extends SheetWindow {
@@ -11041,7 +11376,7 @@ class FixedAssetsWindow extends SheetWindow {
 		const drafts = (frm.doc.fixed_assets || []).filter((row) => row.status !== "Posted");
 		super(frm, {
 			title: __("Fixed assets"),
-			open: (result) => show_fixed_assets(frm, result),
+			open: (result, replacing) => show_fixed_assets(frm, result, replacing),
 			save_method: "save_fixed_assets",
 			get_method: "get_fixed_assets",
 			where: "fixed_assets",
@@ -11132,12 +11467,18 @@ class FixedAssetsWindow extends SheetWindow {
 		});
 		this.views.sheet.push("depreciation_booked");
 		this.views.categories = ["categories_head", "categories"];
-		this.checks = checks;
 		this.result = result;
-		this.drafts = drafts.map((row) => ({
-			...Object.fromEntries(ASSET_FIELDS.map((field) => [field, row[field]])),
-			doc_idx: row.idx,
-		}));
+		this.load(checks);
+	}
+
+	load(checks) {
+		this.checks = checks;
+		this.drafts = (this.frm.doc.fixed_assets || [])
+			.filter((row) => row.status !== "Posted")
+			.map((row) => ({
+				...Object.fromEntries(ASSET_FIELDS.map((field) => [field, row[field]])),
+				doc_idx: row.idx,
+			}));
 	}
 
 	render() {
@@ -11173,7 +11514,7 @@ class FixedAssetsWindow extends SheetWindow {
 						icon: "undo-2",
 						onclick: () =>
 							call_method(frm, "restore_undone_assets", { source }).then((r) =>
-								close_and_reload(frm, this.dialog).then(() => this.open(r.message))
+								this.refresh(r.message)
 							),
 					})
 				),
@@ -11250,21 +11591,17 @@ class FixedAssetsWindow extends SheetWindow {
 		field.df.change = () => {
 			const value = field.get_value();
 			if ((value || "") === (frm.doc.depreciation_booked || "")) return;
-			this.save(undefined, { depreciation_booked: value }).then(() => this.reopen());
+			this.save(undefined, { depreciation_booked: value }).then(() => this.refresh());
 		};
 	}
 
 	get_alerts() {
 		const { checks, frm } = this;
-		const rows = (idxs) => {
-			const set = new Set(idxs);
-			return { label: __("Show rows"), onclick: () => this.show_rows((row) => set.has(row.doc_idx)) };
-		};
-		const reload = () => this.reopen();
+		const reload = () => this.refresh();
 		const set_up = [{ label: __("Set up"), onclick: () => this.show_categories() }];
 		// reds about accounts or categories name them; the others are about rows
 		const actions = {
-			posting: checks.posting_fix ? [fix_button(checks.posting_fix, frm)] : [],
+			posting: checks.posting_fix ? [fix_button(checks.posting_fix, frm, () => this.refresh())] : [],
 			untyped: [
 				{
 					label: get_mark_label(Object.values(checks.untyped_types || {})),
@@ -11297,22 +11634,30 @@ class FixedAssetsWindow extends SheetWindow {
 				__("1 more to fix after this."),
 				__("{0} more to fix after this.", [reds.length - 1])
 			);
+		// the cells a red is about, marked in its rows
+		const fields = {
+			no_account: ["asset_account"],
+			no_date: ["purchase_date"],
+			after_migration: ["purchase_date"],
+			over_cost: ["opening_depreciation"],
+			life_over: ["life"],
+		};
 		const alerts = reds.slice(0, 1).map((item) => ({
 			theme: "red",
+			key: item.key,
 			title: item.text,
 			description:
 				[named[item.key] && item.rows.map((name) => short_account(frm, name)).join(", "), more]
 					.filter(Boolean)
 					.join(" · ") || undefined,
-			buttons: [
-				...(actions[item.key] || []),
-				...(!named[item.key] && item.rows.length ? [rows(item.rows)] : []),
-			],
+			buttons: actions[item.key] || [],
+			rows: !named[item.key] && item.rows,
+			fields: fields[item.key],
 		}));
 		alerts.unshift(...get_hand_after_alerts(frm), ...get_upload_alerts(this.result));
 		const yellows = checks.yellows || {};
-		const yellow = (title, description, buttons = []) =>
-			alerts.push({ theme: "yellow", title, description, buttons });
+		const yellow = (title, description, extra = {}) =>
+			alerts.push({ theme: "yellow", title, description, ...extra });
 		for (const [account, amount] of Object.entries(checks.off || {})) {
 			yellow(
 				__("{0} is off by {1} from its line.", [
@@ -11341,7 +11686,7 @@ class FixedAssetsWindow extends SheetWindow {
 					])
 				),
 				__("Check the sheet: ERPNext books their depreciation from the start."),
-				[rows(yellows.no_depreciation)]
+				{ rows: yellows.no_depreciation, fields: ["opening_depreciation"] }
 			);
 		}
 		if (yellows.ending?.length) {
@@ -11357,7 +11702,7 @@ class FixedAssetsWindow extends SheetWindow {
 					])
 				),
 				undefined,
-				[rows(yellows.ending)]
+				{ rows: yellows.ending }
 			);
 		}
 		if (yellows.year_end_with_hand) {
@@ -11403,18 +11748,7 @@ class FixedAssetsWindow extends SheetWindow {
 		this.dialog.set_secondary_action_label(__("Save draft"));
 		this.dialog.set_secondary_action(() => this.save_draft());
 		const first = (checks.reds || [])[0]?.key;
-		set_footer_reason(
-			this.dialog,
-			!this.get_rows().length
-				? __("Upload a sheet or add rows to post.")
-				: this.dirty || !first
-				? null
-				: first === "answer"
-				? __("Answer the question to post.")
-				: first === "hand"
-				? __("Spread or download the hand-booked depreciation to post.")
-				: __("Fix the red items above to post.")
-		);
+		set_primary_disabled(this.dialog, !this.get_rows().length || (!this.dirty && Boolean(first)));
 	}
 
 	// Depreciation by category: one row each, applied to all its assets
@@ -11452,12 +11786,12 @@ class FixedAssetsWindow extends SheetWindow {
 					"mb-3"
 				)
 			);
-		set_footer_reason(this.dialog, null);
+		set_primary_disabled(this.dialog, false);
 		this.dialog.set_secondary_action_label(__("Back"));
 		this.dialog.set_secondary_action(() => this.show_sheet());
 		const count = this.get_rows().length;
 		this.dialog.set_primary_action(
-			plural(count, __("Apply to 1 row"), __("Apply to {0} rows", [count])),
+			count ? plural(count, __("Apply to 1 row"), __("Apply to {0} rows", [count])) : __("Apply"),
 			() =>
 				this.save()
 					.then(() =>
@@ -11467,7 +11801,7 @@ class FixedAssetsWindow extends SheetWindow {
 							),
 						})
 					)
-					.then(() => this.reopen())
+					.then(() => this.refresh())
 		);
 	}
 
@@ -11740,7 +12074,7 @@ function show_posted_assets(frm) {
 function make_balance_yellows(frm, dialog) {
 	const currency = erpnext.get_currency(frm.doc.company);
 	const reopen = () => {
-		close_and_reload(frm, dialog).then(() => show_opening_balances(frm));
+		reload_fresh(frm).then(() => show_opening_balances(frm, null, dialog));
 	};
 	const alerts = [];
 	for (const line of frm.doc.__onload?.stock_like_lines || []) {

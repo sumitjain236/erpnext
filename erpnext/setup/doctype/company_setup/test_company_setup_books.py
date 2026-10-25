@@ -483,7 +483,11 @@ class TestTaxTemplates(ERPNextTestSuite):
 			"Sales Taxes and Charges Template", {"company": self.company, "is_default": 1}
 		)
 		self.assertTrue(made_at_setup)
-		self.assertIn(made_at_setup, [row["name"] for row in self.doc.get_taxes()["other_templates"]])
+		# before the first save, the templates already in ERPNext are rows to review, not done
+		taxes = self.doc.get_taxes()
+		self.assertIn(made_at_setup, [row["template"] for row in taxes["rows"]])
+		self.assertTrue(taxes["from_existing"])
+		self.assertFalse(self.doc.taxes_saved)
 		agency = frappe.db.get_value(
 			"Account", {"company": self.company, "account_type": "Tax", "is_group": 0}
 		)

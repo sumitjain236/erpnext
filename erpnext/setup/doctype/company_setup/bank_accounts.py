@@ -328,11 +328,30 @@ def guess_new_bank(account_name: str) -> str | None:
 	return name if name and name.casefold() != "bank" else None
 
 
+def get_overdrawn(onboarding, ledgers: dict) -> set[str]:
+	"""The bank ledgers that are overdrafts or cash credits, or that the books, with the trial
+	balance's draft lines, show overdrawn on the day before."""
+	books = (
+		get_balances(onboarding.company, list(ledgers), get_day_before(onboarding), in_account_currency=True)
+		if onboarding.migration_date
+		else {}
+	)
+	for row in onboarding.opening_balances:
+		if row.status != "Posted" and row.account in ledgers:
+			books[row.account] = flt(books.get(row.account)) + flt(row.debit) - flt(row.credit)
+	return {
+		name
+		for name, ledger in ledgers.items()
+		if ledger.root_type == "Liability" or flt(books.get(name)) < 0
+	}
+
+
 def save_bank_details(onboarding, rows: list[dict], has_uncleared_cheques: str | None, draft: bool):
 	"""Keep the rows of the bank details window. Unless a draft, also make a Bank Account for each row
 	with a bank (and the Bank when new), set the default bank and its payment modes, and keep each
 	statement balance on its Bank Account."""
 	ledgers = {ledger.name: ledger for ledger in get_bank_ledgers(onboarding.company)}
+	overdrawn = get_overdrawn(onboarding, ledgers)
 	onboarding.bank_accounts = []
 	for row in rows:
 		row = frappe._dict(row)
@@ -348,7 +367,10 @@ def save_bank_details(onboarding, rows: list[dict], has_uncleared_cheques: str |
 				"bank": " ".join(cstr(row.bank).split()),
 				"bank_account_no": cstr(row.bank_account_no).strip(),
 				"branch_code": cstr(row.branch_code).strip(),
-				"statement_balance": flt(row.statement_balance),
+				# the bank shows what an overdrawn account owes as a plain number
+				"statement_balance": -abs(flt(row.statement_balance))
+				if row.account in overdrawn
+				else flt(row.statement_balance),
 				"has_statement_balance": 0 if row.statement_balance in (None, "") else 1,
 				"is_default": 1 if row.is_default else 0,
 				"is_credit_card": 1 if row.is_credit_card else 0,
@@ -413,13 +435,17 @@ def save_bank_details(onboarding, rows: list[dict], has_uncleared_cheques: str |
 		set_payment_modes(onboarding.company, ledgers[defaults[0].account], previous)
 
 
-def get_statement_mismatches(onboarding) -> list[str]:
+def get_statement_mismatches(onboarding, short: bool = False) -> list[str]:
 	"""A line for each bank ledger whose typed statement balance is not its book balance on the day
-	before with the uncleared cheques and deposits listed for it added back."""
+	before with the uncleared cheques and deposits listed for it added back. short: one line pointing
+	to the Bank accounts step, for lists of everything still open."""
 	lines = []
 	for account, off in get_statement_offs(onboarding).items():
 		name, currency = frappe.get_cached_value("Account", account, ["account_name", "account_currency"])
 		amount = fmt_money(abs(off), currency=currency, precision=0)
+		if short:
+			lines.append(_("{0}: statement off by {1} · see Bank accounts").format(name, amount))
+			continue
 		lines.append(
 			(
 				_("{0}: statement is {1} more than the books.")
@@ -561,6 +587,7 @@ def read_bank_status(onboarding) -> frappe._dict:
 		unmarked=len(get_unmarked_accounts(company)),
 		default_bank=frappe.get_cached_value("Company", company, "default_bank_account"),
 		statement_off=get_statement_mismatches(onboarding),
+		statement_off_short=get_statement_mismatches(onboarding, short=True),
 		has_uncleared_cheques=onboarding.has_uncleared_cheques,
 		drafts=sum(1 for row in onboarding.uncleared_cheques if row.status != "Posted"),
 		cheques=sum(1 for row in posted if row.entry_type == "Issued" and row.bank_account not in cards),
@@ -873,6 +900,12 @@ def get_cheque_checks(onboarding) -> dict:
 	saved = get_company_bank_accounts(company, names)
 	statements = get_statement_balances(onboarding, saved)
 	books = get_balances(company, names, day_before, in_account_currency=True)
+	# until the balances are posted, a bank's book balance is as it will be: with its draft line
+	from_sheet = set()
+	for row in onboarding.opening_balances:
+		if row.status != "Posted" and row.account in names:
+			books[row.account] = flt(books.get(row.account)) + flt(row.debit) - flt(row.credit)
+			from_sheet.add(row.account)
 	currency = frappe.get_cached_value("Company", company, "default_currency")
 	rows = onboarding.uncleared_cheques
 	banks = []
@@ -894,6 +927,7 @@ def get_cheque_checks(onboarding) -> dict:
 				"bank": saved[ledger.name].bank if ledger.name in saved else None,
 				"account_currency": ledger.account_currency,
 				"book": flt(books.get(ledger.name)),
+				"book_from_sheet": ledger.name in from_sheet,
 				"issued": sum(flt(row.amount) for row in issued),
 				"issued_count": len(issued),
 				"deposited": sum(flt(row.amount) for row in deposited),

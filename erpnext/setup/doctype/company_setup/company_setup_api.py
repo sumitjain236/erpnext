@@ -106,8 +106,8 @@ def get_made_orders(company: str, order_type: str) -> dict:
 
 
 @frappe.whitelist()
-def get_job_work_bom(company: str, item_code: str) -> dict:
-	return get_setup(company).get_job_work_bom(item_code)
+def get_job_work_setups(company: str, items: list | str) -> list[dict]:
+	return get_setup(company).get_job_work_setups(items)
 
 
 @frappe.whitelist()

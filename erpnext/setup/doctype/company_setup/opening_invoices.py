@@ -16,6 +16,7 @@ from datetime import date
 from difflib import get_close_matches
 
 import frappe
+from dateutil import parser
 from frappe import _
 from frappe.core.doctype.data_import.exporter import Exporter
 from frappe.model import table_fields
@@ -360,7 +361,14 @@ def read_invoice_sheet(file_url: str, party_type: str) -> frappe._dict:
 			cell = get_cell(row, sheet.columns[field])
 			dates[field] = get_sheet_date(cell, day_first[field])
 			if cstr(cell).strip() and not dates[field]:
-				bad_dates.append(f"{name} {invoice_number}: {cstr(cell).strip()}".strip())
+				bad_dates.append(
+					{
+						"party_name": name,
+						"invoice_number": invoice_number,
+						"field": field,
+						"text": cstr(cell).strip(),
+					}
+				)
 		invoices.append(
 			{
 				"party_name": name,
@@ -462,9 +470,12 @@ def get_sheet_date(value, day_first: bool | None = None) -> str | None:
 	if day_first is None:
 		day_first = get_user_date_format().startswith("dd")
 	day_first = day_first and not ISO_DATE.match(text)
+	if not isinstance(value, str):
+		return str(getdate(value)) if isinstance(value, date) else None
+	# getdate shows its own error for text it can't read, like 31/02/2026: such a date is left empty
 	try:
-		return str(getdate(text if isinstance(value, str) else value, parse_day_first=day_first))
-	except Exception:
+		return str(parser.parse(text, dayfirst=day_first).date())
+	except (ValueError, OverflowError):
 		return None
 
 

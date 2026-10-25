@@ -45,6 +45,7 @@ from erpnext.setup.doctype.company_setup.opening_stock import (
 	get_warehouse_index,
 	match_item,
 	match_warehouse,
+	prepare_rows,
 )
 from erpnext.setup.doctype.company_setup.posted_entries import (
 	cancel_doc,
@@ -340,15 +341,45 @@ def prepare_orders(onboarding, order_type: str) -> list[frappe._dict]:
 		for order, short in zip(prepared, get_short_material(prepared, "wip_warehouse"), strict=True):
 			order.from_wip = bool(order.bom and order.wip_warehouse and not short)
 	if order_type == "Subcontracting Order":
-		for order, short in zip(prepared, get_short_material(prepared, "supplier_warehouse"), strict=True):
-			order.short_material = short
+		set_job_work_material(onboarding, prepared)
 	return prepared
 
 
-def get_short_material(prepared: list, warehouse_field: str) -> list[list[str]]:
+def set_job_work_material(onboarding, prepared: list):
+	"""Set each row's materials its job worker lacks even once Opening stock posts, those it lacks
+	only until then, and whether its item has a Subcontracting BOM."""
+	drafted = get_drafted_stock(onboarding, {order.supplier_warehouse for order in prepared})
+	held_now = get_short_material(prepared, "supplier_warehouse")
+	held_later = get_short_material(prepared, "supplier_warehouse", drafted)
+	for order, short_now, short in zip(prepared, held_now, held_later, strict=True):
+		order.short_material = short
+		order.unposted_material = [item for item in short_now if item not in short]
+		order.job_work_bom = bool(
+			order.item_code
+			and frappe.db.exists("Subcontracting BOM", {"finished_good": order.item_code, "is_active": 1})
+		)
+
+
+def get_drafted_stock(onboarding, warehouses: set) -> dict[tuple, float]:
+	"""The stock qty of each (warehouse, item) on the Opening stock drafts at these warehouses."""
+	index = get_warehouse_index(onboarding)
+	rows = [
+		row
+		for row in onboarding.opening_stock
+		if row.status != "Posted" and match_warehouse(index, row) in warehouses
+	]
+	drafted = {}
+	for row in prepare_rows(onboarding, rows):
+		if row.item_code and row.warehouse:
+			key = (row.warehouse, row.item_code)
+			drafted[key] = drafted.get(key, 0) + row.stock_qty
+	return drafted
+
+
+def get_short_material(prepared: list, warehouse_field: str, drafted: dict | None = None) -> list[list[str]]:
 	"""For each row in turn, the BOM materials its warehouse does not hold enough of for the qty
-	left, after the rows before it took theirs. At a job worker, only the materials ERPNext
-	supplies to it: not those the job worker sources itself."""
+	left, after the rows before it took theirs; counting the drafted stock too when given. At a job
+	worker, only the materials ERPNext supplies to it: not those the job worker sources itself."""
 	per_unit = {}
 	if warehouse_field == "supplier_warehouse":
 		order_doc = frappe.new_doc("Subcontracting Order")
@@ -378,6 +409,8 @@ def get_short_material(prepared: list, warehouse_field: str) -> list[list[str]]:
 			fields=["warehouse", "item_code", "actual_qty"],
 		)
 	}
+	for key, qty in (drafted or {}).items():
+		held[key] = held.get(key, 0) + qty
 	result = []
 	for order in prepared:
 		warehouse = order.get(warehouse_field)
@@ -539,8 +572,11 @@ def get_failing_rows(order_type: str, prepared: list) -> dict[str, list]:
 		"no_warehouse": lambda row: not row.warehouse,
 		"no_job_worker": lambda row: subcontracting and row.party and not row.supplier_warehouse,
 		"not_subcontracted": lambda row: subcontracting and row.item_code and not row.subcontracted,
-		"no_service_item": lambda row: subcontracting and row.item_code and not row.service_item,
-		"material_not_at_job_worker": lambda row: subcontracting and row.short_material,
+		"job_work_setup": lambda row: subcontracting
+		and row.item_code
+		and (not row.service_item or (row.short_material and not row.job_work_bom)),
+		"material_not_posted": lambda row: subcontracting and row.unposted_material,
+		"material_not_at_job_worker": lambda row: subcontracting and row.job_work_bom and row.short_material,
 		"backflush_transferred": lambda row: backflush,
 	}
 	return {key: [row for row in prepared if check(row)] for key, check in checks.items()}
@@ -613,23 +649,19 @@ def get_red_text(order_type: str, key: str, failing: list) -> str:
 		return count_text(len(failing), _("Pick a warehouse for 1 row."), _("Pick a warehouse for {0} rows."))
 	if key == "no_job_worker":
 		return _("Add {0} as a job worker in Warehouses first.").format(", ".join(parties))
-	if key == "material_not_at_job_worker":
-		names = sorted(
-			{
-				frappe.get_cached_value("Item", item, "item_name") or item
-				for row in failing
-				for item in row.short_material
-			}
-		)
+	if key == "material_not_posted":
 		return count_text(
-			len({row.party for row in failing}),
-			_(
-				"The job worker does not hold all the material its orders need: {1}. Add it at the job worker in Opening stock. If you add it in-house, give the item a Subcontracting BOM whose BOM leaves it out."
-			),
-			_(
-				"{0} job workers do not hold all the material their orders need: {1}. Add it at the job workers in Opening stock. If you add it in-house, give the item a Subcontracting BOM whose BOM leaves it out."
-			),
-			", ".join(names[:5]) + (", …" if len(names) > 5 else ""),
+			len({(row.party, item) for row in failing for item in row.unposted_material}),
+			_("{1} is in Opening stock, but not posted yet. Post Opening stock first."),
+			_("{1} are in Opening stock, but not posted yet. Post Opening stock first."),
+			get_material_at(failing, "unposted_material"),
+		)
+	if key == "material_not_at_job_worker":
+		return count_text(
+			len({(row.party, item) for row in failing for item in row.short_material}),
+			_("Add {1} in Opening stock, or untick it in Set up job work."),
+			_("Add {1} in Opening stock, or untick them in Set up job work."),
+			get_material_at(failing, "short_material"),
 		)
 	if key == "not_subcontracted":
 		return count_text(
@@ -637,14 +669,29 @@ def get_red_text(order_type: str, key: str, failing: list) -> str:
 			_("Mark 1 item as subcontracted first."),
 			_("Mark {0} items as subcontracted first."),
 		)
-	if key == "no_service_item":
+	if key == "job_work_setup":
+		codes = sorted({row.item_code for row in failing})
 		return count_text(
-			len(items),
-			_("Pick the service item for 1 item, or add its Subcontracting BOM."),
-			_("Pick the service item for {0} items, or add their Subcontracting BOM."),
+			len(codes),
+			_("1 item needs job-work setup: {1}"),
+			_("{0} items need job-work setup: {1}"),
+			", ".join(codes[:5]) + (", …" if len(codes) > 5 else ""),
 		)
 	return _(
 		"The material is at the job worker already. Set Backflush Raw Materials of Subcontract Based On to BOM in Buying Settings first."
+	)
+
+
+def get_material_at(failing: list, field: str) -> str:
+	"""Like "EN8 Round Bar at Shree Ganesh; Primer, Casting at Precision": by job worker."""
+	materials = {}
+	for row in failing:
+		for item in row.get(field):
+			materials.setdefault(row.party, set()).add(
+				frappe.get_cached_value("Item", item, "item_name") or item
+			)
+	return "; ".join(
+		_("{0} at {1}").format(", ".join(sorted(names)), party) for party, names in sorted(materials.items())
 	)
 
 
@@ -1030,13 +1077,23 @@ def mark_items_subcontracted(onboarding) -> list[str]:
 	return items
 
 
-def get_job_work_bom(onboarding, item_code: str) -> dict:
-	"""For the job-work BOM dialog: the item's default BOM materials, each with whether the job
-	worker holds it, and the service item and finished goods per service unit to start with."""
-	bom = get_default_bom(item_code)
-	if not bom:
-		return {"bom": None}
-	rows = [row for row in prepare_orders(onboarding, "Subcontracting Order") if row.item_code == item_code]
+def get_job_work_setups(onboarding, items: list[str]) -> list[dict]:
+	"""For the Set up job work dialog, per item: its default BOM materials, each with whether the
+	job worker holds it, and the service item and finished goods per service unit to start with."""
+	prepared = prepare_orders(onboarding, "Subcontracting Order")
+	return [get_job_work_setup(item_code, prepared) for item_code in items]
+
+
+def get_job_work_setup(item_code: str, prepared: list) -> dict:
+	rows = [row for row in prepared if row.item_code == item_code]
+	setup = {
+		"item_code": item_code,
+		"item_name": frappe.get_cached_value("Item", item_code, "item_name"),
+		"job_workers": sorted({row.party for row in rows if row.party}),
+		"bom": get_default_bom(item_code),
+	}
+	if not setup["bom"]:
+		return setup
 	short = {material for row in rows for material in row.short_material or []}
 	current = frappe.db.get_value(
 		"Subcontracting BOM",
@@ -1045,7 +1102,7 @@ def get_job_work_bom(onboarding, item_code: str) -> dict:
 		as_dict=True,
 	)
 	return {
-		"bom": bom,
+		**setup,
 		"materials": [
 			{
 				"item_code": line.item_code,
@@ -1054,7 +1111,7 @@ def get_job_work_bom(onboarding, item_code: str) -> dict:
 				"uom": line.uom,
 				"held": line.item_code not in short,
 			}
-			for line in frappe.get_doc("BOM", bom).items
+			for line in frappe.get_doc("BOM", setup["bom"]).items
 		],
 		"service_item": (current and current.service_item)
 		or next((row.service_item for row in rows if row.service_item), None),
@@ -1064,12 +1121,27 @@ def get_job_work_bom(onboarding, item_code: str) -> dict:
 	}
 
 
+def set_job_work_setups(onboarding, setups: list[dict]) -> list[str]:
+	"""Save each item's job-work setup: see set_job_work_bom. Returns the BOMs."""
+	return [
+		set_job_work_bom(
+			onboarding,
+			setup["item_code"],
+			setup["materials"],
+			setup["service_item"],
+			setup.get("finished_good_qty", 1),
+		)
+		for setup in setups
+	]
+
+
 def set_job_work_bom(
 	onboarding, item_code: str, materials: list[str], service_item: str, finished_good_qty: float
-) -> dict:
-	"""Point the item's active Subcontracting BOM at a copy of its default BOM with only these
-	materials, made only when its current BOM has other materials. Returns the BOM and whether the
-	job worker still lacks material."""
+) -> str:
+	"""Point the item's active Subcontracting BOM at a BOM with only these materials: its current
+	one or the default when they match, else a new copy of the default. Returns the BOM."""
+	if not service_item:
+		frappe.throw(_("Pick the service item for {0}.").format(item_code), title=_("No service item"))
 	if flt(finished_good_qty) <= 0:
 		frappe.throw(
 			_("Finished goods per service unit must be more than 0."), title=_("Wrong finished goods")
@@ -1081,8 +1153,15 @@ def set_job_work_bom(
 	subcontracting_bom = (
 		frappe.get_doc("Subcontracting BOM", name) if name else frappe.new_doc("Subcontracting BOM")
 	)
-	bom_name = subcontracting_bom.finished_good_bom
-	if not bom_name or set(get_bom_materials(bom_name)) != set(materials):
+	bom_name = next(
+		(
+			bom
+			for bom in (subcontracting_bom.finished_good_bom, default_bom)
+			if bom and set(get_bom_materials(bom)) == set(materials)
+		),
+		None,
+	)
+	if not bom_name:
 		bom = frappe.copy_doc(frappe.get_doc("BOM", default_bom))
 		bom.items = [line for line in bom.items if line.item_code in set(materials)]
 		if not bom.items:
@@ -1105,12 +1184,7 @@ def set_job_work_bom(
 		}
 	)
 	subcontracting_bom.save()
-	short = any(
-		row.short_material
-		for row in prepare_orders(onboarding, "Subcontracting Order")
-		if row.item_code == item_code
-	)
-	return {"bom": bom_name, "short": short}
+	return bom_name
 
 
 def get_bom_materials(bom: str) -> list[str]:

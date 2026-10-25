@@ -17,7 +17,7 @@ from erpnext.accounts.party import get_party_account
 from erpnext.accounts.utils import get_fiscal_year
 from erpnext.assets.doctype.asset.depreciation import post_depreciation_entries
 from erpnext.setup.doctype.company_setup import company_setup_steps
-from erpnext.setup.doctype.company_setup.bank_accounts import guess_bank, guess_new_bank
+from erpnext.setup.doctype.company_setup.bank_accounts import get_statement_offs, guess_bank, guess_new_bank
 from erpnext.setup.doctype.company_setup.chart_sheet import download_chart_template, get_draft_balances
 from erpnext.setup.doctype.company_setup.company_setup import (
 	create_company_setup,
@@ -2543,6 +2543,21 @@ class TestBankAccounts(ERPNextTestSuite):
 			guess_bank("State Bank of India A/c", ["Bank of India", "State Bank of India"]),
 			"State Bank of India",
 		)
+
+	def test_an_overdraft_statement_typed_as_the_bank_shows_it_is_overdrawn(self):
+		self.doc.mark_bank_accounts()
+		self.doc.save_opening_balances([{"account": self.od, "credit": 50000}])
+		self.doc.save_bank_accounts(
+			[
+				{"account": self.hdfc, "bank": "_Test Setup HDFC", "statement_balance": 123000},
+				{"account": self.od, "bank": "_Test Setup ICICI", "statement_balance": 50000},
+			],
+			"No",
+			True,
+		)
+		statements = {row.account: row.statement_balance for row in self.doc.bank_accounts}
+		self.assertEqual((statements[self.hdfc], statements[self.od]), (123000, -50000))
+		self.assertNotIn(self.od, get_statement_offs(self.doc))
 
 	def test_uncleared_cheques_net_to_zero_and_undo_amends_the_bank_entry(self):
 		self.doc.mark_bank_accounts()

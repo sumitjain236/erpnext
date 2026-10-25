@@ -334,6 +334,8 @@ class TestOpeningStockCases(ERPNextTestSuite):
 		doc.run_method("onload")
 		items = doc.get_onload().steps[step_key(doc, "items")]
 		self.assertTrue(items["summary"].endswith("1 on your stock sheet are not in ERPNext"))
+		opening_stock = doc.get_onload().steps[step_key(doc, "opening_stock")]
+		self.assertEqual(opening_stock["blocker"], "Can't post yet: 1 item is not in ERPNext")
 
 	def test_a_batch_correction_that_drives_a_later_issue_below_zero_is_red(self):
 		batch_item = make_tracked_item("_Test Setup Batch Item", "has_batch_no")
