@@ -116,6 +116,11 @@ def get_boms(company: str) -> dict:
 
 
 @frappe.whitelist()
+def get_made_boms(company: str) -> dict:
+	return get_setup(company).get_made_boms()
+
+
+@frappe.whitelist()
 def get_stock_status(company: str) -> dict:
 	"""For the page to poll while stock posts in the background, without loading the document."""
 	frappe.has_permission("Company Setup", "read", company, throw=True)

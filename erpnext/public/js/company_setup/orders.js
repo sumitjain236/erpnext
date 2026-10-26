@@ -16,7 +16,7 @@ import {
 import { SheetWindow, list_column } from "./sheet_window";
 import { show_tab } from "./overview";
 import { kept_cancelled_line } from "./invoices_posted";
-import { import_blocked, open_party_import } from "./imports";
+import { open_party_import } from "./imports";
 import { show_warehouses } from "./warehouses";
 import { show_opening_stock } from "./stock";
 import { show_posted_window } from "./posted";
@@ -76,53 +76,321 @@ function made_orders_title(order_type) {
 
 // ---------- BOMs ----------
 
-// where BOMs are made when they can't be imported
-export function bom_creator_button() {
-	return { label: __("Open BOM Creator"), onclick: () => frappe.new_doc("BOM Creator") };
+export function count_boms(count) {
+	return plural(count, __("1 BOM"), __("{0} BOMs", [count]));
 }
 
-// The items made here that have no BOM; BOMs come in through Data Import
-export function show_boms(frm) {
-	get_data(frm, "get_boms").then((r) => {
-		const status = r.message;
-		const blocked = import_blocked(frm, "BOM");
-		if (!status.without_bom.length) {
-			return blocked ? frappe.new_doc("BOM Creator") : open_party_import(frm, "BOM");
-		}
-		const dialog = new frappe.ui.Dialog({
+function make_boms_label(count) {
+	return count ? plural(count, __("Make 1 BOM"), __("Make {0} BOMs", [count])) : __("Make BOMs");
+}
+
+function bom_drafts(frm) {
+	return (frm.doc.boms || []).filter((row) => row.status !== "Made");
+}
+
+export function bom_buttons(frm) {
+	return [
+		{
+			label: bom_drafts(frm).length ? __("Edit BOMs") : __("Add BOMs"),
+			onclick: () => show_boms(frm),
+		},
+	];
+}
+
+export function bom_menu(frm) {
+	return [
+		(frm.doc.boms || []).some((row) => row.status === "Made") && {
+			label: __("Made BOMs"),
+			icon: "list",
+			onclick: () => show_made_boms(frm),
+		},
+		{
+			label: __("Download sample"),
+			icon: "download",
+			onclick: () => download_sheet(frm.doc.company, "boms.download_boms"),
+		},
+		{
+			label: __("Open BOM Creator"),
+			icon: "arrow-up-right",
+			onclick: () => frappe.new_doc("BOM Creator"),
+		},
+	].filter(Boolean);
+}
+
+export function show_boms(frm, result) {
+	get_data(frm, "get_boms").then((r) => new BomsWindow(frm, r.message, result).show());
+}
+
+class BomsWindow extends SheetWindow {
+	constructor(frm, checks, result) {
+		super(frm, {
 			title: __("BOMs"),
-			size: "large",
-			fields: [{ fieldname: "body", fieldtype: "HTML" }],
-			primary_action_label: blocked ? __("Open BOM Creator") : __("Import BOMs"),
-			primary_action: () => {
-				dialog.hide();
-				blocked ? frappe.new_doc("BOM Creator") : open_party_import(frm, "BOM");
-			},
-			secondary_action_label: __("Close"),
-			secondary_action: () => dialog.hide(),
+			where: "boms",
+			has_data: bom_drafts(frm).length,
+			save_method: "save_boms",
+			get_method: "get_boms",
+			primary_label: __("Make BOMs"),
+			checks: checks,
 		});
-		dialog.get_field("body").$wrapper.append(
-			$(`<div class="flex flex-col gap-3"></div>`).append(
-				grey_line(
-					plural(
-						status.without_bom.length,
-						__("1 item you make has no BOM. Add it before its first work order."),
-						__("{0} items you make have no BOM. Add them before their first work order.", [
-							status.without_bom.length,
-						])
-					)
-				),
-				make_read_table(
-					[[__("Item")], [__("Item group")], [__("Unit")]],
-					status.without_bom.map((item) => [
-						item.item_name || item.name,
-						item.item_group,
-						item.stock_uom,
-					])
-				)
-			)
+		this.result = result;
+		this.load(checks);
+	}
+
+	get_layout(checks) {
+		return checks?.has_rate ? "rate" : "";
+	}
+
+	get_fields(checks) {
+		const rate = Boolean(checks?.has_rate);
+		return [
+			list_column("item_name", "Data", __("Item you make"), 3),
+			list_column("bom_qty", "Float", __("Makes"), 1),
+			list_column("material_name", "Data", __("Material"), rate ? 3 : 4),
+			list_column("qty", "Float", __("Qty"), 1),
+			list_column("uom", "Data", __("Unit"), 1),
+			{
+				fieldname: "rate",
+				fieldtype: "Currency",
+				label: __("Rate"),
+				columns: 1,
+				in_list_view: rate ? 1 : 0,
+			},
+			{ fieldname: "source", fieldtype: "Data", hidden: 1 },
+			{ fieldname: "doc_idx", fieldtype: "Int", hidden: 1 },
+		];
+	}
+
+	load(checks) {
+		this.checks = checks;
+		const fields = ["item_name", "bom_qty", "material_name", "qty", "uom", "rate", "source"];
+		this.drafts = bom_drafts(this.frm).map((row) => ({
+			...Object.fromEntries(fields.map((field) => [field, row[field]])),
+			doc_idx: row.idx,
+		}));
+	}
+
+	render() {
+		const { checks, frm } = this;
+		this.make_head(
+			__(
+				"One row per material of each item you make. Each item gets one BOM, submitted and set as its default."
+			),
+			{
+				upload: () => this.upload("import_boms", null),
+				menu: [
+					checks.made && {
+						label: __("Made BOMs"),
+						icon: "list",
+						onclick: () => {
+							this.dialog.hide();
+							show_made_boms(frm);
+						},
+					},
+					{
+						label: __("Download sample"),
+						icon: "download",
+						onclick: () => download_sheet(frm.doc.company, "boms.download_boms"),
+					},
+				].filter(Boolean),
+			}
 		);
-		dialog.show();
+		this.set_stats(
+			checks.drafts || checks.made
+				? [
+						frappe.ui.stat_card({
+							label: __("On your sheet"),
+							value: checks.drafts ? count_boms(checks.boms) : __("Nothing to make"),
+							caption: checks.drafts
+								? [
+										plural(
+											checks.drafts,
+											__("1 material row"),
+											__("{0} material rows", [checks.drafts])
+										),
+										...checks.sources,
+								  ].join(" · ")
+								: null,
+						}),
+						frappe.ui.stat_card({
+							label: __("Made"),
+							value: checks.made ? count_boms(checks.made) : __("Nothing yet"),
+						}),
+				  ]
+				: []
+		);
+		const go_to_items = {
+			label: __("Go to Items"),
+			onclick: () => {
+				this.dialog.hide();
+				open_party_import(frm, "Item");
+			},
+		};
+		const fields = {
+			missing_items: ["item_name"],
+			missing_materials: ["material_name"],
+			no_qty: ["qty"],
+			unknown_units: ["uom"],
+		};
+		const alerts = [
+			...(checks.reds || []).map((red) => ({
+				theme: "red",
+				key: red.key,
+				title: red.text,
+				description: red.hint,
+				rows: red.rows,
+				fields: fields[red.key],
+				badge: red.key.startsWith("missing_")
+					? __("Not in ERPNext")
+					: red.key === "no_qty"
+					? __("Needed")
+					: undefined,
+				buttons: red.key.startsWith("missing_") ? [go_to_items] : [],
+			})),
+			...(checks.failed || []).map((failed) => ({
+				theme: "red",
+				key: `failed_${failed.rows[0]}`,
+				title: failed.text,
+				rows: failed.rows,
+			})),
+			checks.kept && {
+				key: "kept",
+				title: checks.kept.text,
+				rows: checks.kept.rows,
+				fields: ["item_name"],
+				badge: __("Has a BOM"),
+				badge_theme: "gray",
+			},
+		].filter(Boolean);
+		this.set_alerts(alerts, [
+			this.result &&
+				plural(
+					this.result.added,
+					__("1 row read from the sheet."),
+					__("{0} rows read from the sheet.", [this.result.added])
+				),
+			this.result?.replaced &&
+				plural(
+					this.result.replaced,
+					__("1 draft row of the same items was replaced."),
+					__("{0} draft rows of the same items were replaced.", [this.result.replaced])
+				),
+		]);
+		this.refresh_footer();
+	}
+
+	refresh_footer() {
+		if (this.view !== "sheet") return;
+		const { checks } = this;
+		this.dialog.set_primary_action(make_boms_label(checks.to_make), () => this.post());
+		this.dialog.set_secondary_action_label(__("Save draft"));
+		this.dialog.set_secondary_action(() => this.save_draft());
+		const empty = !this.get_rows().length;
+		set_primary_disabled(this.dialog, empty || (!this.dirty && Boolean(checks.blocker)));
+	}
+
+	confirm_post() {
+		const { frm, checks } = this;
+		this.show_confirm({
+			title: __("{0}?", [make_boms_label(checks.to_make)]),
+			back: __("Nothing is made until you confirm."),
+			body: [
+				make_kv_lines([[__("To make"), count_boms(checks.to_make)]]),
+				grey_line(__("Each BOM is submitted and set as its item's default.")),
+				checks.kept && grey_line(checks.kept.text),
+			].filter(Boolean),
+			primary: make_boms_label(checks.to_make),
+			on_primary: () =>
+				call_method(frm, "make_boms", {}, { freeze: true }).then((r) => {
+					this.dialog.hide();
+					after_run(
+						frm,
+						r.message,
+						__("Making the BOMs in the background. This page updates when it's done."),
+						(result) => show_boms_made(frm, result)
+					);
+				}),
+		});
+	}
+}
+
+export function show_boms_made(frm, result) {
+	if (result.failed) {
+		frappe.ui.toast({
+			type: "error",
+			message: plural(
+				result.failed,
+				__("1 BOM was not made."),
+				__("{0} BOMs were not made.", [result.failed])
+			),
+			description: __("The reason is on its rows."),
+		});
+		return show_boms(frm);
+	}
+	frappe.ui.toast({
+		type: "success",
+		message: __("{0} made.", [count_boms(result.made)]),
+		action: { label: __("View"), onclick: () => show_made_boms(frm) },
+	});
+}
+
+function show_made_boms(frm) {
+	const count = (rows) => count_boms(rows.length);
+	show_posted_window(frm, {
+		title: __("Made BOMs"),
+		load: () => get_data(frm, "get_made_boms").then((r) => r.message),
+		posted_word: (when) => __("Made {0}", [when]),
+		group_line: (group) => count_boms(group.count),
+		fields: [
+			{ fieldname: "document", fieldtype: "Link", options: "BOM", label: __("BOM"), columns: 3 },
+			{ fieldname: "item_code", fieldtype: "Data", label: __("Item you make"), columns: 3 },
+			{ fieldname: "bom_qty", fieldtype: "Float", label: __("Makes"), columns: 1 },
+			{ fieldname: "materials", fieldtype: "Int", label: __("Materials"), columns: 1 },
+			{ fieldname: "used", fieldtype: "Int", label: __("Used by"), columns: 2 },
+		],
+		rows: (group) => group.rows.map((row) => ({ ...row })),
+		blocked: (row) => row.used > 0,
+		blocked_alert: (rows) => ({
+			title: plural(
+				rows.length,
+				__("1 BOM is used by work orders or stock entries."),
+				__("{0} BOMs are used by work orders or stock entries.", [rows.length])
+			),
+			description: __("Cancel those first."),
+		}),
+		undo_label: (selected) =>
+			selected.length ? __("Undo {0} selected", [selected.length]) : __("Undo this upload"),
+		confirm_title: (rows) => __("Undo {0}?", [count(rows)]),
+		confirm_text: (rows) =>
+			plural(
+				rows.length,
+				__("Its rows are kept, so you can fix it and make it again."),
+				__("Their rows are kept, so you can fix them and make them again.")
+			),
+		confirm_what: (rows) => ({
+			count: rows.length,
+			what: count(rows),
+			one: __("BOM"),
+			has_ledger: false,
+		}),
+		confirm_rows: (rows) =>
+			rows.map((row) => [
+				$(`<span class="text-base text-ink-gray-8 shrink-0"></span>`).text(row.document),
+				$(`<span class="text-base text-ink-gray-5 grow truncate"></span>`).text(row.item_code),
+			]),
+		confirm_button: (rows) => __("Undo {0}", [count(rows)]),
+		undo: (group, selected) =>
+			call_method(frm, "undo_boms", {
+				source: group.source,
+				documents: selected ? selected.map((row) => row.document) : null,
+			}),
+		after_undo: (result) =>
+			frappe.ui.toast({
+				type: "success",
+				message: __("{0} undone", [count_boms(result.removed)]),
+				description: [__("They're cancelled and deleted in ERPNext."), kept_cancelled_line(result)]
+					.filter(Boolean)
+					.join(" "),
+			}),
 	});
 }
 
@@ -449,11 +717,7 @@ class OpenOrdersWindow extends SheetWindow {
 				),
 			],
 			missing_items: [go(__("Go to Items"), () => open_party_import(frm, "Item"))],
-			no_bom: [
-				import_blocked(frm, "BOM")
-					? go(__("Open BOM Creator"), () => frappe.new_doc("BOM Creator"))
-					: go(__("Import BOMs"), () => open_party_import(frm, "BOM")),
-			],
+			no_bom: [go(__("Go to BOMs"), () => show_boms(frm))],
 			no_job_worker: [
 				go(__("Go to Warehouses"), () =>
 					show_warehouses(frm, {

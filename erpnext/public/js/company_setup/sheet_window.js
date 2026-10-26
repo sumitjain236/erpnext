@@ -275,7 +275,10 @@ export class SheetWindow {
 		if (value == null || value === "") {
 			return frappe.ui.badge.html({ label: __("Needed"), theme: "red" });
 		}
-		const badge = frappe.ui.badge.html({ label: alert.badge || __("Check"), theme: "red" });
+		const badge = frappe.ui.badge.html({
+			label: alert.badge || __("Check"),
+			theme: alert.badge_theme || "red",
+		});
 		return `<div class="flex items-center gap-1"><div class="truncate min-w-0">${formatted}</div><div class="shrink-0">${badge}</div></div>`;
 	}
 

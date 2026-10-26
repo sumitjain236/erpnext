@@ -12,6 +12,7 @@ from frappe.utils.background_jobs import is_job_enqueued
 
 from erpnext.accounts.utils import get_fiscal_year
 from erpnext.setup.doctype.company_setup import bank_accounts as banks
+from erpnext.setup.doctype.company_setup import boms as bom_setup
 from erpnext.setup.doctype.company_setup import fixed_assets as assets
 from erpnext.setup.doctype.company_setup import open_orders as orders
 from erpnext.setup.doctype.company_setup import opening_stock as stock
@@ -83,6 +84,7 @@ POSTING_FIELDS = {
 	"uncleared_cheques": ("status", "journal_entry", "opening_entry"),
 	"opening_stock": ("status", "stock_entry", "correction"),
 	"open_orders": ("status", "document", "purchase_order"),
+	"boms": ("status", "bom", "error"),
 	"fixed_assets": ("status", "asset", "net_value_entry", "moved", "wdv_gap"),
 }
 # tables of undone rows, which only an undo adds to
@@ -116,7 +118,7 @@ COMPANY_FIELDS = (
 # the Company's Modules Used checks the Edit dialog fills, of those the Company has
 MODULE_FIELDS = ("stock", "manufacturing", "subcontracting", "assets", "projects", "pos")
 # the sheets the steps bring in through Data Import
-IMPORTED_DOCTYPES = ("Customer", "Supplier", "Item Group", "UOM", "Item", "BOM")
+IMPORTED_DOCTYPES = ("Customer", "Supplier", "Item Group", "UOM", "Item")
 # what each step makes, as the permission it needs
 STEP_PERMISSIONS = {
 	"chart_of_accounts": [("Account", "create")],
@@ -135,7 +137,7 @@ STEP_PERMISSIONS = {
 	"opening_stock": [("Stock Reconciliation", "submit")],
 	"job_workers": [("Supplier", "write")],
 	"fixed_assets": [("Asset", "submit"), ("Asset Category", "create"), ("Item", "create")],
-	"boms": [("BOM", "submit")],
+	"boms": [("BOM", "create"), ("BOM", "submit")],
 	"open_sales_orders": [("Sales Order", "submit")],
 	"open_purchase_orders": [("Purchase Order", "submit")],
 	"open_work_orders": [("Work Order", "submit")],
@@ -161,6 +163,7 @@ class CompanySetup(
 		from erpnext.setup.doctype.company_setup_bank_account.company_setup_bank_account import (
 			CompanySetupBankAccount,
 		)
+		from erpnext.setup.doctype.company_setup_bom.company_setup_bom import CompanySetupBOM
 		from erpnext.setup.doctype.company_setup_fixed_asset.company_setup_fixed_asset import (
 			CompanySetupFixedAsset,
 		)
@@ -195,6 +198,7 @@ class CompanySetup(
 			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
 		]
 		bank_accounts: DF.Table[CompanySetupBankAccount]
+		boms: DF.Table[CompanySetupBOM]
 		boms_source: DF.Literal[
 			"", "Tally", "Busy", "Zoho Books", "QuickBooks", "Xero", "Marg", "Excel / other"
 		]
@@ -578,6 +582,8 @@ class CompanySetup(
 			posting.append("Stock")
 		if orders.is_making_orders(self.company):
 			posting.append("Orders")
+		if bom_setup.is_making_boms(self.company):
+			posting.append("BOMs")
 		if assets.is_posting_assets(self.company):
 			posting.append("Assets")
 		return posting
@@ -594,6 +600,7 @@ class CompanySetup(
 			or banks.is_posting_cheques(self.company)
 			or stock.is_posting_stock(self.company)
 			or orders.is_making_orders(self.company)
+			or bom_setup.is_making_boms(self.company)
 			or assets.is_posting_assets(self.company)
 			or is_closing_year(self.company)
 		)

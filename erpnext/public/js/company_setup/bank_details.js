@@ -49,7 +49,7 @@ export function get_bank_details_fields(win, details) {
 					label: __("Account"),
 					in_list_view: 1,
 					read_only: 1,
-					columns: 3,
+					columns: 2,
 					formatter: (value) =>
 						value
 							? `<span class="block truncate" title="${frappe.utils.escape_html(
@@ -63,7 +63,7 @@ export function get_bank_details_fields(win, details) {
 					options: "Bank",
 					label: __("Bank"),
 					in_list_view: 1,
-					columns: 2,
+					columns: 1,
 					ignore_link_validation: 1,
 					formatter: (value) =>
 						value
@@ -79,7 +79,7 @@ export function get_bank_details_fields(win, details) {
 					fieldtype: "Data",
 					label: __("Account number"),
 					in_list_view: 1,
-					columns: 2,
+					columns: 1,
 					onchange: refresh,
 				},
 				{
@@ -101,7 +101,7 @@ export function get_bank_details_fields(win, details) {
 					// the date is on the cards above: the column is too narrow for it
 					label: __("Statement"),
 					in_list_view: 1,
-					columns: 1,
+					columns: 4,
 					onchange: refresh,
 					formatter: (value, df, options, row) =>
 						[null, undefined, ""].includes(value)

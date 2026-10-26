@@ -38,6 +38,7 @@ from erpnext.setup.doctype.company_setup.bank_accounts import (
 	get_cheque_blocker,
 	get_cheque_checks,
 )
+from erpnext.setup.doctype.company_setup.boms import get_bom_checks
 from erpnext.setup.doctype.company_setup.fixed_assets import get_asset_checks, get_assets_status
 from erpnext.setup.doctype.company_setup.open_orders import (
 	get_boms_status,
@@ -825,21 +826,27 @@ def fixed_assets(onboarding) -> dict:
 
 
 def boms(onboarding) -> dict:
-	"""Optional. BOMs come in through the standard Data Import."""
+	"""Optional. Done when every item made here has a BOM, and none on the sheet waits for one."""
 	status = get_cached(onboarding, "boms_status", lambda doc: get_boms_status(doc.company))
+	checks = get_cached(onboarding, "bom_checks", get_bom_checks) if onboarding.boms else None
 	summary = count_text(status.boms, _("1 BOM"), _("{0} BOMs")) if status.boms else None
-	if status.without_bom:
+	if checks and checks["to_make"]:
+		summary = _("{0} in draft").format(count_text(checks["to_make"], _("1 BOM"), _("{0} BOMs")))
+	elif status.without_bom:
 		missing = count_text(
 			len(status.without_bom), _("1 item you make has no BOM"), _("{0} items you make have no BOM")
 		)
 		summary = f"{summary} · {missing}" if summary else missing
+	to_make = bool(checks and checks["to_make"])
 	return {
 		"title": _("BOMs"),
 		"description": _(
 			"Add your BOMs (bills of materials: what goes into each product you make) before your first work order."
 		),
 		"summary": summary,
-		"done": bool(status.boms),
+		"done": bool(status.boms) and not status.without_bom and not to_make,
+		"started": to_make,
+		"blocker": to_make and get_blocker_line([red["text"] for red in checks["reds"]]),
 		"tab": "manufacturing_tab",
 	}
 

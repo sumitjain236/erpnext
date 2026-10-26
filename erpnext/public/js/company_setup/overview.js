@@ -33,13 +33,7 @@ import {
 } from "./invoices_posted";
 import { show_opening_invoices } from "./invoices";
 import { count_entries, count_invoices, show_posting_result } from "./invoice_posting";
-import {
-	download_import_sample,
-	import_blocked,
-	import_buttons,
-	items_import_menu,
-	open_party_import,
-} from "./imports";
+import { import_blocked, import_buttons, items_import_menu, open_party_import } from "./imports";
 import { show_chart, show_chart_import } from "./chart";
 import { bank_menu, show_bank_accounts, show_cheques_posted } from "./bank";
 import { show_taxes } from "./taxes";
@@ -47,11 +41,13 @@ import { show_warehouses } from "./warehouses";
 import { show_opening_stock, show_stock_corrected } from "./stock";
 import { show_job_worker_stock, show_posted_stock } from "./posted";
 import {
-	bom_creator_button,
+	bom_buttons,
+	bom_menu,
 	count_orders,
 	order_buttons,
 	order_menu,
 	show_boms,
+	show_boms_made,
 	show_open_orders,
 } from "./orders";
 import { get_hand_after_alerts, show_fixed_assets, show_posted_assets } from "./assets";
@@ -329,7 +325,8 @@ export function make_task_card(frm, step) {
 		step = { ...step, description: frm.doc.__onload.chart_import_blocked };
 	}
 	const background =
-		{ opening_stock: "Stock", fixed_assets: "Assets" }[step.name] || (ORDER_TYPES[step.name] && "Orders");
+		{ opening_stock: "Stock", fixed_assets: "Assets", boms: "BOMs" }[step.name] ||
+		(ORDER_TYPES[step.name] && "Orders");
 	if (
 		frm.posting_step === step.name ||
 		(background && (frm.doc.__onload?.posting || []).includes(background))
@@ -795,10 +792,7 @@ Object.assign(STEP_ACTIONS, {
 			onclick: () => show_fixed_assets(frm),
 		},
 	],
-	boms: (frm) =>
-		frappe.model.can_create("Data Import") && !import_blocked(frm, "BOM")
-			? [{ label: __("Import BOMs"), onclick: () => open_party_import(frm, "BOM") }]
-			: [bom_creator_button()],
+	boms: bom_buttons,
 });
 
 Object.assign(STEP_MORE, {
@@ -843,11 +837,7 @@ Object.assign(STEP_MORE, {
 				onclick: () => download_sheet(frm.doc.company, "fixed_assets.download_fixed_assets"),
 			},
 		].filter(Boolean),
-	boms: (frm) =>
-		[
-			!import_blocked(frm, "BOM") && { ...bom_creator_button(), icon: "arrow-up-right" },
-			{ label: __("Download sample"), icon: "download", onclick: () => download_import_sample("BOM") },
-		].filter(Boolean),
+	boms: bom_menu,
 });
 
 Object.assign(STEP_OPENERS, {
@@ -918,6 +908,7 @@ export function listen_for_postings(frm) {
 		company_setup_stock: { done: toast(__("Opening stock posted.")) },
 		company_setup_assets: { done: toast(__("Fixed assets posted.")) },
 		company_setup_stock_correction: { done: (data) => show_stock_corrected(frm, data.result) },
+		company_setup_boms: { title: () => __("BOMs not made"), done: (data) => show_boms_made(frm, data) },
 		company_setup_orders: {
 			done: (data) =>
 				frappe.ui.toast({

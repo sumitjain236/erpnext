@@ -3,6 +3,7 @@
 
 import frappe
 
+from erpnext.setup.doctype.company_setup import boms as bom_setup
 from erpnext.setup.doctype.company_setup import open_orders as orders
 from erpnext.setup.doctype.company_setup.chart_sheet import get_file_label
 from erpnext.setup.doctype.company_setup.posted_entries import check_undo, run_or_enqueue
@@ -84,6 +85,50 @@ class OrdersMixin:
 		return orders.undo_open_orders(self, order_type, source, documents)
 
 	def get_boms(self) -> dict:
-		"""What the BOMs window shows: how many BOMs, and the items made here that have none."""
+		"""What the BOMs window shows: see boms.get_bom_checks."""
 		self.check_permission("read")
-		return orders.get_boms_status(self.company)
+		return bom_setup.get_bom_checks(self)
+
+	@frappe.whitelist()
+	def save_boms(self, rows: list | str, source: str | None = None):
+		"""Replace the draft BOM rows with these rows."""
+		self.check_permission("write")
+		self.start_change()
+		bom_setup.save_boms(self, frappe.parse_json(rows), source)
+		self.save()
+
+	@frappe.whitelist()
+	def import_boms(self, file_url: str) -> dict:
+		"""Add a BOM sheet's rows to the drafts, in place of the drafts of the same items."""
+		self.check_permission("write")
+		rows = bom_setup.read_bom_sheet(file_url)
+		merged, replaced = bom_setup.merge_upload(self, rows)
+		self.save_boms(merged, get_file_label(file_url))
+		return {"added": len(rows), "replaced": replaced}
+
+	@frappe.whitelist()
+	def make_boms(self) -> dict | str:
+		"""Make the draft BOMs in ERPNext: right away, or in the background when many."""
+		self.check_permission("write")
+		self.start_change()
+		to_make = bom_setup.get_boms_to_make(self)
+		return run_or_enqueue(
+			len(to_make),
+			lambda: bom_setup.make_boms(self, to_make),
+			bom_setup.make_boms_in_background,
+			bom_setup.JOB_ID.format(self.company),
+			company=self.company,
+		)
+
+	def get_made_boms(self) -> dict:
+		self.check_permission("read")
+		return bom_setup.get_made_boms(self)
+
+	@frappe.whitelist()
+	def undo_boms(self, source: str | None = None, documents: list | str | None = None) -> dict:
+		"""Cancel BOMs made from one upload, or only those named. Not once live."""
+		self.check_permission("write")
+		self.start_change()
+		check_undo(self)
+		documents = frappe.parse_json(documents) if isinstance(documents, str) else documents
+		return bom_setup.undo_boms(self, source, documents)

@@ -112,8 +112,8 @@ const WHERE_TO_FIND = {
 		["Excel / other", __("One row per order line: order number, party, item, qty left, rate, date.")],
 	],
 	boms: [
-		["Tally", __("Tally keeps the BOM on each stock item: fill the BOM import sheet from them.")],
-		["Excel / other", __("Import them from the BOMs step with the BOM import sheet.")],
+		["Tally", __("Tally keeps the BOM on each stock item: fill the BOMs sheet from them.")],
+		["Excel / other", __("One row per material: item you make, how many it makes, material, qty, unit.")],
 	],
 	job_work_orders: [
 		[

@@ -379,6 +379,7 @@ const POSTING_STEPS = {
 	post_opening_stock: () => "opening_stock",
 	post_stock_difference: () => "opening_stock",
 	post_fixed_assets: () => "fixed_assets",
+	make_boms: () => "boms",
 	make_open_orders: (args) =>
 		Object.keys(ORDER_TYPES).find((name) => ORDER_TYPES[name] === args.order_type),
 };

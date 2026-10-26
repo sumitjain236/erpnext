@@ -18,9 +18,7 @@ export function import_buttons(frm, doctype, step) {
 
 // why this user can't import the sheet, or nothing when they can
 export function import_blocked(frm, doctype) {
-	const reason = frm.doc.__onload?.import_blocked?.[doctype];
-	if (!reason || doctype !== "BOM") return reason;
-	return `${reason} ${__("Make your BOMs in BOM Creator.")}`;
+	return frm.doc.__onload?.import_blocked?.[doctype];
 }
 
 // items with batch or serial numbers import only once Stock Settings tracks them: asked before
@@ -69,13 +67,10 @@ export function open_party_import(frm, doctype, after = null, asked = false) {
 	}
 	const open = (data_import) =>
 		frappe.require("data_import_tools.bundle.js", () => {
-			// a BOM is used only once submitted; a BOM's sub-assemblies need theirs first
-			if (doctype === "BOM") frappe.route_options = { submit_after_import: 1 };
 			frappe.data_import.open_data_import_dialog({
 				data_import: data_import,
 				reference_doctype: doctype,
 				import_type: "Insert New Records",
-				title: doctype === "BOM" ? __("Import BOMs: sub-assemblies first") : null,
 				// the counts on the tasks change after an import
 				on_close: () => reload_fresh(frm).then(() => after?.()),
 			});

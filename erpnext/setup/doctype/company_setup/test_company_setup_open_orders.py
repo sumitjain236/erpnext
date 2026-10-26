@@ -4,6 +4,7 @@
 import frappe
 from frappe.utils import getdate
 
+from erpnext.setup.doctype.company_setup.open_orders import get_boms_status
 from erpnext.setup.doctype.company_setup.opening_invoices import ensure_fiscal_year
 from erpnext.setup.doctype.company_setup.test_company_setup import (
 	make_bom,
@@ -116,7 +117,7 @@ class TestOpenOrders(ERPNextTestSuite):
 			(order.docstatus, order.qty, order.bom_no, order.skip_transfer, order.wip_warehouse),
 			(1, 40, self.bom, 0, self.wip),
 		)
-		self.assertEqual(self.doc.get_boms().boms, 2)
+		self.assertEqual(get_boms_status(self.company).boms, 2)
 		frappe.db.set_value("Work Order", name, "produced_qty", 5)
 		self.doc.reload()
 		self.assertRaisesRegex(

@@ -82,6 +82,8 @@
   "manufacturing_tab",
   "manufacturing_section",
   "manufacturing_html",
+  "boms_section",
+  "boms",
   "subcontracting_tab",
   "subcontracting_section",
   "subcontracting_html"
@@ -444,6 +446,19 @@
    "label": "Manufacturing"
   },
   {
+   "fieldname": "boms_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "BOMs"
+  },
+  {
+   "fieldname": "boms",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "BOMs",
+   "options": "Company Setup BOM"
+  },
+  {
    "depends_on": "eval:!doc.__islocal",
    "fieldname": "subcontracting_tab",
    "fieldtype": "Tab Break",
@@ -601,7 +616,7 @@
  "grid_page_length": 50,
  "hide_toolbar": 1,
  "links": [],
- "modified": "2026-10-25 12:00:00.000000",
+ "modified": "2026-10-26 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Company Setup",
